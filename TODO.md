@@ -1,8 +1,7 @@
 # TODO
 
-- Install dependencies (`pnpm install`).
-- Validate WhatsApp flow with a real account.
-- Tune memory chunking + embedding batch sizes for large projects.
-- Add retries/backoff for LM Studio and WhatsApp disconnects.
-- Add more tools and richer routing controls.
-- Expand docs in `docs/` as new features land.
+- Decide on restart strategy: keep TSX or switch restart to `node dist/cli.js`.
+- Add more fast‑path intents (screenshot, open browser, list files).
+- Improve retry/backoff for WhatsApp disconnects and provider errors.
+- Add optional media size limits + downscaling for large images.
+- Extend docs as features stabilize.

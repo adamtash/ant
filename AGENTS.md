@@ -1,41 +1,65 @@
-# Ant Agent Notes
+# ant — Agent Notes
 
-## Goal
-Build a minimal but robust CLI named **ant** with:
-- Single provider: LM Studio (OpenAI-compatible API)
-- WhatsApp integration (Baileys)
-- Subagents as a core feature
-- Memory system: embeddings + sqlite + default session transcript indexing
-- Host-only tool execution (no sandbox for v1)
+## Repo & Goal
+- Repo root: `/Users/a/Projects/ant-cli`
+- GitHub: https://github.com/adamtash/ant
+- Product: **ant** — local autonomous assistant with WhatsApp integration, tools, memory, and subagents.
+- Core goals: single OpenAI-compatible provider (LM Studio), WhatsApp chat, subagents, memory indexing, host-only tool execution (no sandbox for now).
 
-## Current State
-- Worktree created at `/Users/a/Projects/ant` (branch `ant-main`).
-- New CLI scaffold lives under `ant/`.
-- Core runtime implemented:
-  - `ant/src/runtime/agent.ts`
-  - `ant/src/runtime/run.ts`
-  - `ant/src/runtime/queue.ts`
-  - `ant/src/runtime/subagents.ts`
-  - `ant/src/runtime/session-store.ts`
-  - `ant/src/runtime/prompt.ts`
-  - `ant/src/runtime/*-cli.ts`
-  - `ant/src/runtime/openai.ts`
-  - `ant/src/runtime/paths.ts`
-  - `ant/src/runtime/context.ts`
-- Memory system:
-  - `ant/src/memory/manager.ts`
-  - `ant/src/memory/index.ts`
-- WhatsApp integration:
-  - `ant/src/whatsapp/client.ts`
-- Config template:
-  - `ant/ant.config.json`
+## Current Runtime Overview
+- CLI entry: `src/cli.ts`
+- Runtime: `src/runtime/run.ts`
+- Agent core: `src/runtime/agent.ts`
+- Tools: `src/runtime/tools.ts`
+- Subagents: `src/runtime/subagents.ts`
+- Queue: `src/runtime/queue.ts`
+- Sessions: `src/runtime/session-store.ts`
+- Memory: `src/memory/manager.ts`
+- WhatsApp: `src/whatsapp/client.ts`
+- TUI: `src/runtime/tui.ts`
 
-## Next Steps (Recommended)
-1) Install deps: `pnpm install`.
-2) Configure `ant.config.json` for LM Studio and WhatsApp.
-3) Run: `pnpm dev -- run -c ant.config.json`.
+## Key Behaviors Implemented
+- **Media pipeline**: tools return `MEDIA:/path` tokens; `run.ts` parses and sends media replies.
+- **Direct tool fast‑paths**: `open_app` and `restart_ant` invoked without model involvement.
+- **CLI provider support**: parent LLM handles tools; CLI prompt includes history + memory recall summary.
+- **Memory**: embeddings + SQLite. `memory_search` forces session transcript reindexing on search.
+- **TUI**: `--tui` shows main/subagent status; uses alternate screen; console logs suppressed in TUI.
 
-## Notes
-- Keep new CLI isolated inside `ant/` to avoid mixing with Clawdbot sources.
-- Use JSON config only.
-- Default to indexing session transcripts in memory.
+## Tools (built‑in)
+- File: `read`, `write`, `ls`
+- Commands: `exec`, `open_app`, `restart_ant`
+- Media: `screenshot`, `screen_record`, `send_file`
+- Browser: `browser` (Playwright)
+- Memory: `memory_search`, `memory_get`
+- Subagents: `sessions_spawn`, `sessions_send`
+- Messaging: `message_send`
+- External CLI: `external_cli` (Codex/Copilot/Claude)
+- Twitter/X: `bird` (requires bird CLI)
+
+## Config
+- Primary config: `ant.config.json`
+- Logging: `~/.ant/ant.log` by default
+- WhatsApp session dir: `~/.ant/whatsapp` (via config)
+- Memory DB: `~/.ant/memory.sqlite`
+- Restart tool: `runtime.restart` command in config
+
+## Running
+```bash
+npm install
+npm run dev -- run -c ant.config.json
+# Optional TUI
+npm run dev -- run -c ant.config.json --tui
+```
+
+## Known Issues / Notes
+- `restart_ant` uses `npm run dev` and can hit TSX pipe permissions; workaround: `rm -rf /var/folders/*/T/tsx-501` or switch restart to `node dist/cli.js`.
+- WhatsApp respond‑to‑self uses JID/LID checks; `respondToSelfOnly: true` is set in config.
+
+## Where to Look for Behavior
+- Prompt rules: `src/runtime/prompt.ts`
+- Media parsing: `src/runtime/media.ts`
+- Tool execution logs: `~/.ant/ant.log`
+
+## Style / Conventions
+- TypeScript (ESM). Keep files concise. Add brief comments only for tricky logic.
+- Default to ASCII in code.
