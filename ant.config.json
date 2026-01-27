@@ -1,0 +1,96 @@
+{
+  "workspaceDir": "~",
+  "providers": {
+    "default": "lmstudio",
+    "items": {
+      "lmstudio": {
+        "type": "openai",
+        "baseUrl": "http://localhost:1234/v1",
+        "apiKey": "",
+        "model": "zai-org/glm-4.7-flash",
+        "embeddingsModel": "text-embedding-nomic-embed-text-v1.5"
+      },
+      "codex-cli": {
+        "type": "cli",
+        "cliProvider": "codex",
+        "model": "gpt-5.2-codex",
+         "args": [
+          "exec",
+          "--output-last-message",
+          "{output}",
+          "--color",
+          "never",
+          "--skip-git-repo-check",
+          "-"
+        ]
+      }
+    }
+  },
+  "routing": {
+    "chat": "codex-cli",
+    "tools": "codex-cli",
+    "embeddings": "lmstudio",
+    "parentForCli": "lmstudio"
+  },
+  "whatsapp": {
+    "sessionDir": "./.ant/whatsapp",
+    "respondToGroups": false,
+    "mentionOnly": true,
+    "botName": "ant",
+    "respondToSelfOnly": true,
+    "allowSelfMessages": true,
+    "resetOnLogout": true,
+    "typingIndicator": true,
+    "mentionKeywords": [
+      "ant"
+    ],
+    "ownerJids": []
+  },
+  "memory": {
+    "enabled": true,
+    "indexSessions": true,
+    "sqlitePath": "./.ant/memory.sqlite",
+    "embeddingsModel": "text-embedding-nomic-embed-text-v1.5"
+  },
+  "agent": {
+    "systemPrompt": ""
+  },
+  "subagents": {
+    "enabled": true
+  },
+  "cliTools": {
+    "enabled": true,
+    "timeoutMs": 120000,
+    "providers": {
+      "codex": {
+        "command": "codex",
+        "args": []
+      },
+      "copilot": {
+        "command": "copilot",
+        "args": []
+      },
+      "claude": {
+        "command": "claude",
+        "args": []
+      }
+    }
+  },
+  "logging": {
+    "level": "debug",
+    "fileLevel": "trace"
+  },
+  "runtime": {
+    "restart": {
+      "command": "npm",
+      "args": [
+        "run",
+        "dev",
+        "--",
+        "run",
+        "-c",
+        "ant.config.json"
+      ]
+    }
+  }
+}
