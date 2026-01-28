@@ -22,6 +22,7 @@ export type WhatsAppClient = {
     jid: string,
     payload: { filePath: string; type?: "image" | "video" | "document"; caption?: string },
   ) => Promise<void>;
+  getSelfJid: () => string | undefined;
   close: () => Promise<void>;
 };
 
@@ -29,6 +30,12 @@ export async function startWhatsApp(params: {
   cfg: AntConfig;
   logger: Logger;
   onMessage: (message: InboundMessage) => Promise<void>;
+  onStatus?: (status: {
+    connection?: string;
+    qr?: string;
+    loggedOut?: boolean;
+    statusCode?: number;
+  }) => void;
 }): Promise<WhatsAppClient> {
   await fs.mkdir(params.cfg.resolved.whatsappSessionDir, { recursive: true });
 
@@ -36,6 +43,8 @@ export async function startWhatsApp(params: {
 
   let sock: ReturnType<typeof makeWASocket> | null = null;
   let reconnecting = false;
+  let selfJid: string | undefined;
+  let selfLid: string | undefined;
 
   const createSocket = async (resetCreds: boolean) => {
     if (resetCreds) {
@@ -44,8 +53,8 @@ export async function startWhatsApp(params: {
     const { state, saveCreds } = await useMultiFileAuthState(
       params.cfg.resolved.whatsappSessionDir,
     );
-    let selfJid = state.creds.me?.id;
-    let selfLid = (state.creds.me as { lid?: string } | undefined)?.lid;
+    selfJid = state.creds.me?.id ?? selfJid;
+    selfLid = (state.creds.me as { lid?: string } | undefined)?.lid ?? selfLid;
     const refreshSelf = () => {
       selfJid = state.creds.me?.id ?? selfJid;
       selfLid = (state.creds.me as { lid?: string } | undefined)?.lid ?? selfLid;
@@ -67,6 +76,7 @@ export async function startWhatsApp(params: {
       if (qr) {
         qrcode.generate(qr, { small: true });
         params.logger.info("scan the QR code to pair WhatsApp");
+        params.onStatus?.({ connection: "qr", qr });
       }
       if (connection === "close") {
         const statusCode = (lastDisconnect?.error as any)?.output?.statusCode as
@@ -77,6 +87,7 @@ export async function startWhatsApp(params: {
           { loggedOut, statusCode },
           "whatsapp connection closed",
         );
+        params.onStatus?.({ connection: "close", loggedOut, statusCode });
         if (!reconnecting) {
           reconnecting = true;
           const shouldReset = loggedOut && params.cfg.whatsapp.resetOnLogout;
@@ -89,9 +100,13 @@ export async function startWhatsApp(params: {
       }
       if (connection === "open") {
         params.logger.info("whatsapp connection open");
+        params.onStatus?.({ connection: "open" });
         if (params.cfg.whatsapp.typingIndicator) {
           void next.sendPresenceUpdate("available").catch(() => {});
         }
+      }
+      if (connection === "connecting") {
+        params.onStatus?.({ connection: "connecting" });
       }
     });
 
@@ -158,6 +173,7 @@ export async function startWhatsApp(params: {
         throw err;
       }
     },
+    getSelfJid: () => selfJid,
     close: async () => {
       if (!sock) return;
       await sock.logout();

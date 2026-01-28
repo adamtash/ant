@@ -140,9 +140,16 @@ export class AgentRunner {
     if (fastPath) {
       return fastPath;
     }
-    const toolProvider = this.providers.resolveProvider("tools");
+    let toolProvider = this.providers.resolveProvider("tools");
     const chatProvider = this.providers.resolveProvider("chat");
     const parentProvider = this.resolveParentProvider(toolProvider);
+    if (toolProvider.type !== "openai") {
+      this.logger.warn(
+        { toolProvider: toolProvider.id, fallbackProvider: parentProvider.id },
+        "tools provider is not openai-capable; falling back to parent provider",
+      );
+      toolProvider = parentProvider;
+    }
     const toolPromptProvider = chatProvider.type === "cli" ? parentProvider : chatProvider;
     const toolPromptProviderType: "openai" | "cli" =
       chatProvider.type === "cli" ? "openai" : chatProvider.type;
@@ -391,6 +398,10 @@ export class AgentRunner {
 
   private resolveParentProvider(toolProvider: ResolvedProvider): ResolvedProvider {
     const parentId = this.cfg.resolved.routing.parentForCli ?? toolProvider.id;
+    if (!this.cfg.resolved.routing.parentForCli && toolProvider.type !== "openai") {
+      const fallbackId = this.cfg.resolved.providers.default;
+      return this.providers.resolveProviderById(fallbackId, "tools");
+    }
     return this.providers.resolveProviderById(parentId, "tools");
   }
 

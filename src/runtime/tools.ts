@@ -9,6 +9,8 @@ import type { MemoryManager } from "../memory/index.js";
 import type { SessionStore } from "./session-store.js";
 import type { SubagentManager } from "./subagents.js";
 import { runCliProvider, type CliProvider } from "./cli-tools.js";
+import { BrowserManager } from "./browser-manager.js";
+import { callBrowserProxy } from "./browser-proxy.js";
 
 export type ToolContext = {
   cfg: AntConfig;
@@ -263,74 +265,224 @@ export function buildTools(ctx: ToolContext): Tool[] {
   tools.push({
     name: "browser",
     description:
-      "Automate a headless browser to fetch rendered page text or screenshots. Requires Playwright.",
+      "Control the browser (status/start/stop/profiles/tabs/open/snapshot/screenshot/navigate/console/pdf/upload/dialog/act). Use profile=\"chrome\" for an existing Chrome session (requires browser.profiles.chrome.cdpUrl).",
     parameters: {
       type: "object",
       properties: {
-        url: { type: "string" },
-        action: { type: "string", enum: ["extract", "html", "screenshot"] },
+        action: {
+          type: "string",
+          enum: [
+            "status",
+            "start",
+            "stop",
+            "profiles",
+            "tabs",
+            "open",
+            "focus",
+            "close",
+            "snapshot",
+            "screenshot",
+            "navigate",
+            "console",
+            "pdf",
+            "upload",
+            "dialog",
+            "act",
+          ],
+        },
+        target: { type: "string", enum: ["sandbox", "host", "node"] },
+        node: { type: "string" },
+        profile: { type: "string" },
+        targetUrl: { type: "string" },
+        targetId: { type: "string" },
+        limit: { type: "number" },
+        maxChars: { type: "number" },
+        mode: { type: "string", enum: ["efficient"] },
+        snapshotFormat: { type: "string", enum: ["aria", "ai"] },
+        refs: { type: "string", enum: ["role", "aria"] },
+        interactive: { type: "boolean" },
+        compact: { type: "boolean" },
+        depth: { type: "number" },
         selector: { type: "string" },
-        waitMs: { type: "number" },
+        frame: { type: "string" },
+        labels: { type: "boolean" },
         fullPage: { type: "boolean" },
-        send: { type: "boolean" },
-        caption: { type: "string" },
+        ref: { type: "string" },
+        element: { type: "string" },
+        type: { type: "string", enum: ["png", "jpeg"] },
+        level: { type: "string" },
+        paths: { type: "array", items: { type: "string" } },
+        inputRef: { type: "string" },
+        timeoutMs: { type: "number" },
+        accept: { type: "boolean" },
+        promptText: { type: "string" },
+        request: { type: "object" },
       },
-      required: ["url", "action"],
+      required: ["action"],
     },
     execute: async (args, ctx) => {
       const parsed = typeof args === "string" ? safeJsonParse(args) : args;
       if (!parsed || typeof parsed !== "object") {
         throw new Error("invalid tool arguments");
       }
-      const url = String((parsed as any).url ?? "");
       const action = String((parsed as any).action ?? "");
-      const selector = (parsed as any).selector ? String((parsed as any).selector) : undefined;
-      const waitMs =
-        typeof (parsed as any).waitMs === "number" && (parsed as any).waitMs > 0
-          ? Math.min((parsed as any).waitMs, 60_000)
-          : 0;
-      const fullPage = typeof (parsed as any).fullPage === "boolean" ? (parsed as any).fullPage : true;
-      const send = typeof (parsed as any).send === "boolean" ? (parsed as any).send : false;
-      const caption = typeof (parsed as any).caption === "string" ? (parsed as any).caption : undefined;
-      if (!url || !action) {
-        throw new Error("url and action are required");
+      if (!action) {
+        throw new Error("action is required");
+      }
+      const target = typeof (parsed as any).target === "string" ? (parsed as any).target : undefined;
+      if (target === "sandbox") {
+        return { content: JSON.stringify({ ok: false, error: "sandbox target not supported" }) };
+      }
+      if (target === "node") {
+        const proxyBaseUrl = ctx.cfg.browser.proxyBaseUrl?.trim();
+        if (!proxyBaseUrl) {
+          return {
+            content: JSON.stringify({
+              ok: false,
+              error: "browser proxy not configured",
+              hint: "Set browser.proxyBaseUrl in ant.config.json.",
+            }),
+          };
+        }
+        try {
+          const result = await callBrowserProxy(proxyBaseUrl, action, parsed as any);
+          return { content: JSON.stringify(result) };
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          return { content: JSON.stringify({ ok: false, error: message }) };
+        }
       }
 
-      const pw = await loadPlaywright();
-      if (!pw.ok) {
-        return { content: JSON.stringify(pw) };
-      }
-
-      const browser = await pw.chromium.launch({ headless: true });
-      const page = await browser.newPage();
-      try {
-        await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45_000 });
-        if (waitMs > 0) {
-          await page.waitForTimeout(waitMs);
+      const manager = getBrowserManager(ctx.cfg);
+      switch (action) {
+        case "status":
+          return { content: JSON.stringify(await manager.status()) };
+        case "start":
+          return { content: JSON.stringify(await manager.start((parsed as any).profile)) };
+        case "stop":
+          return { content: JSON.stringify(await manager.stop((parsed as any).profile)) };
+        case "profiles":
+          return { content: JSON.stringify({ profiles: await manager.profiles() }) };
+        case "tabs":
+          return { content: JSON.stringify({ tabs: await manager.tabs((parsed as any).profile) }) };
+        case "open": {
+          const targetUrl = String((parsed as any).targetUrl ?? "");
+          if (!targetUrl) throw new Error("targetUrl is required");
+          return {
+            content: JSON.stringify(await manager.open((parsed as any).profile, targetUrl)),
+          };
         }
-        if (action === "extract") {
-          const text = selector
-            ? await page.locator(selector).innerText()
-            : await page.locator("body").innerText();
-          return { content: JSON.stringify({ ok: true, url, text }) };
+        case "focus": {
+          const targetId = String((parsed as any).targetId ?? "");
+          if (!targetId) throw new Error("targetId is required");
+          return {
+            content: JSON.stringify(await manager.focus((parsed as any).profile, targetId)),
+          };
         }
-        if (action === "html") {
-          const html = await page.content();
-          return { content: JSON.stringify({ ok: true, url, html }) };
+        case "close": {
+          const targetId = (parsed as any).targetId ? String((parsed as any).targetId) : undefined;
+          return {
+            content: JSON.stringify(await manager.close((parsed as any).profile, targetId)),
+          };
         }
-        if (action === "screenshot") {
-          const outputDir = path.join(ctx.cfg.resolved.stateDir, "captures");
-          await fs.mkdir(outputDir, { recursive: true });
-          const filePath = path.join(outputDir, `browser-${Date.now()}.png`);
-          await page.screenshot({ path: filePath, fullPage });
-          if (send && ctx.requester?.chatId) {
-            await ctx.sendMedia(ctx.requester.chatId, { filePath, type: "image", caption });
-          }
-          return { content: JSON.stringify({ ok: true, url, path: filePath, sent: Boolean(send) }) };
+        case "navigate": {
+          const targetUrl = String((parsed as any).targetUrl ?? "");
+          if (!targetUrl) throw new Error("targetUrl is required");
+          return {
+            content: JSON.stringify(
+              await manager.navigate(
+                (parsed as any).profile,
+                targetUrl,
+                (parsed as any).targetId,
+              ),
+            ),
+          };
         }
-        return { content: JSON.stringify({ ok: false, error: `unknown action: ${action}` }) };
-      } finally {
-        await browser.close().catch(() => {});
+        case "snapshot":
+          return {
+            content: JSON.stringify(
+              await manager.snapshot({
+                profile: (parsed as any).profile,
+                targetId: (parsed as any).targetId,
+                snapshotFormat: (parsed as any).snapshotFormat,
+                maxChars: (parsed as any).maxChars,
+                interactive: (parsed as any).interactive,
+                compact: (parsed as any).compact,
+                depth: (parsed as any).depth,
+              }),
+            ),
+          };
+        case "screenshot":
+          return {
+            content: JSON.stringify(
+              await manager.screenshot({
+                profile: (parsed as any).profile,
+                targetId: (parsed as any).targetId,
+                fullPage: (parsed as any).fullPage,
+                ref: (parsed as any).ref,
+                element: (parsed as any).element,
+                type: (parsed as any).type,
+              }),
+            ),
+          };
+        case "console":
+          return {
+            content: JSON.stringify(
+              await manager.consoleMessages(
+                (parsed as any).profile,
+                (parsed as any).targetId,
+                (parsed as any).level,
+              ),
+            ),
+          };
+        case "pdf":
+          return {
+            content: JSON.stringify(
+              await manager.pdf((parsed as any).profile, (parsed as any).targetId),
+            ),
+          };
+        case "upload": {
+          const paths = Array.isArray((parsed as any).paths)
+            ? (parsed as any).paths.map((p: any) => String(p))
+            : [];
+          if (!paths.length) throw new Error("paths are required");
+          return {
+            content: JSON.stringify(
+              await manager.upload({
+                profile: (parsed as any).profile,
+                targetId: (parsed as any).targetId,
+                paths,
+                ref: (parsed as any).ref,
+                inputRef: (parsed as any).inputRef,
+                element: (parsed as any).element,
+                timeoutMs: (parsed as any).timeoutMs,
+              }),
+            ),
+          };
+        }
+        case "dialog":
+          return {
+            content: JSON.stringify(
+              await manager.dialog({
+                profile: (parsed as any).profile,
+                targetId: (parsed as any).targetId,
+                accept: Boolean((parsed as any).accept),
+                promptText: (parsed as any).promptText,
+                timeoutMs: (parsed as any).timeoutMs,
+              }),
+            ),
+          };
+        case "act": {
+          const request = (parsed as any).request as Record<string, unknown> | undefined;
+          if (!request || typeof request !== "object") throw new Error("request required");
+          return {
+            content: JSON.stringify(
+              await manager.act((parsed as any).profile, request as any),
+            ),
+          };
+        }
+        default:
+          return { content: JSON.stringify({ ok: false, error: `unknown action: ${action}` }) };
       }
     },
   });
@@ -802,18 +954,11 @@ function isMissingBinary(result: { stderr: string; stdout: string; exitCode: num
   return combined.includes("enoent") || combined.includes("not found");
 }
 
-async function loadPlaywright(): Promise<
-  | { ok: true; chromium: typeof import("playwright").chromium }
-  | { ok: false; error: string; hint: string }
-> {
-  try {
-    const mod = await import("playwright");
-    return { ok: true, chromium: mod.chromium };
-  } catch (err) {
-    return {
-      ok: false,
-      error: err instanceof Error ? err.message : String(err),
-      hint: "Install Playwright: `npm install playwright` then `npx playwright install chromium`.",
-    };
+let browserManager: BrowserManager | null = null;
+
+function getBrowserManager(cfg: AntConfig): BrowserManager {
+  if (!browserManager) {
+    browserManager = new BrowserManager(cfg);
   }
+  return browserManager;
 }

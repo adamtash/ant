@@ -6,6 +6,8 @@ type QueueEntry<T> = {
   reject: (reason?: unknown) => void;
   enqueuedAt: number;
   warnAfterMs: number;
+  text?: string;
+  lane: string;
 };
 
 type LaneState = {
@@ -22,6 +24,17 @@ export type QueueLaneSnapshot = {
   active: number;
   maxConcurrent: number;
   oldestEnqueuedAt?: number;
+};
+
+export type QueueItemSnapshot = {
+  lane: string;
+  text: string;
+  enqueuedAt: number;
+};
+
+export type QueueDetailSnapshot = {
+  lane: string;
+  items: QueueItemSnapshot[];
 };
 
 export class CommandQueue {
@@ -55,9 +68,15 @@ export class CommandQueue {
     this.drainLane(state);
   }
 
-  enqueue<T>(lane: string, task: () => Promise<T>): Promise<T> {
+  enqueue<T>(
+    lane: string,
+    task: () => Promise<T>,
+    meta?: { text?: string; lane?: string },
+  ): Promise<T> {
     const state = this.getLane(lane);
     const warnAfterMs = this.warnAfterMs;
+    const resolvedLane = state.lane;
+    const text = meta?.text?.trim();
     return new Promise<T>((resolve, reject) => {
       state.queue.push({
         task: () => task(),
@@ -65,6 +84,8 @@ export class CommandQueue {
         reject,
         enqueuedAt: Date.now(),
         warnAfterMs,
+        text: text || undefined,
+        lane: resolvedLane,
       });
       this.drainLane(state);
     });
@@ -101,6 +122,20 @@ export class CommandQueue {
     }
     return lanes.sort((a, b) => a.lane.localeCompare(b.lane));
   }
+
+  snapshotDetail(): QueueDetailSnapshot[] {
+    const lanes: QueueDetailSnapshot[] = [];
+    for (const state of this.lanes.values()) {
+      const items = state.queue.map((entry) => ({
+        lane: entry.lane,
+        text: entry.text ?? "",
+        enqueuedAt: entry.enqueuedAt,
+      }));
+      lanes.push({ lane: state.lane, items });
+    }
+    return lanes.sort((a, b) => a.lane.localeCompare(b.lane));
+  }
+
 
   private drainLane(state: LaneState) {
     if (state.draining) return;

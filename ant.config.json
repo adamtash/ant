@@ -32,6 +32,14 @@
     "embeddings": "lmstudio",
     "parentForCli": "lmstudio"
   },
+  "ui": {
+    "enabled": true,
+    "host": "127.0.0.1",
+    "port": 5117,
+    "autoOpen": true,
+    "openUrl": "http://127.0.0.1:5117",
+    "staticDir": "/Users/a/Projects/ant-cli/ui/dist"
+  },
   "whatsapp": {
     "sessionDir": "./.ant/whatsapp",
     "respondToGroups": false,

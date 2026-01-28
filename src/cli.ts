@@ -9,6 +9,7 @@ import { listSessions, showSession, clearSession } from "./runtime/sessions-cli.
 import { memorySearchCommand, memoryIndexCommand } from "./runtime/memory-cli.js";
 import { listSubagents, cleanupSubagents } from "./runtime/subagents-cli.js";
 import { runMcpServer } from "./runtime/mcp-cli.js";
+import { stopAnt, restartAnt } from "./runtime/control-cli.js";
 
 const program = new Command();
 
@@ -31,6 +32,32 @@ program
   .action(async (options) => {
     const cfg = await loadConfig(options.config);
     await showStatus(cfg);
+  });
+
+program
+  .command("stop")
+  .description("Stop the running ant process (UI + runtime)")
+  .option("-c, --config <path>", "Path to ant.config.json")
+  .action(async (options) => {
+    const cfg = await loadConfig(options.config);
+    const ok = await stopAnt(cfg);
+    if (!ok) {
+      console.error("ant is not running or could not be stopped");
+      process.exitCode = 1;
+    }
+  });
+
+program
+  .command("restart")
+  .description("Restart the running ant process (UI + runtime)")
+  .option("-c, --config <path>", "Path to ant.config.json")
+  .action(async (options) => {
+    const cfg = await loadConfig(options.config);
+    const ok = await restartAnt(cfg);
+    if (!ok) {
+      console.error("ant could not be restarted");
+      process.exitCode = 1;
+    }
   });
 
 program

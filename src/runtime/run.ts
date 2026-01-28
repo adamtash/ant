@@ -15,8 +15,18 @@ import { startMemorySync } from "./memory-sync.js";
 import { normalizeMediaSource, splitMediaFromOutput } from "./media.js";
 import { RuntimeStatusStore } from "./status-store.js";
 import { startTui } from "./tui.js";
+import { startUiServer } from "./ui-server.js";
+import { createWhatsAppStatusStore } from "./whatsapp-status.js";
+import { clearPidFile, writePidFile } from "./process-control.js";
 
 export async function runAnt(cfg: AntConfig, opts?: { tui?: boolean }): Promise<void> {
+  await writePidFile(cfg);
+  const cleanupPid = () => {
+    void clearPidFile(cfg);
+  };
+  process.once("exit", cleanupPid);
+  process.once("SIGINT", () => cleanupPid());
+  process.once("SIGTERM", () => cleanupPid());
   const logger = createLogger(
     cfg.logging.level,
     cfg.resolved.logFilePath,
@@ -36,6 +46,8 @@ export async function runAnt(cfg: AntConfig, opts?: { tui?: boolean }): Promise<
   });
 
   let whatsappClient: Awaited<ReturnType<typeof startWhatsApp>> | null = null;
+  let pendingStartupMessage = false;
+  let startupMessageSent = false;
   const memorySync = startMemorySync({
     cfg,
     memory,
@@ -43,12 +55,19 @@ export async function runAnt(cfg: AntConfig, opts?: { tui?: boolean }): Promise<
     sessionsDir: paths.sessionsDir,
   });
 
+  const whatsappStatus = createWhatsAppStatusStore();
+
   const sendMessage = async (chatId: string, text: string) => {
     if (!whatsappClient) {
       logger.warn("whatsapp client not ready; dropping message");
       return;
     }
-    await whatsappClient.sendText(chatId, text);
+    try {
+      await whatsappClient.sendText(chatId, text);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      logger.warn({ error: message, chatId }, "whatsapp sendText failed");
+    }
   };
 
   const sendMedia = async (
@@ -97,6 +116,38 @@ export async function runAnt(cfg: AntConfig, opts?: { tui?: boolean }): Promise<
     }
   };
 
+  const maybeSendStartupMessage = async () => {
+    if (startupMessageSent) return;
+    if (!whatsappClient) return;
+    const message = cfg.whatsapp.startupMessage?.trim();
+    if (!message) return;
+    let recipients = cfg.whatsapp.startupRecipients?.slice() ?? [];
+    if (recipients.length === 0) {
+      recipients = cfg.whatsapp.ownerJids?.slice() ?? [];
+    }
+    if (recipients.length === 0) {
+      const selfJid = whatsappClient?.getSelfJid();
+      if (selfJid) recipients = [selfJid];
+    }
+    if (recipients.length === 0) {
+      logger.warn("startupMessage configured but no recipients available");
+      return;
+    }
+    let allSent = true;
+    for (const jid of recipients) {
+      try {
+        await whatsappClient.sendText(jid, message);
+      } catch (err) {
+        allSent = false;
+        const error = err instanceof Error ? err.message : String(err);
+        logger.warn({ error, jid }, "startup message send failed");
+      }
+    }
+    if (allSent) {
+      startupMessageSent = true;
+    }
+  };
+
   let agent: AgentRunner | null = null;
   const subagents = new SubagentManager({
     cfg,
@@ -110,7 +161,31 @@ export async function runAnt(cfg: AntConfig, opts?: { tui?: boolean }): Promise<
   });
   await subagents.load();
 
-  const tui = opts?.tui ? startTui({ queue, subagents, status }) : null;
+  const providerRuntime = [
+    { label: "chat", ...providers.resolveProvider("chat") },
+    { label: "tools", ...providers.resolveProvider("tools") },
+    { label: "summary", ...providers.resolveProvider("summary") },
+    { label: "subagent", ...providers.resolveProvider("subagent") },
+    { label: "embeddings", ...providers.resolveProvider("embeddings") },
+  ].map((entry) => ({
+    label: entry.label,
+    id: entry.id,
+    type: entry.type,
+    model: entry.modelForAction,
+    baseUrl: entry.baseUrl,
+    cliProvider: entry.cliProvider,
+  }));
+  const uiUrl = cfg.ui.openUrl?.trim() || `http://${cfg.ui.host}:${cfg.ui.port}`;
+  const tui = opts?.tui
+    ? startTui({
+        queue,
+        subagents,
+        status,
+        runtime: { providers: providerRuntime },
+        logFilePath: cfg.resolved.logFilePath,
+        uiUrl,
+      })
+    : null;
 
   agent = new AgentRunner({
     cfg,
@@ -123,34 +198,64 @@ export async function runAnt(cfg: AntConfig, opts?: { tui?: boolean }): Promise<
     sendMedia,
   });
 
+  const ui = cfg.ui.enabled
+    ? startUiServer({
+        cfg,
+        logger,
+        queue,
+        status,
+        subagents,
+        providers,
+        memory,
+        sessions,
+        agent,
+        whatsappStatus,
+      })
+    : null;
+
   whatsappClient = await startWhatsApp({
     cfg,
     logger,
     onMessage: async (message) => {
-      await queue.enqueue(message.sessionKey, async () => {
-        logger.info({ sessionKey: message.sessionKey }, "inbound message");
-        await whatsappClient?.sendTyping(message.chatId, true);
-        status.startMainTask({
-          sessionKey: message.sessionKey,
-          chatId: message.chatId,
-          text: message.text,
-        });
-        try {
-          const reply = await agent!.runInboundMessage(message);
-          await deliverReply(message.chatId, reply);
-          status.finishMainTask(message.sessionKey, { status: "complete" });
-        } catch (err) {
-          status.finishMainTask(message.sessionKey, {
-            status: "error",
-            error: err instanceof Error ? err.message : String(err),
+      await queue.enqueue(
+        message.sessionKey,
+        async () => {
+          logger.info({ sessionKey: message.sessionKey }, "inbound message");
+          await whatsappClient?.sendTyping(message.chatId, true);
+          status.startMainTask({
+            sessionKey: message.sessionKey,
+            chatId: message.chatId,
+            text: message.text,
           });
-          throw err;
-        } finally {
-          await whatsappClient?.sendTyping(message.chatId, false);
-        }
-      });
+          try {
+            const reply = await agent!.runInboundMessage(message);
+            await deliverReply(message.chatId, reply);
+            status.finishMainTask(message.sessionKey, { status: "complete" });
+          } catch (err) {
+            status.finishMainTask(message.sessionKey, {
+              status: "error",
+              error: err instanceof Error ? err.message : String(err),
+            });
+            throw err;
+          } finally {
+            await whatsappClient?.sendTyping(message.chatId, false);
+          }
+        },
+        { text: message.text, lane: message.sessionKey },
+      );
+    },
+
+    onStatus: (update) => {
+      whatsappStatus.update(update);
+      if (update.connection === "open") {
+        pendingStartupMessage = true;
+        void maybeSendStartupMessage();
+      }
     },
   });
+  if (pendingStartupMessage) {
+    void maybeSendStartupMessage();
+  }
 
   logger.info("ant runtime started");
 }

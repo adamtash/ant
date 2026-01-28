@@ -10,7 +10,9 @@
     "build": "tsc -p tsconfig.json",
     "dev": "tsx src/cli.ts",
     "lint": "echo \"no lint yet\"",
-    "test": "node --test --import tsx"
+    "test": "node --test --import tsx",
+    "ui:dev": "npm --prefix ui run dev",
+    "ui:build": "npm --prefix ui run build"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",
