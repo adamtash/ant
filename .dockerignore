@@ -1,0 +1,72 @@
+# =============================================================================
+# Docker Ignore File for ANT CLI
+# =============================================================================
+
+# Dependencies (will be installed fresh in container)
+node_modules
+ui/node_modules
+
+# Build outputs (will be built fresh in container)
+dist
+ui/dist
+
+# Git
+.git
+.gitignore
+
+# IDE and Editor
+.idea
+.vscode
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Environment files (sensitive - mount at runtime)
+.env
+.env.local
+.env.*.local
+
+# Logs
+*.log
+logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Test files
+test
+tests
+*.test.ts
+*.spec.ts
+coverage
+.nyc_output
+
+# Documentation (not needed in container)
+*.md
+!README.md
+
+# Local data and cache
+.ant
+data
+.cache
+.npm
+
+# Claude/AI assistant files
+.claude
+
+# Development config
+.eslintrc*
+.prettierrc*
+vitest.config.*
+
+# TypeScript build info
+*.tsbuildinfo
+
+# Docker files (prevent recursive inclusion)
+Dockerfile*
+docker-compose*.yml
+.dockerignore

@@ -16,5 +16,18 @@ export default defineConfig({
   build: {
     outDir: 'dist',
     emptyOutDir: true,
+    chunkSizeWarningLimit: 1000,
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          // Split vendor chunks
+          'vendor-react': ['react', 'react-dom', 'react-router-dom'],
+          'vendor-charts': ['recharts', 'd3'],
+          'vendor-canvas': ['konva', 'react-konva'],
+          'vendor-animation': ['framer-motion'],
+          'vendor-state': ['zustand'],
+        },
+      },
+    },
   },
 })

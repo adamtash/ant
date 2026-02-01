@@ -7,9 +7,26 @@
 }
 
 body {
-  @apply bg-slate-950 text-slate-100;
+  @apply bg-chamber-dark text-white;
 }
 
 * {
   @apply box-border;
+}
+
+/* Custom layer for ant colony utilities */
+@layer utilities {
+  .line-clamp-2 {
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+  }
+
+  .line-clamp-3 {
+    display: -webkit-box;
+    -webkit-line-clamp: 3;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+  }
 }

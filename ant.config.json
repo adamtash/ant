@@ -84,6 +84,22 @@
       }
     }
   },
+  "scheduler": {
+    "enabled": true,
+    "storePath": "./.ant/jobs.json",
+    "timezone": "UTC"
+  },
+  "monitoring": {
+    "enabled": true,
+    "retentionDays": 30,
+    "alertChannels": ["whatsapp"],
+    "criticalErrorThreshold": 5
+  },
+  "gateway": {
+    "enabled": true,
+    "port": 18789,
+    "host": "127.0.0.1"
+  },
   "logging": {
     "level": "debug",
     "fileLevel": "trace"
