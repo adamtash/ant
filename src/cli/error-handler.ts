@@ -123,11 +123,25 @@ export function formatError(err: unknown, verbose = false): string {
 }
 
 /**
- * Handle an error and exit with appropriate code
+ * Handle an error and exit with appropriate code, or execute an async function with error handling.
  */
-export function handleError(err: unknown, verbose = false): never {
+export async function handleError(errOrFn: unknown | (() => Promise<unknown>), verbose = false): Promise<void> {
+  if (typeof errOrFn === "function") {
+    try {
+      await errOrFn();
+      return;
+    } catch (err) {
+      handleError(err, verbose);
+      return;
+    }
+  }
+
+  const err = errOrFn;
   console.error(formatError(err, verbose));
   process.exitCode = 1;
+  // If we're just reporting an error, we don't necessarily need to throw
+  // unless we want to bubble up. But for CLI entry points, setting exitCode is enough.
+  // However, keeping throw ensures we stop execution if this was called directly.
   throw err;
 }
 

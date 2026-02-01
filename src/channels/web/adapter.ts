@@ -87,6 +87,13 @@ export class WebAdapter extends BaseChannelAdapter {
     this.setConnected(false, "stopped");
   }
 
+  getStatus(): Record<string, any> {
+    return {
+      connected: this.isConnected(),
+      address: this.getAddress(),
+    };
+  }
+
   // ==========================================================================
   // Message Handling
   // ==========================================================================

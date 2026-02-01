@@ -109,6 +109,15 @@ export class CLIAdapter extends BaseChannelAdapter {
     this.setConnected(false, "stopped");
   }
 
+  getStatus(): Record<string, any> {
+    return {
+      connected: this.isConnected(),
+      interactive: this.interactive,
+      // sessionManager doesn't explicitly expose count, but getSessions() returns array
+      sessionKey: this.currentSession?.sessionKey,
+    };
+  }
+
   // ==========================================================================
   // Message Handling
   // ==========================================================================

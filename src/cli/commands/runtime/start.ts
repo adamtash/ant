@@ -72,17 +72,76 @@ export async function start(cfg: AntConfig, options: StartOptions = {}): Promise
     // Start the gateway server
     const { GatewayServer } = await import("../../../gateway/server.js");
     const { createLogger } = await import("../../../log.js");
+    const { createAgentEngine } = await import("../../../agent/engine.js");
+    const { MessageRouter, WhatsAppAdapter } = await import("../../../channels/index.js");
 
     const logLevel = cfg.logging?.level || "info";
-    const logger = createLogger(logLevel);
+    const logger = createLogger(
+      logLevel,
+      cfg.resolved.logFilePath,
+      cfg.resolved.logFileLevel
+    );
+
+    // Initialize Router
+    const router = new MessageRouter({ logger });
+    router.start();
+
+    // Initialize WhatsApp Adapter
+    const whatsapp = new WhatsAppAdapter({
+        cfg,
+        logger,
+        // onStatusUpdate handled by adapter events/router
+    });
+
+    try {
+        await whatsapp.start();
+        router.registerAdapter(whatsapp);
+        logger.info("WhatsApp adapter registered");
+    } catch (err) {
+        logger.error({ error: err instanceof Error ? err.message : String(err) }, "Failed to start WhatsApp adapter");
+    }
+
+    // Initialize Agent Engine
+    const agentEngine = await createAgentEngine({
+      config: {
+        maxHistoryTokens: cfg.agent.maxHistoryTokens,
+        temperature: cfg.agent.temperature,
+        maxToolIterations: 20, // Default or config? Config doesn't have it explicitly in AgentSchema, verify in config.ts
+      },
+      providerConfig: {
+        providers: cfg.resolved.providers.items as any,
+        defaultProvider: cfg.resolved.providers.default,
+        routing: cfg.resolved.routing,
+      },
+
+      logger,
+      workspaceDir: cfg.resolved.workspaceDir,
+      stateDir: cfg.resolved.stateDir,
+      // memorySearch: ... // Optional, skip for now to simplify
+    });
+
+    // Initialize Main Agent
+    const { MainAgent } = await import("../../../agent/main-agent.js");
+    const mainAgent = new MainAgent({
+      config: cfg,
+      agentEngine,
+      logger,
+    });
+    mainAgent.start();
 
     const server = new GatewayServer({
+
       config: {
         port: cfg.ui.port,
         host: cfg.ui.host,
         stateDir: cfg.resolved.stateDir,
+        staticDir: cfg.resolved.uiStaticDir,
+        logFilePath: cfg.resolved.logFilePath,
+        configPath: cfg.resolved.configPath,
       },
       logger,
+      agentEngine,
+      router,
     });
 
     await server.start();
@@ -95,15 +154,17 @@ export async function start(cfg: AntConfig, options: StartOptions = {}): Promise
 
     // Keep running until interrupted
     await new Promise<void>((resolve) => {
-      process.on("SIGINT", () => {
+      const shutdown = async () => {
         out.info("\nShutting down...");
+        mainAgent.stop();
+        await router.stop();
         server.stop().then(() => resolve());
-      });
-      process.on("SIGTERM", () => {
-        out.info("\nShutting down...");
-        server.stop().then(() => resolve());
-      });
+      };
+
+      process.on("SIGINT", shutdown);
+      process.on("SIGTERM", shutdown);
     });
+
   }
 }
 

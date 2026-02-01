@@ -8,7 +8,9 @@
   },
   "scripts": {
     "start": "node dist/cli.js start",
+    "start:all": "npm run ui:build && bash -lc 'if [ -f ~/.ant/ant.pid ]; then kill -9 \"$(cat ~/.ant/ant.pid)\"; fi; rm -f ~/.ant/ant.pid; npm run dev -- start -c ant.config.json'",
     "dev": "tsx src/cli.ts",
+    "dev:all": "bash -lc 'pkill -f \"node.*ant-cli\" || true && rm -f ~/.ant/ant.pid' && npm run build && npm run ui:build && bash -lc 'npm run dev -- start -c ant.config.json & npm run ui:dev'",
     "build": "tsc -p tsconfig.json",
     "lint": "eslint src --ext .ts",
     "typecheck": "tsc --noEmit",

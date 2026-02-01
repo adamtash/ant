@@ -263,7 +263,10 @@ export interface ProviderConfig {
   model: string;
   contextWindow?: number;
   embeddingsModel?: string;
+  command?: string;
+  args?: string[];
 }
+
 
 // ============================================================================
 // Logging Types

@@ -19,7 +19,10 @@ import {
   SeasonalCycles,
   PheromonTrails,
   GeneticCode,
+  Logs,
+  Tunnels,
 } from './pages';
+
 
 // Navigation items configuration
 const navItems: Array<{
@@ -86,11 +89,25 @@ const navItems: Array<{
     description: 'Session History',
   },
   {
+    id: 'logs',
+    path: '/logs',
+    label: 'Colony Logs',
+    icon: '📜',
+    description: 'System Logs',
+  },
+  {
     id: 'genetic',
     path: '/genetic',
     label: 'Genetic Code',
     icon: '🧬',
     description: 'Configuration',
+  },
+  {
+    id: 'tunnels',
+    path: '/tunnels',
+    label: 'Tunnels',
+    icon: '📡',
+    description: 'Channels',
   },
 ];
 
@@ -189,7 +206,10 @@ const MainContent: React.FC = () => {
         <Route path="/war" element={<WarRoom />} />
         <Route path="/seasonal" element={<SeasonalCycles />} />
         <Route path="/pheromone" element={<PheromonTrails />} />
+        <Route path="/logs" element={<Logs />} />
         <Route path="/genetic" element={<GeneticCode />} />
+        <Route path="/tunnels" element={<Tunnels />} />
+
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>
     </main>

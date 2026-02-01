@@ -24,6 +24,8 @@ const ProviderItemSchema = z
       .default({}),
     contextWindow: z.number().int().positive().optional(),
     embeddingsModel: z.string().min(1).optional(),
+    command: z.string().optional(),
+    args: z.array(z.string()).optional(),
   })
   .refine(
     (value) => (value.type === "openai" ? Boolean(value.baseUrl?.trim()) : true),
@@ -93,7 +95,15 @@ const AgentSchema = z.object({
   temperature: z.number().min(0).max(2).default(0.2),
 });
 
+const MainAgentSchema = z.object({
+  enabled: z.boolean().default(true),
+  intervalMs: z.number().int().positive().default(60000),
+  dutiesFile: z.string().default("AGENT_DUTIES.md"),
+  logFile: z.string().default("AGENT_LOG.md"),
+});
+
 const SubagentsSchema = z.object({
+
   enabled: z.boolean().default(true),
   timeoutMs: z.number().int().positive().default(300_000),
   archiveAfterMinutes: z.number().int().positive().default(60),
@@ -191,7 +201,9 @@ const ConfigSchema = z.object({
   whatsapp: WhatsAppSchema,
   memory: MemorySchema,
   agent: AgentSchema.default({}),
+  mainAgent: MainAgentSchema.default({}),
   subagents: SubagentsSchema.default({}),
+
   cliTools: CliToolsSchema.default({}),
   queue: QueueSchema.default({}),
   logging: LoggingSchema.default({}),
@@ -220,6 +232,14 @@ export async function loadConfig(explicitPath?: string): Promise<AntConfig> {
   const parsed = JSON.parse(raw);
   const base = ConfigSchema.parse(parsed);
   return resolveConfig(base, configPath);
+}
+
+export async function saveConfig(config: unknown, explicitPath?: string): Promise<void> {
+  const configPath = resolveConfigPath(explicitPath);
+  // specific validation could be done here, or just writing JSON
+  // We do a partial parse/validation to ensure structure
+  const parsed = ConfigSchema.parse(config);
+  await fs.writeFile(configPath, JSON.stringify(parsed, null, 2), "utf-8");
 }
 
 export function resolveConfigPath(explicitPath?: string): string {

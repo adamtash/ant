@@ -23,12 +23,22 @@
           "--skip-git-repo-check",
           "-"
         ]
+      },
+      "copilot": {
+        "type": "cli",
+        "cliProvider": "copilot",
+        "model": "gpt-4.1",
+         "args": [
+          "--yolo",
+          "--no-ask-user"
+        ]
       }
     }
   },
+
   "routing": {
-    "chat": "codex-cli",
-    "tools": "codex-cli",
+    "chat": "copilot",
+    "tools": "copilot",
     "embeddings": "lmstudio",
     "parentForCli": "lmstudio"
   },

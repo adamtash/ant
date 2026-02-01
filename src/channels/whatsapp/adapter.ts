@@ -116,6 +116,17 @@ export class WhatsAppAdapter extends BaseChannelAdapter {
     this.setConnected(false, "stopped");
   }
 
+  getStatus(): Record<string, any> {
+      if (!this.client) {
+          return { connected: false, message: "Client not initialized" };
+      }
+      return {
+          connected: this.client.isConnected(),
+          selfJid: this.client.getSelfJid(),
+          ...this.client.getStatus(),
+      };
+  }
+
   // ==========================================================================
   // Message Sending
   // ==========================================================================

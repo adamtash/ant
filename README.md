@@ -1,17 +1,17 @@
-# ANT CLI
+# 🐜 ANT CLI
 
-A modular, autonomous AI agent runtime that runs locally on your machine. Connect via WhatsApp, CLI, or Web interface. ANT manages memory, schedules tasks, and continuously improves itself.
+A modular, autonomous AI agent runtime that runs locally on your machine. Connect via WhatsApp, CLI, or Web interface. ANT manages memory, schedules tasks, and continuously improves itself through its Main Agent system.
 
-## Features
+## ✨ Features
 
-- **Multi-Channel Support** - Interact via WhatsApp, CLI commands, or Web UI
+- **Multi-Channel Support** - Interact via WhatsApp, CLI commands, or Web UI (React + Tailwind)
 - **Cron Scheduling** - Schedule recurring agent tasks with cron expressions
-- **Memory System** - Semantic search with embeddings over notes and session history
-- **Self-Improvement** - Skill generation and autonomous learning from interactions
-- **Monitoring & Alerting** - Live dashboards, logging, and critical error alerts
+- **Memory System** - Semantic search with embeddings over notes and session history (SQLite)
+- **Main Agent Loop** - Ralph-inspired autonomous system that continuously monitors, maintains, and improves
 - **Subagents** - Spawn parallel workers for complex tasks
-- **Local Tools** - File operations, shell commands, screenshots, browser automation
+- **Local Tools** - File operations, shell commands, screenshots, browser automation (Playwright)
 - **Pluggable Providers** - OpenAI-compatible APIs (LM Studio) or CLI tools (Codex, Claude, Copilot)
+- **Web Dashboard** - Real-time monitoring, session history, memory search, and system health
 
 ## Installation
 
@@ -24,19 +24,23 @@ npm install
 # Build the project
 npm run build
 
-# (Optional) Build the web UI
+# Build the web UI (production)
 npm run ui:build
 ```
 
-### Requirements
+### System Requirements
 
-- Node.js 22+
-- WhatsApp account (for QR pairing)
-- LM Studio or any OpenAI-compatible API (for local LLM)
+- **Node.js 22+** - Runtime engine
+- **WhatsApp account** - For QR pairing (optional if using CLI/Web only)
+- **LM Studio or OpenAI-compatible API** - For local LLM inference
+- **macOS/Linux** - Primary support (Windows WSL2 compatible)
+- **Screen Recording permission** (macOS) - For screenshot/recording tools
 
 ## Quick Start
 
-1. **Create configuration** - Copy and customize `ant.config.json`:
+### 1. Configuration
+
+Copy and customize `ant.config.json` in the project root:
 
 ```json
 {
@@ -64,21 +68,50 @@ npm run ui:build
   "scheduler": {
     "enabled": true,
     "storePath": "./.ant/jobs.json"
+  },
+  "ui": {
+    "enabled": true,
+    "port": 5117,
+    "autoOpen": true
+  },
+  "mainAgent": {
+    "enabled": true,
+    "iterationDelayMinutes": 5
   }
 }
 ```
 
-2. **Start the runtime**:
+### 2. Start the Runtime
 
 ```bash
-ant start -c ant.config.json
+# Development mode (with hot reload)
+npm run dev -- run -c ant.config.json
+
+# With TUI dashboard (real-time monitoring)
+npm run dev -- run -c ant.config.json --tui
+
+# Production mode
+npm start
 ```
 
-3. **Scan the QR code** to pair with WhatsApp, then start chatting!
+### 3. Web UI
+
+Open **http://localhost:5117** in your browser to access:
+- 🎛️ **Royal Chamber** - Main dashboard with real-time status
+- 💬 **Chat Interface** - Direct conversation with the agent
+- 📊 **Sessions** - View and export conversation history
+- 🧠 **Memory** - Search semantic knowledge base
+- ⚙️ **Settings** - Configure runtime options
+
+### 4. WhatsApp (Optional)
+
+Scan the QR code in the terminal to pair with WhatsApp and start chatting!
+
+---
 
 ## CLI Commands Reference
 
-### Runtime
+### Runtime Management
 
 | Command | Description |
 |---------|-------------|
@@ -104,8 +137,7 @@ ant start -c ant.config.json
 
 | Command | Description |
 |---------|-------------|
-| `ant schedule add "<cron>" -p "<prompt>"` | Schedule a recurring prompt |
-| `ant schedule add "0 9 * * *" -n "daily" -p "Check email"` | Daily 9am task |
+| `ant schedule add "0 9 * * *" -p "<prompt>"` | Schedule daily 9am task |
 | `ant schedule list` | List all scheduled jobs |
 | `ant schedule run <jobId>` | Manually trigger a job |
 | `ant schedule remove <jobId>` | Delete a scheduled job |
@@ -115,7 +147,6 @@ ant start -c ant.config.json
 | Command | Description |
 |---------|-------------|
 | `ant remember "<note>"` | Add a note to memory |
-| `ant remember --category work "<note>"` | Add with category |
 | `ant recall "<query>"` | Search memory |
 | `ant recall -l 10 "<query>"` | Search with limit |
 | `ant memory export -f json -o backup.json` | Export memory |
@@ -140,17 +171,21 @@ ant start -c ant.config.json
 | `ant doctor` | Run health checks |
 | `ant doctor --fix` | Auto-fix issues |
 
-### Tools
+### Main Agent
 
 | Command | Description |
 |---------|-------------|
-| `ant list-tools` | Show all available tools |
-| `ant tool <name>` | Get tool details and schema |
+| `ant main-agent status` | Check Main Agent status |
+| `ant main-agent pause` | Pause Main Agent loop |
+| `ant main-agent resume` | Resume Main Agent loop |
+| `ant main-agent logs` | View Main Agent log file |
 
 ### Utilities
 
 | Command | Description |
 |---------|-------------|
+| `ant list-tools` | Show all available tools |
+| `ant tool <name>` | Get tool details and schema |
 | `ant onboard` | Interactive setup wizard |
 | `ant mcp-server` | Run MCP server over stdio |
 | `ant subagents list` | List active subagents |
@@ -162,6 +197,8 @@ ant start -c ant.config.json
 |---------|-------------|
 | `ant debug run "<prompt>"` | Run prompt without WhatsApp |
 | `ant debug simulate "<text>"` | Simulate inbound message |
+
+---
 
 ## Configuration (`ant.config.json`)
 
@@ -188,7 +225,7 @@ ant start -c ant.config.json
         "type": "openai",
         "baseUrl": "http://localhost:1234/v1",
         "model": "your-model",
-        "embeddingsModel": "embedding-model"
+        "embeddingsModel": "text-embedding-nomic-embed-text-v1.5"
       },
       "codex-cli": {
         "type": "cli",
@@ -256,6 +293,29 @@ ant start -c ant.config.json
 }
 ```
 
+### Main Agent (NEW - Autonomous Background System)
+
+```json
+{
+  "mainAgent": {
+    "enabled": true,
+    "iterationDelayMinutes": 5,
+    "maxIterationsPerTask": 10,
+    "maxConsecutiveFailures": 3,
+    "dutiesFile": "AGENT_DUTIES.md",
+    "logFile": "AGENT_LOG.md",
+    "alertOwnerOnCritical": true,
+    "duties": {
+      "subagentManagement": true,
+      "systemMaintenance": true,
+      "memoryManagement": true,
+      "improvements": true,
+      "monitoring": true
+    }
+  }
+}
+```
+
 ### Monitoring
 
 ```json
@@ -268,6 +328,8 @@ ant start -c ant.config.json
   }
 }
 ```
+
+---
 
 ## Architecture Overview
 
@@ -291,53 +353,198 @@ ant start -c ant.config.json
      │             │           │               │
      ▼             ▼           ▼               ▼
 ┌─────────┐  ┌──────────┐  ┌─────────┐  ┌───────────┐
-│  Tools  │  │ Providers│  │ Memory  │  │ Scheduler │
+│  Tools  │  │Providers│  │ Memory  │  │ Subagents │
 │         │  │          │  │         │  │           │
-│ • File  │  │ • OpenAI │  │ • SQLite│  │ • Cron    │
-│ • Exec  │  │ • CLI    │  │ • Vector│  │ • Jobs    │
+│ • File  │  │ • OpenAI │  │ • SQLite│  │ • Jobs    │
+│ • Exec  │  │ • CLI    │  │ • Vector│  │ • Monitors│
 │ • Media │  │   tools  │  │ • Search│  │           │
 │ • Browse│  │          │  │         │  │           │
 └─────────┘  └──────────┘  └─────────┘  └───────────┘
                                 │
                                 ▼
-                          ┌───────────┐
-                          │ Monitoring│
-                          │ • Metrics │
-                          │ • Alerts  │
-                          │ • Events  │
-                          └───────────┘
+                    ┌─────────────────────┐
+                    │  Main Agent Loop    │
+                    │  (Ralph-Inspired)   │
+                    │ • Duty Execution    │
+                    │ • System Monitoring │
+                    │ • Auto-Improvements │
+                    └─────────────────────┘
 ```
 
 ### Key Components
 
 | Component | Location | Purpose |
 |-----------|----------|---------|
-| Channels | `src/channels/` | WhatsApp, CLI, Web adapters |
-| Agent | `src/agent/` | Core agent logic, skill generation |
-| Tools | `src/tools/` | Built-in tool implementations |
-| Memory | `src/memory/` | Embeddings, SQLite store, file watcher |
-| Scheduler | `src/scheduler/` | Cron job management |
-| Monitor | `src/monitor/` | Metrics, alerting, event streaming |
-| Gateway | `src/gateway/` | HTTP API for external integrations |
-| CLI | `src/cli/` | Command-line interface |
+| **Channels** | `src/channels/` | WhatsApp, CLI, Web, Gateway adapters |
+| **Agent** | `src/agent/` | Core agent logic, prompt building, tool calls |
+| **Tools** | `src/tools/` | Built-in tool implementations (40+) |
+| **Memory** | `src/memory/` | Embeddings, SQLite store, semantic search |
+| **Scheduler** | `src/scheduler/` | Cron job management and execution |
+| **Monitor** | `src/monitor/` | Metrics, alerting, event streaming |
+| **Gateway** | `src/gateway/` | HTTP API for external integrations |
+| **Supervisor** | `src/supervisor.ts` | Main Agent loop, duty execution |
+| **CLI** | `src/cli/` | Command-line interface |
 
 ### Data Storage
 
 ```
 .ant/
-├── whatsapp/          # WhatsApp session data
+├── whatsapp/          # WhatsApp session data (Baileys)
 ├── sessions/          # Conversation history (JSONL)
-├── memory.sqlite      # Embeddings database
+├── memory.sqlite      # Embeddings & memory index
 ├── jobs.json          # Scheduled jobs
-└── ant.log            # Runtime logs
-
-~/.ant/
-└── ant.log            # Default log location
+├── subagents.json     # Active/completed subagents
+├── ant.log            # Runtime logs
+└── main-agent.log     # Main Agent activity log
 ```
+
+---
+
+## 🤖 Main Agent System (NEW!)
+
+The **Main Agent** is an autonomous background supervisor that continuously monitors, maintains, and improves the runtime. It's inspired by the **Ralph Wiggum loop** philosophy—a self-referential feedback cycle where the agent reviews its own work and builds upon it.
+
+### Key Features
+
+✅ **Autonomous Operation** - Runs every 5 minutes without user intervention
+✅ **Self-Aware** - Reviews its own logs and session history
+✅ **Maintenance Focused** - Keeps system healthy and optimized
+✅ **Error Recovery** - Detects issues and attempts fixes
+✅ **Learning Loop** - Improves strategy based on past iterations
+✅ **Owner Alerts** - Notifies you on critical issues via WhatsApp
+
+### How It Works
+
+1. **Iteration Cycle** (Every 5 minutes by default):
+   ```
+   Read Duties → Inspect State → Execute Tasks → Log Results → Sleep → Repeat
+   ```
+
+2. **Core Responsibilities**:
+   - 🔧 **Subagent Management** - Monitor, restart, archive parallel tasks
+   - 🧹 **System Maintenance** - Cleanup old logs, check health, prune large files
+   - 🧠 **Memory Management** - Index new content, detect duplicates, optimize
+   - 📈 **Improvements** - Analyze patterns, suggest optimizations, learn from usage
+   - 🚨 **Monitoring** - Track errors, usage, resource consumption, send alerts
+
+3. **Self-Correction**:
+   - Learns from previous iterations
+   - Adjusts tactics based on failures
+   - Pauses after 3 consecutive failures
+   - Logs all actions for transparency
+
+### Configuration
+
+Add to `ant.config.json`:
+
+```json
+{
+  "mainAgent": {
+    "enabled": true,
+    "iterationDelayMinutes": 5,
+    "maxIterationsPerTask": 10,
+    "maxConsecutiveFailures": 3,
+    "dutiesFile": "AGENT_DUTIES.md",
+    "logFile": "AGENT_LOG.md",
+    "alertOwnerOnCritical": true
+  }
+}
+```
+
+### Define Your Duties
+
+Create `AGENT_DUTIES.md` in your project root:
+
+```markdown
+# Main Agent Duties
+
+## 1. Subagent Management
+- Read `.ant/subagents.json` for active tasks
+- Check if any subagent has been running > 10 minutes
+- Flag stuck/failed subagents and attempt restart
+- Archive completed runs older than 24 hours
+
+## 2. System Maintenance
+- Delete session files older than 30 days
+- Warn if any single session exceeds 10 MB
+- Test provider connectivity (embeddings model)
+- Check available disk space in `.ant/`
+
+## 3. Memory Management
+- Re-index memory if new content detected
+- Archive old sessions as memory summaries
+- Detect broken internal links
+- Consolidate duplicate entries
+
+## 4. Improvements & Optimization
+- Analyze tool usage patterns from session history
+- Suggest new tools based on common requests
+- Identify repetitive tasks for automation
+- Review error logs for optimization opportunities
+
+## 5. Monitoring & Alerting
+- Count errors in last 1000 log lines
+- Track provider API usage/costs
+- Detect unusual activity patterns
+- Send WhatsApp alert if critical threshold reached
+
+## Completion
+After checking all duties, output:
+<promise>DUTY_CYCLE_COMPLETE</promise>
+```
+
+### Monitoring the Main Agent
+
+```bash
+# View duty execution log
+tail -f AGENT_LOG.md
+
+# Check Main Agent session
+ant sessions view "main-agent:system"
+
+# Monitor in TUI dashboard
+ant start --tui
+
+# Check status
+ant main-agent status
+```
+
+### Best Practices
+
+✅ **Clear, actionable duties** - Each duty should have specific steps
+✅ **Idempotent operations** - Safe to run multiple times
+✅ **Log everything** - Append to AGENT_LOG.md with timestamps
+✅ **Graceful failures** - Try alternatives, don't crash
+✅ **Owner notifications** - Ask for help on uncertain decisions
+
+---
+
+## Available Tools (40+)
+
+The agent has access to comprehensive tools for system control:
+
+**File Operations**: `read`, `write`, `append`, `ls`, `mkdir`, `rm`
+**Execution**: `exec`, `open_app`, `restart_ant`
+**Media**: `screenshot`, `screen_record`, `send_file`
+**Browser**: `browser` (Playwright automation)
+**Memory**: `memory_search`, `memory_get`, `memory_recall`
+**Messages**: `message_send`, `sessions_spawn`, `sessions_send`
+**External CLI**: `external_cli` (Codex, Copilot, Claude)
+**Social**: `bird` (Twitter/X via bird CLI)
+
+For full tool documentation, run:
+```bash
+ant list-tools
+ant tool <tool-name>
+```
+
+---
 
 ## Documentation
 
 - **[PROJECT.md](PROJECT.md)** - Complete technical documentation
+- **[AGENT_DUTIES.md](AGENT_DUTIES.md)** - Main Agent responsibilities template
+- **[AGENT_LOG.md](AGENT_LOG.md)** - Main Agent activity log
 - **[AGENTS.md](AGENTS.md)** - Quick reference for AI agents
 
 ## License

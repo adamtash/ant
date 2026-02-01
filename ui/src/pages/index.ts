@@ -11,3 +11,6 @@ export { WarRoom } from './WarRoom';
 export { SeasonalCycles } from './SeasonalCycles';
 export { PheromonTrails } from './PheromonTrails';
 export { GeneticCode } from './GeneticCode';
+export { Logs } from './Logs';
+export { Tunnels } from './Tunnels';
+

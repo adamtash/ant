@@ -45,7 +45,8 @@ export async function listTasks(cfg: AntConfig, options: ListTasksOptions = {}):
       throw new RuntimeError(`Failed to get tasks: ${error}`);
     }
 
-    const tasks = (await res.json()) as Task[];
+    const data = (await res.json()) as { ok: boolean; tasks: Task[] };
+    const tasks = data.tasks || [];
 
     if (options.json) {
       out.json(tasks);

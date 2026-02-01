@@ -96,9 +96,12 @@ export class ProviderManager {
           cliType: config.cliProvider || "claude",
           model: config.model,
           logger: this.logger,
+          command: config.command,
+          args: config.args,
         });
 
       case "ollama":
+
         return new OllamaProvider({
           id,
           baseUrl: config.baseUrl || "http://localhost:11434",
@@ -150,21 +153,30 @@ export class ProviderManager {
       ...(this.config.fallbackChain || []),
     ];
 
+    this.logger.debug({ preferredOrder }, "Selecting best provider");
+
     for (const id of preferredOrder) {
       const provider = this.providers.get(id);
       if (provider) {
+        this.logger.debug({ id, type: provider.type }, "Checking provider health");
         try {
-          if (await provider.health()) {
+          const isHealthy = await provider.health();
+          this.logger.debug({ id, isHealthy }, "Provider health check result");
+          if (isHealthy) {
             return provider;
           }
-        } catch {
+        } catch (err) {
+           this.logger.warn({ id, error: err instanceof Error ? err.message : String(err) }, "Provider health check failed with error");
           // Provider unhealthy, try next
         }
+      } else {
+        this.logger.warn({ id }, "Provider not found in registry");
       }
     }
 
     throw new Error("No healthy LLM providers available");
   }
+
 
   /**
    * Get all provider IDs
@@ -449,10 +461,11 @@ export class CLIProvider implements LLMProvider {
           args.push("-p", prompt);
           break;
         case "copilot":
-          args.push("prompt", prompt);
+          args.push("--prompt", prompt);
           break;
         case "codex":
           args.push("-q", prompt);
+
           break;
       }
 
@@ -518,26 +531,33 @@ export class CLIProvider implements LLMProvider {
   async health(): Promise<boolean> {
     // Check if CLI binary exists
     return new Promise((resolve) => {
+      this.logger.debug({ command: this.command }, "Checking CLI health");
       const child = spawn(this.command, ["--version"], {
         env: process.env,
       });
 
       const timer = setTimeout(() => {
         child.kill();
+        this.logger.warn({ command: this.command }, "CLI health check timed out");
         resolve(false);
       }, 5000);
 
       child.on("close", (code) => {
         clearTimeout(timer);
+        if (code !== 0) {
+            this.logger.warn({ command: this.command, code }, "CLI health check failed");
+        }
         resolve(code === 0);
       });
 
-      child.on("error", () => {
+      child.on("error", (err) => {
         clearTimeout(timer);
+        this.logger.warn({ command: this.command, error: err.message }, "CLI health check error");
         resolve(false);
       });
     });
   }
+
 
   estimateCost(): number {
     // CLI tools are typically free (subscription-based)

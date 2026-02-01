@@ -15,7 +15,10 @@ export type PageId =
   | 'war'
   | 'seasonal'
   | 'pheromone'
-  | 'genetic';
+  | 'logs'
+  | 'genetic'
+  | 'tunnels';
+
 
 export interface Toast {
   id: string;

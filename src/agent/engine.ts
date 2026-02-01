@@ -323,10 +323,19 @@ export async function createAgentEngine(params: {
       baseUrl?: string;
       apiKey?: string;
       model: string;
+      command?: string;
+      args?: string[];
     }>;
     defaultProvider: string;
+    routing?: {
+      chat?: string;
+      tools?: string;
+      embeddings?: string;
+      subagent?: string;
+    };
   };
   logger: Logger;
+
   workspaceDir: string;
   stateDir: string;
   memorySearch?: (query: string, maxResults?: number) => Promise<string[]>;

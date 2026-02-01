@@ -27,16 +27,20 @@ export type GatewayEventType =
   | "tool_call"
   | "tool_result"
   | "error"
-  | "status";
+  | "status"
+  | "task_started"
+  | "task_completed"
+  | "error_occurred";
 
 /**
  * Gateway event
  */
 export interface GatewayEvent {
+  id?: string;
   type: GatewayEventType;
-  connectionId: string;
-  sessionKey: string;
-  channel: Channel;
+  connectionId?: string;
+  sessionKey?: string;
+  channel?: Channel;
   timestamp: number;
   data: unknown;
 }
@@ -93,5 +97,5 @@ export interface GatewayStatus {
   connections: number;
   activeSessions: number;
   queueDepth: number;
-  channels: Record<Channel, { enabled: boolean; connected: boolean }>;
+  channels: Record<string, any>;
 }

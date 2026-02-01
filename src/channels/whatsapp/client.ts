@@ -98,6 +98,8 @@ export class WhatsAppClient extends EventEmitter {
   private reconnectAttempts = 0;
   private readonly maxReconnectAttempts = 5;
   private isClosing = false;
+  private lastQr: string | undefined;
+  private lastConnectionStatus: ConnectionStatus = { connection: "close" };
 
   constructor(config: WhatsAppClientConfig) {
     super();
@@ -147,6 +149,13 @@ export class WhatsAppClient extends EventEmitter {
    */
   getSelfJid(): string | undefined {
     return this.selfJid;
+  }
+
+  /**
+   * Get current connection status
+   */
+  getStatus(): ConnectionStatus {
+    return this.lastConnectionStatus;
   }
 
   // ==========================================================================
@@ -261,10 +270,11 @@ export class WhatsAppClient extends EventEmitter {
   private handleConnectionUpdate(update: Partial<ConnectionState>): void {
     const { connection, lastDisconnect, qr } = update;
 
-    const status: ConnectionStatus = {};
+    const status: ConnectionStatus = { ...this.lastConnectionStatus };
 
     if (qr) {
       status.qr = qr;
+      this.lastQr = qr;
       this.logger.info("QR code received, scan to authenticate");
     }
 
@@ -274,6 +284,8 @@ export class WhatsAppClient extends EventEmitter {
       if (connection === "open") {
         this.selfJid = this.socket?.user?.id;
         this.reconnectAttempts = 0;
+        status.qr = undefined; // Clear QR on connect
+        this.lastQr = undefined;
         this.logger.info({ selfJid: this.selfJid }, "WhatsApp connected");
       }
 
@@ -284,6 +296,10 @@ export class WhatsAppClient extends EventEmitter {
 
         status.loggedOut = loggedOut;
         status.statusCode = statusCode;
+        // Don't clear QR immediately on close/reconnect unless explicit
+        if (loggedOut) {
+            status.qr = undefined;
+        }
 
         this.logger.info(
           { statusCode, loggedOut },
@@ -297,6 +313,8 @@ export class WhatsAppClient extends EventEmitter {
         }
       }
     }
+    
+    this.lastConnectionStatus = status;
 
     // Emit status update
     this.onStatus?.(status);

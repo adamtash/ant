@@ -114,6 +114,11 @@ export abstract class BaseChannelAdapter extends EventEmitter {
   abstract stop(): Promise<void>;
 
   /**
+   * Get formatted status object for API responses
+   */
+  abstract getStatus(): Record<string, any>;
+
+  /**
    * Send a normalized message to the channel
    */
   abstract sendMessage(

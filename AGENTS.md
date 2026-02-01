@@ -9,25 +9,12 @@
 ## Repository Structure
 
 ### Core Source Files
-- **CLI Entry:** `src/cli.ts` - command dispatch (run, debug, memory, sessions, control)
-- **Runtime Orchestrator:** `src/runtime/run.ts` - ties together WhatsApp, queue, agent, status, UI
-- **Agent Core:** `src/runtime/agent.ts` - prompt building, tool loop, provider routing, fast-paths
-- **Tools:** `src/runtime/tools.ts` - tool definitions (read, write, exec, screenshot, browser, etc.)
-- **Providers:** `src/runtime/providers.ts` - provider resolution and OpenAI client management
-- **OpenAI Client:** `src/runtime/openai.ts` - OpenAI API wrapper (chat, embeddings)
-- **CLI Tools:** `src/runtime/cli-tools.ts` - invoke Codex/Copilot/Claude CLIs
-- **WhatsApp Client:** `src/whatsapp/client.ts` - Baileys integration, message parsing, media handling
-- **Queue:** `src/runtime/queue.ts` - per-session queueing with concurrency control
-- **Sessions:** `src/runtime/session-store.ts` - JSONL session history persistence
-- **Subagents:** `src/runtime/subagents.ts` - spawn and track parallel agent tasks
-- **Memory:** `src/memory/manager.ts` - SQLite + embeddings for semantic search
-- **Memory Sync:** `src/runtime/memory-sync.ts` - watch/index memory files and session transcripts
-- **TUI:** `src/runtime/tui.ts` - blessed-based terminal UI with queue/subagent status
-- **UI Server:** `src/runtime/ui-server.ts` - Express API + embedded web UI
-- **Media Parser:** `src/runtime/media.ts` - split MEDIA: tokens from text
-- **Prompt Builder:** `src/runtime/prompt.ts` - system prompt with tools + bootstrap files
-- **Browser Manager:** `src/runtime/browser-manager.ts` - Playwright browser control
-- **Browser Proxy:** `src/runtime/browser-proxy.ts` - remote browser control client
+- **CLI Entry:** `src/cli.ts` - command dispatch
+- **Gateway Server:** `src/gateway/server.ts` - API & WebSocket server (replaces runtime/ui-server)
+- **Agent Engine:** `src/agent/engine.js` - Main agent logic
+- **CLI Tools:** `src/cli/commands/` - implementation of CLI commands
+- **WhatsApp Client:** `src/channels/whatsapp/client.ts`
+- **Memory:** `src/memory/` - SQLite + embeddings
 
 ### Configuration & State
 - **Config:** `ant.config.json` - runtime configuration (providers, routing, WhatsApp, memory, mainAgent, etc.)
@@ -207,8 +194,8 @@ ant stop                                      # Stop running instance (WIP)
 ant restart                                   # Restart via configured command
 
 # Memory management
-npm run dev -- memory index -c ant.config.json
-npm run dev -- memory search "query" -c ant.config.json
+npm run dev -- remember "note" -c ant.config.json
+npm run dev -- recall "query" -c ant.config.json
 
 # Session management
 npm run dev -- sessions list -c ant.config.json

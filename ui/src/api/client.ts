@@ -163,9 +163,15 @@ export const deleteSession = (key: string) =>
 
 export const getConfig = () => apiGet<ConfigResponse>('/config');
 export const updateConfig = (config: Record<string, unknown>) =>
-  apiPut<ActionResponse>('/config', config);
+  apiPost<ActionResponse>('/config', config); // Changed to POST
 export const validateConfig = (config: Record<string, unknown>) =>
   apiPost<ActionResponse>('/config/validate', config);
+
+// ============================================
+// Channels
+// ============================================
+
+export const getChannels = () => apiGet<{ ok: boolean, channels: any[] }>('/channels');
 
 // ============================================
 // EventSource (SSE)
