@@ -1,28 +1,43 @@
-# ant
+# ANT CLI
 
-A lightweight, autonomous assistant that runs on your own machine and talks to you over WhatsApp. ant can use local tools, manage subagents, and keep memory from past sessions.
+A modular, autonomous AI agent runtime that runs locally on your machine. Connect via WhatsApp, CLI, or Web interface. ANT manages memory, schedules tasks, and continuously improves itself.
 
-## Highlights
-- WhatsApp-first agent (Baileys-based) with typing indicators and media replies.
-- Local tool execution (files, commands, screenshots, browser automation).
-- Subagents for parallel work.
-- Memory indexing with embeddings (SQLite + optional session transcript indexing).
-- Pluggable providers (OpenAI-compatible, CLI providers like Codex/Copilot/Claude).
-- Optional live TUI to visualize main/subagent activity.
+## Features
 
-## Requirements
-- Node.js 22+
-- WhatsApp account for QR pairing
-- LM Studio (or any OpenAI-compatible API)
+- **Multi-Channel Support** - Interact via WhatsApp, CLI commands, or Web UI
+- **Cron Scheduling** - Schedule recurring agent tasks with cron expressions
+- **Memory System** - Semantic search with embeddings over notes and session history
+- **Self-Improvement** - Skill generation and autonomous learning from interactions
+- **Monitoring & Alerting** - Live dashboards, logging, and critical error alerts
+- **Subagents** - Spawn parallel workers for complex tasks
+- **Local Tools** - File operations, shell commands, screenshots, browser automation
+- **Pluggable Providers** - OpenAI-compatible APIs (LM Studio) or CLI tools (Codex, Claude, Copilot)
 
-## Quick start
+## Installation
 
-1) Install dependencies:
 ```bash
+# Clone and install
+git clone <repo-url>
+cd ant-cli
 npm install
+
+# Build the project
+npm run build
+
+# (Optional) Build the web UI
+npm run ui:build
 ```
 
-2) Configure ant:
+### Requirements
+
+- Node.js 22+
+- WhatsApp account (for QR pairing)
+- LM Studio or any OpenAI-compatible API (for local LLM)
+
+## Quick Start
+
+1. **Create configuration** - Copy and customize `ant.config.json`:
+
 ```json
 {
   "workspaceDir": "~",
@@ -32,111 +47,299 @@ npm install
       "lmstudio": {
         "type": "openai",
         "baseUrl": "http://localhost:1234/v1",
-        "apiKey": "",
-        "model": "zai-org/glm-4.7-flash",
+        "model": "your-model-name",
         "embeddingsModel": "text-embedding-nomic-embed-text-v1.5"
+      }
+    }
+  },
+  "whatsapp": {
+    "sessionDir": "./.ant/whatsapp",
+    "respondToSelfOnly": true,
+    "typingIndicator": true
+  },
+  "memory": {
+    "enabled": true,
+    "sqlitePath": "./.ant/memory.sqlite"
+  },
+  "scheduler": {
+    "enabled": true,
+    "storePath": "./.ant/jobs.json"
+  }
+}
+```
+
+2. **Start the runtime**:
+
+```bash
+ant start -c ant.config.json
+```
+
+3. **Scan the QR code** to pair with WhatsApp, then start chatting!
+
+## CLI Commands Reference
+
+### Runtime
+
+| Command | Description |
+|---------|-------------|
+| `ant start` | Start the agent runtime |
+| `ant start --tui` | Start with TUI dashboard |
+| `ant start --detached` | Run in background |
+| `ant stop` | Stop the running agent |
+| `ant restart` | Restart the agent |
+| `ant status` | Show runtime status |
+
+### Agent Interaction
+
+| Command | Description |
+|---------|-------------|
+| `ant ask "<prompt>"` | Ask a one-off question |
+| `ant ask -s <session> "<prompt>"` | Ask in a specific session |
+| `ant run-task "<description>"` | Spawn a long-running task |
+| `ant run-task -w "<description>"` | Spawn and wait for completion |
+| `ant list-tasks` | Show active tasks |
+| `ant list-tasks -a` | Show all tasks including completed |
+
+### Scheduling
+
+| Command | Description |
+|---------|-------------|
+| `ant schedule add "<cron>" -p "<prompt>"` | Schedule a recurring prompt |
+| `ant schedule add "0 9 * * *" -n "daily" -p "Check email"` | Daily 9am task |
+| `ant schedule list` | List all scheduled jobs |
+| `ant schedule run <jobId>` | Manually trigger a job |
+| `ant schedule remove <jobId>` | Delete a scheduled job |
+
+### Memory
+
+| Command | Description |
+|---------|-------------|
+| `ant remember "<note>"` | Add a note to memory |
+| `ant remember --category work "<note>"` | Add with category |
+| `ant recall "<query>"` | Search memory |
+| `ant recall -l 10 "<query>"` | Search with limit |
+| `ant memory export -f json -o backup.json` | Export memory |
+
+### Sessions
+
+| Command | Description |
+|---------|-------------|
+| `ant sessions list` | List all sessions |
+| `ant sessions view <key>` | View session messages |
+| `ant sessions export <key> -f markdown` | Export session |
+| `ant sessions clear <key>` | Clear a session |
+| `ant sessions clear -a` | Clear all sessions |
+
+### Monitoring
+
+| Command | Description |
+|---------|-------------|
+| `ant logs` | Tail live logs |
+| `ant logs -n 100 -l error` | Last 100 error logs |
+| `ant dashboard` | Show TUI dashboard |
+| `ant doctor` | Run health checks |
+| `ant doctor --fix` | Auto-fix issues |
+
+### Tools
+
+| Command | Description |
+|---------|-------------|
+| `ant list-tools` | Show all available tools |
+| `ant tool <name>` | Get tool details and schema |
+
+### Utilities
+
+| Command | Description |
+|---------|-------------|
+| `ant onboard` | Interactive setup wizard |
+| `ant mcp-server` | Run MCP server over stdio |
+| `ant subagents list` | List active subagents |
+| `ant subagents cleanup` | Clean up completed subagents |
+
+### Debug
+
+| Command | Description |
+|---------|-------------|
+| `ant debug run "<prompt>"` | Run prompt without WhatsApp |
+| `ant debug simulate "<text>"` | Simulate inbound message |
+
+## Configuration (`ant.config.json`)
+
+### Core Settings
+
+```json
+{
+  "workspaceDir": "~",              // Base directory for file operations
+  "logging": {
+    "level": "info",                // Console log level
+    "fileLevel": "debug"            // File log level (~/.ant/ant.log)
+  }
+}
+```
+
+### Providers
+
+```json
+{
+  "providers": {
+    "default": "lmstudio",
+    "items": {
+      "lmstudio": {
+        "type": "openai",
+        "baseUrl": "http://localhost:1234/v1",
+        "model": "your-model",
+        "embeddingsModel": "embedding-model"
       },
       "codex-cli": {
         "type": "cli",
-        "cliProvider": "codex",
-        "model": "gpt-5.2-codex",
-        "args": ["exec", "--output-last-message", "{output}", "--color", "never", "--skip-git-repo-check", "-"]
+        "cliProvider": "codex"
       }
     }
   },
   "routing": {
-    "chat": "codex-cli",
-    "tools": "codex-cli",
-    "embeddings": "lmstudio",
-    "parentForCli": "lmstudio"
-  },
+    "chat": "codex-cli",            // Provider for chat responses
+    "tools": "lmstudio",            // Provider for tool calls
+    "embeddings": "lmstudio"        // Provider for memory embeddings
+  }
+}
+```
+
+### Channels
+
+```json
+{
   "whatsapp": {
     "sessionDir": "./.ant/whatsapp",
+    "respondToSelfOnly": true,      // Only respond to your own messages
     "respondToGroups": false,
     "mentionOnly": true,
-    "botName": "ant",
-    "respondToSelfOnly": true,
-    "allowSelfMessages": true,
-    "resetOnLogout": true,
-    "typingIndicator": true,
-    "mentionKeywords": ["ant"],
-    "ownerJids": []
+    "typingIndicator": true
   },
+  "ui": {
+    "enabled": true,
+    "port": 5117,
+    "autoOpen": true
+  },
+  "gateway": {
+    "enabled": true,
+    "port": 18789                   // HTTP API for programmatic access
+  }
+}
+```
+
+### Memory
+
+```json
+{
   "memory": {
     "enabled": true,
-    "indexSessions": true,
     "sqlitePath": "./.ant/memory.sqlite",
-    "embeddingsModel": "text-embedding-nomic-embed-text-v1.5"
-  },
-  "agent": { "systemPrompt": "" },
-  "subagents": { "enabled": true },
-  "logging": { "level": "debug", "fileLevel": "trace" },
-  "runtime": {
-    "restart": {
-      "command": "npm",
-      "args": ["run", "dev", "--", "run", "-c", "ant.config.json"]
+    "indexSessions": true,
+    "sync": {
+      "onSessionStart": true,
+      "onSearch": true,
+      "watch": true
     }
   }
 }
 ```
-Save it as `ant.config.json` in the repo root.
 
-3) Run:
-```bash
-npm run dev -- run -c ant.config.json
-```
+### Scheduler
 
-4) Pair WhatsApp by scanning the QR in your terminal.
-
-## TUI mode (optional)
-Shows main/subagent activity, queue lanes, and timing.
-
-```bash
-npm run dev -- run -c ant.config.json --tui
-```
-
-Logs still go to `~/.ant/ant.log`.
-
-## Tools (built-in)
-- File: `read`, `write`, `ls`
-- Commands: `exec`, `open_app`, `restart_ant`
-- Media: `screenshot`, `screen_record`, `send_file`
-- Browser: `browser` (Playwright)
-- Memory: `memory_search`, `memory_get`
-- Subagents: `sessions_spawn`, `sessions_send`
-- Messaging: `message_send`
-- External CLI: `external_cli` (Codex/Copilot/Claude) when enabled
-- Twitter/X: `bird` (requires bird CLI)
-
-## macOS permissions
-For screenshots and automation, grant Terminal (or your Node binary) Screen Recording + Accessibility.
-Use the tool:
-```
-macos_permissions
-```
-
-## Memory
-ant indexes:
-- `MEMORY.md` / `memory.md`
-- `memory/*.md`
-- session transcripts (`.ant/sessions/*.jsonl`)
-
-Use `/memory <note>` or `/remember <note>` in chat to append to memory.
-
-## Restarting ant
-Say "restart ant" and the `restart_ant` tool will run the configured command and exit the current process.
-
-## Logs
-- File: `~/.ant/ant.log`
-- Adjust logging in `ant.config.json`:
 ```json
-"logging": { "level": "debug", "fileLevel": "trace" }
+{
+  "scheduler": {
+    "enabled": true,
+    "storePath": "./.ant/jobs.json",
+    "timezone": "UTC"
+  }
+}
 ```
 
-## Notes
-- ant runs locally; be careful with destructive commands.
-- `respondToSelfOnly: true` keeps replies to your own DM.
-- For large media, prefer shorter recordings or smaller images.
+### Monitoring
+
+```json
+{
+  "monitoring": {
+    "enabled": true,
+    "retentionDays": 30,
+    "alertChannels": ["whatsapp"],
+    "criticalErrorThreshold": 5
+  }
+}
+```
+
+## Architecture Overview
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│                        Channels Layer                           │
+│  WhatsApp (Baileys) │ CLI Interface │ Web UI │ HTTP Gateway    │
+└──────────────────────────┬─────────────────────────────────────┘
+                           │
+                           ▼
+┌────────────────────────────────────────────────────────────────┐
+│                      Message Router                             │
+│  Routes messages to sessions, manages queue per conversation    │
+└──────────────────────────┬─────────────────────────────────────┘
+                           │
+                           ▼
+┌────────────────────────────────────────────────────────────────┐
+│                       Agent Runtime                             │
+│  Prompt building │ Tool loop │ Provider routing │ Subagents    │
+└────┬─────────────┬───────────┬───────────────┬─────────────────┘
+     │             │           │               │
+     ▼             ▼           ▼               ▼
+┌─────────┐  ┌──────────┐  ┌─────────┐  ┌───────────┐
+│  Tools  │  │ Providers│  │ Memory  │  │ Scheduler │
+│         │  │          │  │         │  │           │
+│ • File  │  │ • OpenAI │  │ • SQLite│  │ • Cron    │
+│ • Exec  │  │ • CLI    │  │ • Vector│  │ • Jobs    │
+│ • Media │  │   tools  │  │ • Search│  │           │
+│ • Browse│  │          │  │         │  │           │
+└─────────┘  └──────────┘  └─────────┘  └───────────┘
+                                │
+                                ▼
+                          ┌───────────┐
+                          │ Monitoring│
+                          │ • Metrics │
+                          │ • Alerts  │
+                          │ • Events  │
+                          └───────────┘
+```
+
+### Key Components
+
+| Component | Location | Purpose |
+|-----------|----------|---------|
+| Channels | `src/channels/` | WhatsApp, CLI, Web adapters |
+| Agent | `src/agent/` | Core agent logic, skill generation |
+| Tools | `src/tools/` | Built-in tool implementations |
+| Memory | `src/memory/` | Embeddings, SQLite store, file watcher |
+| Scheduler | `src/scheduler/` | Cron job management |
+| Monitor | `src/monitor/` | Metrics, alerting, event streaming |
+| Gateway | `src/gateway/` | HTTP API for external integrations |
+| CLI | `src/cli/` | Command-line interface |
+
+### Data Storage
+
+```
+.ant/
+├── whatsapp/          # WhatsApp session data
+├── sessions/          # Conversation history (JSONL)
+├── memory.sqlite      # Embeddings database
+├── jobs.json          # Scheduled jobs
+└── ant.log            # Runtime logs
+
+~/.ant/
+└── ant.log            # Default log location
+```
+
+## Documentation
+
+- **[PROJECT.md](PROJECT.md)** - Complete technical documentation
+- **[AGENTS.md](AGENTS.md)** - Quick reference for AI agents
 
 ## License
+
 MIT

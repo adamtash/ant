@@ -1,236 +1,601 @@
+/**
+ * Memory Manager
+ * Phase 7: Memory System Redesign
+ *
+ * Multi-tier memory architecture:
+ * - Tier 1 (Short-term): Current session in RAM, last 5 sessions cached
+ * - Tier 2 (Medium-term): SQLite index, session transcripts past 30 days
+ * - Tier 3 (Long-term): MEMORY.md, memory/*.md files
+ */
+
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { DatabaseSync } from "node:sqlite";
 
 import type { AntConfig } from "../config.js";
-import type { OpenAIClient } from "../runtime/openai.js";
+import { chunkText, createMemoryChunks } from "./chunker.js";
+import {
+  createEmbeddingProvider,
+  type EmbeddingProvider,
+} from "./embeddings.js";
+import { createMemoryFileWatcher, FileWatcher, listMemoryFiles } from "./file-watcher.js";
+import { SqliteStore } from "./sqlite-store.js";
+import type {
+  EmbeddingProviderConfig,
+  MemorySearchResult,
+  MemorySyncState,
+  ReadFileParams,
+  ReadFileResult,
+  ShortTermMessage,
+  ShortTermSession,
+} from "./types.js";
 
-export type MemorySearchResult = {
-  path: string;
-  startLine: number;
-  endLine: number;
-  score: number;
-  snippet: string;
-  source: "memory" | "sessions";
+/**
+ * Default configuration values
+ */
+const DEFAULTS = {
+  SHORT_TERM_CACHED_SESSIONS: 5,
+  SHORT_TERM_MAX_AGE_MINUTES: 60,
+  MEDIUM_TERM_RETENTION_DAYS: 30,
 };
 
+/**
+ * Legacy OpenAI client interface for backward compatibility
+ */
+interface LegacyOpenAIClient {
+  embed(params: { model: string; input: string[] }): Promise<{ embeddings: number[][] }>;
+}
+
+/**
+ * Wrapper to adapt legacy client to EmbeddingProvider interface
+ */
+class LegacyEmbeddingProviderAdapter implements EmbeddingProvider {
+  private readonly client: LegacyOpenAIClient;
+  private readonly model: string;
+
+  constructor(client: LegacyOpenAIClient, model: string) {
+    this.client = client;
+    this.model = model;
+  }
+
+  async embed(texts: string[]): Promise<number[][]> {
+    if (texts.length === 0) return [];
+    const result = await this.client.embed({ model: this.model, input: texts });
+    return result.embeddings;
+  }
+
+  getModel(): string {
+    return this.model;
+  }
+
+  getDimension(): number | undefined {
+    return undefined;
+  }
+}
+
+/**
+ * Constructor params - supports both new and legacy signatures
+ */
+type MemoryManagerParams = {
+  cfg: AntConfig;
+  embeddingProvider?: EmbeddingProvider;
+  embeddingConfig?: EmbeddingProviderConfig;
+  // Legacy parameters for backward compatibility
+  client?: LegacyOpenAIClient;
+  embeddingModel?: string;
+};
+
+/**
+ * Main memory manager with multi-tier architecture
+ */
 export class MemoryManager {
   private readonly cfg: AntConfig;
-  private readonly db: DatabaseSync;
-  private readonly client: OpenAIClient;
-  private readonly embeddingModel: string;
+  private readonly store: SqliteStore;
+  private readonly embedder: EmbeddingProvider;
   private readonly syncStatePath: string;
   private syncState: MemorySyncState;
 
-  constructor(params: { cfg: AntConfig; client: OpenAIClient; embeddingModel: string }) {
+  // Tier 1: Short-term memory
+  private readonly shortTermSessions = new Map<string, ShortTermSession>();
+  private readonly shortTermOrder: string[] = []; // LRU order
+
+  // File watcher for Tier 3
+  private fileWatcher?: FileWatcher;
+
+  constructor(params: MemoryManagerParams) {
     this.cfg = params.cfg;
-    this.client = params.client;
-    this.embeddingModel = params.embeddingModel;
-    this.db = new DatabaseSync(params.cfg.resolved.memorySqlitePath);
+    this.store = new SqliteStore(
+      params.cfg.resolved.memorySqlitePath,
+      DEFAULTS.MEDIUM_TERM_RETENTION_DAYS,
+    );
+
+    // Create embedding provider - support both new and legacy signatures
+    if (params.embeddingProvider) {
+      this.embedder = params.embeddingProvider;
+    } else if (params.client && params.embeddingModel) {
+      // Legacy: wrap OpenAIClient in adapter
+      this.embedder = new LegacyEmbeddingProviderAdapter(params.client, params.embeddingModel);
+    } else if (params.embeddingConfig) {
+      this.embedder = createEmbeddingProvider(params.embeddingConfig);
+    } else {
+      // Default to OpenAI-compatible provider using config
+      const defaultProvider = params.cfg.resolved.providers.items[params.cfg.resolved.providers.default];
+      this.embedder = createEmbeddingProvider({
+        type: "openai",
+        baseUrl: defaultProvider?.baseUrl ?? "http://localhost:1234/v1",
+        apiKey: defaultProvider?.apiKey,
+        model: params.cfg.resolved.providerEmbeddingsModel,
+      });
+    }
+
     this.syncStatePath = path.join(params.cfg.resolved.stateDir, "memory-sync.json");
     this.syncState = { files: {}, lastRunAt: 0 };
-    this.ensureSchema();
   }
 
-  async indexAll(params?: { forceSessions?: boolean }): Promise<void> {
+  /**
+   * Start the memory system (including file watcher)
+   */
+  async start(): Promise<void> {
     if (!this.cfg.memory.enabled) return;
-    await this.indexMemoryFiles();
-    if (this.cfg.memory.indexSessions) {
-      await this.indexSessionTranscripts(params?.forceSessions ?? false);
+
+    // Load sync state
+    await this.loadSyncState();
+
+    // Start file watcher if enabled
+    if (this.cfg.memory.sync.watch) {
+      this.fileWatcher = createMemoryFileWatcher(
+        this.cfg.resolved.workspaceDir,
+        async (filePath) => {
+          await this.indexFile(filePath, "memory");
+        },
+        this.cfg.memory.sync.watchDebounceMs,
+      );
+      await this.fileWatcher.start();
     }
+
+    // Initial sync if configured
+    if (this.cfg.memory.sync.onSessionStart) {
+      await this.indexAll();
+    }
+  }
+
+  /**
+   * Stop the memory system
+   */
+  stop(): void {
+    this.fileWatcher?.stop();
+    this.store.close();
+  }
+
+  /**
+   * Search memory for relevant context
+   */
+  async search(
+    query: string,
+    maxResults?: number,
+    minScore?: number,
+  ): Promise<MemorySearchResult[]> {
+    if (!this.cfg.memory.enabled) return [];
+
+    // Sync if configured
+    if (this.cfg.memory.sync.onSearch) {
+      await this.syncIfNeeded("search");
+    }
+
+    const limit = maxResults ?? this.cfg.memory.maxResults;
+    const threshold = minScore ?? this.cfg.memory.minScore;
+
+    // Generate query embedding
+    const queryEmbeddings = await this.embedder.embed([query]);
+    const queryEmbedding = queryEmbeddings[0];
+    if (!queryEmbedding || queryEmbedding.length === 0) return [];
+
+    // Search Tier 1: Short-term memory
+    const shortTermResults = this.searchShortTerm(queryEmbedding, limit, threshold);
+
+    // Search Tier 2 & 3: SQLite store (medium + long term)
+    const storeResults = this.store.searchSimilar(
+      queryEmbedding,
+      limit,
+      threshold,
+    );
+
+    // Combine and deduplicate results
+    const combined = [
+      ...shortTermResults.map((r) => ({
+        path: r.path,
+        startLine: r.startLine,
+        endLine: r.endLine,
+        score: r.score,
+        snippet: r.text,
+        source: "short-term" as const,
+        chunkId: r.id,
+      })),
+      ...storeResults.map((r) => ({
+        path: r.chunk.path,
+        startLine: r.chunk.startLine,
+        endLine: r.chunk.endLine,
+        score: r.score,
+        snippet: r.chunk.text,
+        source: r.chunk.source,
+        chunkId: r.chunk.id,
+      })),
+    ];
+
+    // Sort by score and limit
+    combined.sort((a, b) => b.score - a.score);
+    return combined.slice(0, limit);
+  }
+
+  /**
+   * Get relevant context for a session (recall)
+   */
+  async recall(sessionKey: string): Promise<string[]> {
+    if (!this.cfg.memory.enabled) return [];
+
+    // Get recent messages from the session
+    const session = this.shortTermSessions.get(sessionKey);
+    if (!session || session.messages.length === 0) return [];
+
+    // Build a query from recent user messages
+    const recentUserMessages = session.messages
+      .filter((m) => m.role === "user")
+      .slice(-3)
+      .map((m) => m.content)
+      .join(" ");
+
+    if (!recentUserMessages.trim()) return [];
+
+    // Search for relevant context
+    const results = await this.search(recentUserMessages, 5, 0.4);
+
+    return results.map((r) => `[${r.source}:${r.path}:${r.startLine}-${r.endLine}]\n${r.snippet}`);
+  }
+
+  /**
+   * Add content to memory
+   */
+  async update(content: string, source = "dynamic"): Promise<void> {
+    if (!this.cfg.memory.enabled) return;
+
+    // For dynamic updates, add to a special dynamic memory file
+    const dynamicPath = path.join(this.cfg.resolved.workspaceDir, "memory", "dynamic.md");
+
+    // Ensure memory directory exists
+    const memoryDir = path.join(this.cfg.resolved.workspaceDir, "memory");
+    await fs.mkdir(memoryDir, { recursive: true });
+
+    // Append to dynamic memory file
+    const timestamp = new Date().toISOString();
+    const entry = `\n---\n[${timestamp}] ${source}\n\n${content}\n`;
+
+    await fs.appendFile(dynamicPath, entry, "utf-8");
+
+    // Re-index the file
+    await this.indexFile(dynamicPath, "memory");
+  }
+
+  /**
+   * Re-index all memory sources
+   */
+  async indexAll(): Promise<void> {
+    if (!this.cfg.memory.enabled) return;
+
+    // Index Tier 3: Long-term memory files
+    await this.indexMemoryFiles();
+
+    // Index Tier 2: Session transcripts
+    if (this.cfg.memory.indexSessions) {
+      await this.indexSessionTranscripts();
+    }
+
+    // Cleanup old sessions
+    this.store.cleanupOldSessions();
+
+    // Persist sync state
     await this.persistSyncState();
   }
 
-  async search(query: string, maxResults?: number, minScore?: number): Promise<MemorySearchResult[]> {
-    if (!this.cfg.memory.enabled) return [];
-    if (this.cfg.memory.sync.onSearch) {
-      await this.syncIfNeeded("search");
-    } else {
-      await this.indexAll();
-    }
-    const { embeddings } = await this.client.embed({
-      model: this.embeddingModel,
-      input: [query],
-    });
-    const queryEmbedding = embeddings[0];
-    if (!queryEmbedding) return [];
+  /**
+   * Read a file from memory or sessions
+   */
+  async readFile(params: ReadFileParams): Promise<ReadFileResult> {
+    const rel = params.relPath.replace(/^\/+/, "");
 
-    const rows = this.db
-      .prepare(
-        "SELECT chunks.id as id, chunks.path as path, chunks.startLine as startLine, chunks.endLine as endLine, chunks.text as text, chunks.source as source, embeddings.embedding as embedding FROM chunks JOIN embeddings ON chunks.id = embeddings.chunk_id",
-      )
-      .all() as Array<{
+    // Determine base directory
+    const isSession = rel.startsWith("sessions/");
+    const base = isSession
+      ? path.join(this.cfg.resolved.stateDir, "sessions")
+      : this.cfg.resolved.workspaceDir;
+
+    const filePath = path.join(base, rel.replace(/^sessions\//, ""));
+
+    const raw = await fs.readFile(filePath, "utf-8");
+    const allLines = raw.split("\n");
+
+    const from = params.from && params.from > 0 ? params.from - 1 : 0;
+    const lines = params.lines && params.lines > 0 ? params.lines : allLines.length;
+    const slice = allLines.slice(from, from + lines);
+
+    return { path: rel, text: slice.join("\n") };
+  }
+
+  /**
+   * Add a message to short-term memory for a session
+   */
+  addToShortTerm(sessionKey: string, message: ShortTermMessage): void {
+    let session = this.shortTermSessions.get(sessionKey);
+
+    if (!session) {
+      session = {
+        sessionKey,
+        messages: [],
+        lastActivityAt: Date.now(),
+      };
+      this.shortTermSessions.set(sessionKey, session);
+      this.shortTermOrder.push(sessionKey);
+    }
+
+    session.messages.push(message);
+    session.lastActivityAt = Date.now();
+
+    // Move to end of LRU order
+    const idx = this.shortTermOrder.indexOf(sessionKey);
+    if (idx >= 0) {
+      this.shortTermOrder.splice(idx, 1);
+    }
+    this.shortTermOrder.push(sessionKey);
+
+    // Evict old sessions if needed
+    this.evictShortTermIfNeeded();
+  }
+
+  /**
+   * Get short-term session data
+   */
+  getShortTermSession(sessionKey: string): ShortTermSession | undefined {
+    return this.shortTermSessions.get(sessionKey);
+  }
+
+  /**
+   * Clear short-term memory for a session
+   */
+  clearShortTerm(sessionKey: string): void {
+    this.shortTermSessions.delete(sessionKey);
+    const idx = this.shortTermOrder.indexOf(sessionKey);
+    if (idx >= 0) {
+      this.shortTermOrder.splice(idx, 1);
+    }
+  }
+
+  /**
+   * Get memory system statistics
+   */
+  getStats(): {
+    shortTermSessions: number;
+    storeStats: ReturnType<SqliteStore["getStats"]>;
+  } {
+    return {
+      shortTermSessions: this.shortTermSessions.size,
+      storeStats: this.store.getStats(),
+    };
+  }
+
+  // ============================================
+  // Private methods
+  // ============================================
+
+  /**
+   * Search short-term memory
+   */
+  private searchShortTerm(
+    queryEmbedding: number[],
+    maxResults: number,
+    minScore: number,
+  ): Array<{ id: string; path: string; startLine: number; endLine: number; text: string; score: number }> {
+    const results: Array<{
       id: string;
       path: string;
       startLine: number;
       endLine: number;
       text: string;
-      source: "memory" | "sessions";
-      embedding: string;
-    }>;
+      score: number;
+    }> = [];
 
-    const scored = rows
-      .map((row) => ({
-        ...row,
-        score: cosineSimilarity(queryEmbedding, JSON.parse(row.embedding) as number[]),
-      }))
-      .filter((row) => Number.isFinite(row.score));
+    // For now, we'll do a simple text-based search on short-term memory
+    // A full implementation would embed the messages and compute similarity
+    // This is a placeholder that returns empty results
+    // Full implementation would:
+    // 1. Chunk recent messages
+    // 2. Compute embeddings (cached per session)
+    // 3. Compute similarity scores
 
-    const threshold = minScore ?? this.cfg.memory.minScore;
-    const limited = scored
-      .filter((row) => row.score >= threshold)
-      .sort((a, b) => b.score - a.score)
-      .slice(0, maxResults ?? this.cfg.memory.maxResults);
-
-    return limited.map((row) => ({
-      path: row.path,
-      startLine: row.startLine,
-      endLine: row.endLine,
-      score: row.score,
-      snippet: row.text,
-      source: row.source,
-    }));
+    return results.slice(0, maxResults);
   }
 
-  async readFile(params: {
-    relPath: string;
-    from?: number;
-    lines?: number;
-  }): Promise<{ path: string; text: string }> {
-    const rel = params.relPath.replace(/^\/+/, "");
-    const base = rel.startsWith("sessions/")
-      ? path.join(this.cfg.resolved.stateDir, "sessions")
-      : this.cfg.resolved.workspaceDir;
-    const filePath = path.join(base, rel.replace(/^sessions\//, ""));
-    const raw = await fs.readFile(filePath, "utf-8");
-    const allLines = raw.split("\n");
-    const from = params.from && params.from > 0 ? params.from - 1 : 0;
-    const lines = params.lines && params.lines > 0 ? params.lines : allLines.length;
-    const slice = allLines.slice(from, from + lines);
-    return { path: rel, text: slice.join("\n") };
-  }
+  /**
+   * Evict oldest short-term sessions if over limit
+   */
+  private evictShortTermIfNeeded(): void {
+    const maxSessions = DEFAULTS.SHORT_TERM_CACHED_SESSIONS;
+    const maxAgeMs = DEFAULTS.SHORT_TERM_MAX_AGE_MINUTES * 60 * 1000;
+    const now = Date.now();
 
-  async syncIfNeeded(reason: "search" | "interval" | "watch" | "startup"): Promise<void> {
-    if (!this.cfg.memory.enabled) return;
-    await this.loadSyncState();
-    if (reason === "interval") {
-      const minIntervalMs = this.cfg.memory.sync.intervalMinutes * 60_000;
-      if (minIntervalMs > 0 && Date.now() - this.syncState.lastRunAt < minIntervalMs) {
-        return;
+    // Remove expired sessions
+    for (const [key, session] of this.shortTermSessions.entries()) {
+      if (now - session.lastActivityAt > maxAgeMs) {
+        this.shortTermSessions.delete(key);
+        const idx = this.shortTermOrder.indexOf(key);
+        if (idx >= 0) {
+          this.shortTermOrder.splice(idx, 1);
+        }
       }
     }
-    const forceSessions = reason === "search";
-    await this.indexAll({ forceSessions });
-    this.syncState.lastRunAt = Date.now();
-    await this.persistSyncState();
-  }
 
-  private ensureSchema() {
-    this.db.exec(
-      [
-        "CREATE TABLE IF NOT EXISTS files (path TEXT PRIMARY KEY, source TEXT, hash TEXT, updatedAt INTEGER)",
-        "CREATE TABLE IF NOT EXISTS chunks (id TEXT PRIMARY KEY, path TEXT, source TEXT, startLine INTEGER, endLine INTEGER, text TEXT)",
-        "CREATE TABLE IF NOT EXISTS embeddings (chunk_id TEXT PRIMARY KEY, embedding TEXT)",
-      ].join(";"),
-    );
-  }
-
-  private async indexMemoryFiles(): Promise<void> {
-    const memoryFiles = await listMemoryFiles(this.cfg.resolved.workspaceDir);
-    for (const entry of memoryFiles) {
-      await this.indexFile(entry.path, "memory");
+    // Remove oldest if over limit
+    while (this.shortTermOrder.length > maxSessions) {
+      const oldest = this.shortTermOrder.shift();
+      if (oldest) {
+        this.shortTermSessions.delete(oldest);
+      }
     }
   }
 
-  private async indexSessionTranscripts(force: boolean): Promise<void> {
+  /**
+   * Index all memory files (Tier 3)
+   */
+  private async indexMemoryFiles(): Promise<void> {
+    const memoryFiles = await listMemoryFiles(this.cfg.resolved.workspaceDir);
+
+    for (const entry of memoryFiles) {
+      await this.indexFile(entry.path, "memory", entry.relativePath);
+    }
+  }
+
+  /**
+   * Index session transcripts (Tier 2)
+   */
+  private async indexSessionTranscripts(): Promise<void> {
     const sessionsDir = path.join(this.cfg.resolved.stateDir, "sessions");
+
     let entries: string[] = [];
     try {
       entries = await fs.readdir(sessionsDir);
     } catch {
       return;
     }
+
     for (const name of entries) {
       if (!name.endsWith(".jsonl")) continue;
+
       const filePath = path.join(sessionsDir, name);
       const relPath = `sessions/${name}`;
-      if (!force) {
-        const shouldIndex = await this.shouldIndexSessionFile(filePath, relPath);
-        if (!shouldIndex) continue;
-      }
+
+      // Check if needs indexing
+      const shouldIndex = await this.shouldIndexSessionFile(filePath, relPath);
+      if (!shouldIndex) continue;
+
       await this.indexFile(filePath, "sessions", relPath);
     }
   }
 
-  private async indexFile(absPath: string, source: "memory" | "sessions", relOverride?: string) {
-    const raw = await fs.readFile(absPath, "utf-8");
-    const hash = sha256(raw);
-    const relPath = relOverride ?? path.relative(this.cfg.resolved.workspaceDir, absPath);
-    const stats = await fs.stat(absPath);
+  /**
+   * Check if a session file needs re-indexing
+   */
+  private async shouldIndexSessionFile(absPath: string, relPath: string): Promise<boolean> {
+    try {
+      const stats = await fs.stat(absPath);
+      const prev = this.syncState.files[relPath];
 
-    const existing = this.db
-      .prepare("SELECT hash FROM files WHERE path = ?")
-      .get(relPath) as { hash?: string } | undefined;
-    if (existing?.hash === hash) return;
+      if (!prev) return true;
 
-    this.db.prepare("DELETE FROM chunks WHERE path = ?").run(relPath);
-    this.db
-      .prepare("DELETE FROM embeddings WHERE chunk_id NOT IN (SELECT id FROM chunks)")
-      .run();
+      // Check size delta
+      const deltaBytes = Math.max(0, stats.size - prev.size);
+      if (deltaBytes >= this.cfg.memory.sync.sessionsDeltaBytes) return true;
 
-    const chunks = chunkText(raw, this.cfg.memory.chunkChars, this.cfg.memory.chunkOverlap);
-    if (chunks.length === 0) {
-      this.db
-        .prepare("INSERT OR REPLACE INTO files (path, source, hash, updatedAt) VALUES (?, ?, ?, ?)")
-        .run(relPath, source, hash, Date.now());
+      // Check message delta
+      if (this.cfg.memory.sync.sessionsDeltaMessages <= 0) return false;
+
+      const raw = await fs.readFile(absPath, "utf-8");
+      const lines = raw.split("\n").filter(Boolean).length;
+      const deltaLines = Math.max(0, lines - (prev.lines ?? 0));
+
+      return deltaLines >= this.cfg.memory.sync.sessionsDeltaMessages;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Index a single file
+   */
+  private async indexFile(
+    absPath: string,
+    source: "memory" | "sessions",
+    relOverride?: string,
+  ): Promise<void> {
+    let raw: string;
+    try {
+      raw = await fs.readFile(absPath, "utf-8");
+    } catch {
       return;
     }
-    const embeddings = await embedInBatches(
-      this.client,
-      this.embeddingModel,
-      chunks.map((c) => c.text),
-    );
 
-    const insertChunk = this.db.prepare(
-      "INSERT OR REPLACE INTO chunks (id, path, source, startLine, endLine, text) VALUES (?, ?, ?, ?, ?, ?)",
-    );
-    const insertEmbedding = this.db.prepare(
-      "INSERT OR REPLACE INTO embeddings (chunk_id, embedding) VALUES (?, ?)",
-    );
+    const hash = sha256(raw);
+    const relPath = relOverride ?? path.relative(this.cfg.resolved.workspaceDir, absPath);
 
-    for (let i = 0; i < chunks.length; i += 1) {
-      const chunk = chunks[i];
-      const chunkId = `${relPath}#${i}`;
-      insertChunk.run(chunkId, relPath, source, chunk.startLine, chunk.endLine, chunk.text);
-      const embedding = embeddings[i] ?? [];
-      insertEmbedding.run(chunkId, JSON.stringify(embedding));
+    // Check if already indexed with same hash
+    if (!this.store.fileNeedsUpdate(relPath, hash)) {
+      return;
     }
 
-    this.db
-      .prepare("INSERT OR REPLACE INTO files (path, source, hash, updatedAt) VALUES (?, ?, ?, ?)")
-      .run(relPath, source, hash, Date.now());
+    // Chunk the text
+    const textChunks = chunkText(raw, {
+      chunkSize: this.cfg.memory.chunkChars,
+      overlap: this.cfg.memory.chunkOverlap,
+      preserveMarkdown: source === "memory",
+    });
 
+    if (textChunks.length === 0) {
+      // Still update file record even if empty
+      const stats = await fs.stat(absPath);
+      this.store.upsertFile(relPath, source, hash, stats.size, 0);
+      return;
+    }
+
+    // Create memory chunks
+    const chunks = createMemoryChunks(textChunks, relPath, source, hash);
+
+    // Generate embeddings
+    const embeddings = await this.embedder.embed(chunks.map((c) => c.text));
+
+    // Store in database
+    this.store.storeChunks(relPath, chunks);
+    this.store.storeEmbeddings(
+      chunks.map((chunk, i) => ({
+        chunkId: chunk.id,
+        embedding: embeddings[i] ?? [],
+        model: this.embedder.getModel(),
+      })),
+    );
+
+    // Update file record
+    const stats = await fs.stat(absPath);
+    const lines = raw.split("\n").length;
+    this.store.upsertFile(relPath, source, hash, stats.size, lines);
+
+    // Update sync state
     this.syncState.files[relPath] = {
       size: stats.size,
       mtimeMs: stats.mtimeMs,
-      lines: countLines(raw),
+      lines,
+      hash,
     };
   }
 
-  private async shouldIndexSessionFile(absPath: string, relPath: string): Promise<boolean> {
-    const stats = await fs.stat(absPath);
-    const prev = this.syncState.files[relPath];
-    if (!prev) return true;
-    const deltaBytes = Math.max(0, stats.size - prev.size);
-    if (deltaBytes >= this.cfg.memory.sync.sessionsDeltaBytes) return true;
-    if (this.cfg.memory.sync.sessionsDeltaMessages <= 0) return false;
-    const raw = await fs.readFile(absPath, "utf-8");
-    const lines = countLines(raw);
-    const deltaLines = Math.max(0, lines - (prev.lines ?? 0));
-    return deltaLines >= this.cfg.memory.sync.sessionsDeltaMessages;
+  /**
+   * Sync if needed based on trigger
+   */
+  async syncIfNeeded(reason: "search" | "interval" | "watch" | "startup"): Promise<void> {
+    if (!this.cfg.memory.enabled) return;
+
+    await this.loadSyncState();
+
+    if (reason === "interval") {
+      const minIntervalMs = this.cfg.memory.sync.intervalMinutes * 60_000;
+      if (minIntervalMs > 0 && Date.now() - this.syncState.lastRunAt < minIntervalMs) {
+        return;
+      }
+    }
+
+    await this.indexAll();
+    this.syncState.lastRunAt = Date.now();
+    await this.persistSyncState();
   }
 
+  /**
+   * Load sync state from disk
+   */
   private async loadSyncState(): Promise<void> {
     try {
       const raw = await fs.readFile(this.syncStatePath, "utf-8");
@@ -240,106 +605,28 @@ export class MemoryManager {
     }
   }
 
+  /**
+   * Persist sync state to disk
+   */
   private async persistSyncState(): Promise<void> {
-    await fs.writeFile(this.syncStatePath, JSON.stringify(this.syncState, null, 2), "utf-8");
-  }
-}
-
-export async function listMemoryFiles(workspaceDir: string): Promise<Array<{ path: string }>> {
-  const files: Array<{ path: string }> = [];
-  const rootFiles = ["MEMORY.md", "memory.md"];
-  for (const name of rootFiles) {
-    const filePath = path.join(workspaceDir, name);
     try {
-      await fs.access(filePath);
-      files.push({ path: filePath });
+      await fs.writeFile(
+        this.syncStatePath,
+        JSON.stringify(this.syncState, null, 2),
+        "utf-8",
+      );
     } catch {
-      // ignore
+      // Ignore write errors
     }
   }
-  const memoryDir = path.join(workspaceDir, "memory");
-  try {
-    const entries = await fs.readdir(memoryDir);
-    for (const name of entries) {
-      if (!name.endsWith(".md")) continue;
-      files.push({ path: path.join(memoryDir, name) });
-    }
-  } catch {
-    // ignore
-  }
-  return files;
 }
 
-function chunkText(text: string, chunkChars: number, overlap: number) {
-  const lines = text.split("\n");
-  const chunks: Array<{ text: string; startLine: number; endLine: number }> = [];
-  let buffer: string[] = [];
-  let startLine = 1;
-  let charCount = 0;
-
-  const flush = (endLine: number) => {
-    if (buffer.length === 0) return;
-    const chunkText = buffer.join("\n");
-    chunks.push({ text: chunkText, startLine, endLine });
-  };
-
-  for (let i = 0; i < lines.length; i += 1) {
-    const line = lines[i] ?? "";
-    buffer.push(line);
-    charCount += line.length + 1;
-    if (charCount >= chunkChars) {
-      flush(i + 1);
-      const overlapLines = overlap > 0 ? buffer.slice(Math.max(0, buffer.length - overlap)) : [];
-      buffer = overlapLines;
-      startLine = Math.max(1, i + 2 - overlapLines.length);
-      charCount = overlapLines.join("\n").length;
-    }
-  }
-  flush(lines.length);
-  return chunks;
-}
-
+/**
+ * Compute SHA-256 hash of text
+ */
 function sha256(text: string): string {
   return crypto.createHash("sha256").update(text).digest("hex");
 }
 
-function countLines(text: string): number {
-  if (!text) return 0;
-  return text.split("\n").length;
-}
-
-type MemorySyncState = {
-  lastRunAt: number;
-  files: Record<string, { size: number; mtimeMs: number; lines?: number }>;
-};
-
-function cosineSimilarity(a: number[], b: number[]): number {
-  if (a.length === 0 || b.length === 0 || a.length !== b.length) return 0;
-  let dot = 0;
-  let normA = 0;
-  let normB = 0;
-  for (let i = 0; i < a.length; i += 1) {
-    const va = a[i] ?? 0;
-    const vb = b[i] ?? 0;
-    dot += va * vb;
-    normA += va * va;
-    normB += vb * vb;
-  }
-  if (normA === 0 || normB === 0) return 0;
-  return dot / (Math.sqrt(normA) * Math.sqrt(normB));
-}
-
-async function embedInBatches(
-  client: OpenAIClient,
-  model: string,
-  inputs: string[],
-): Promise<number[][]> {
-  const batchSize = 64;
-  const out: number[][] = [];
-  for (let i = 0; i < inputs.length; i += batchSize) {
-    const batch = inputs.slice(i, i + batchSize);
-    const result = await client.embed({ model, input: batch });
-    out.push(...result.embeddings);
-  }
-  return out;
-}
+// Re-export types
+export type { MemorySearchResult } from "./types.js";

@@ -61,6 +61,8 @@ const WhatsAppSchema = z.object({
   typingIndicator: z.boolean().default(true),
   mentionKeywords: z.array(z.string()).default([]),
   ownerJids: z.array(z.string()).default([]),
+  startupMessage: z.string().optional(),
+  startupRecipients: z.array(z.string()).default([]),
 });
 
 const MemorySchema = z.object({
@@ -143,6 +145,38 @@ const RuntimeSchema = z
         cwd: z.string().optional(),
       })
       .optional(),
+    start: z
+      .object({
+        command: z.string().min(1),
+        args: z.array(z.string()).default([]),
+        cwd: z.string().optional(),
+      })
+      .optional(),
+  })
+  .default({});
+
+const UiSchema = z
+  .object({
+    enabled: z.boolean().default(true),
+    port: z.number().int().positive().default(5117),
+    host: z.string().min(1).default("127.0.0.1"),
+    autoOpen: z.boolean().default(true),
+    openUrl: z.string().optional(),
+    staticDir: z.string().default("ui/dist"),
+  })
+  .default({});
+
+const BrowserProfileSchema = z.object({
+  cdpUrl: z.string().optional(),
+});
+
+const BrowserSchema = z
+  .object({
+    enabled: z.boolean().default(true),
+    headless: z.boolean().default(true),
+    defaultProfile: z.string().default("default"),
+    profiles: z.record(BrowserProfileSchema).default({}),
+    proxyBaseUrl: z.string().optional(),
   })
   .default({});
 
@@ -152,6 +186,8 @@ const ConfigSchema = z.object({
   provider: ProviderItemSchema.optional(),
   providers: ProvidersSchema.optional(),
   routing: RoutingSchema.optional(),
+  browser: BrowserSchema.default({}),
+  ui: UiSchema.default({}),
   whatsapp: WhatsAppSchema,
   memory: MemorySchema,
   agent: AgentSchema.default({}),
@@ -173,6 +209,8 @@ export type AntConfig = z.infer<typeof ConfigSchema> & {
     routing: RoutingOutput;
     logFilePath: string;
     logFileLevel: string;
+    configPath: string;
+    uiStaticDir: string;
   };
 };
 
@@ -181,7 +219,7 @@ export async function loadConfig(explicitPath?: string): Promise<AntConfig> {
   const raw = await fs.readFile(configPath, "utf-8");
   const parsed = JSON.parse(raw);
   const base = ConfigSchema.parse(parsed);
-  return resolveConfig(base);
+  return resolveConfig(base, configPath);
 }
 
 export function resolveConfigPath(explicitPath?: string): string {
@@ -190,7 +228,7 @@ export function resolveConfigPath(explicitPath?: string): string {
   return path.resolve(pathToUse);
 }
 
-function resolveConfig(base: z.infer<typeof ConfigSchema>): AntConfig {
+function resolveConfig(base: z.infer<typeof ConfigSchema>, configPath: string): AntConfig {
   const workspaceDir = resolveUserPath(base.workspaceDir);
   const stateDir = resolveUserPath(
     base.stateDir?.trim() || path.join(workspaceDir, ".ant"),
@@ -208,6 +246,7 @@ function resolveConfig(base: z.infer<typeof ConfigSchema>): AntConfig {
   const defaultProvider = providers.items[providers.default];
   const providerEmbeddingsModel =
     defaultProvider?.embeddingsModel?.trim() || base.memory.embeddingsModel;
+  const uiStaticDir = resolveUserPath(base.ui.staticDir, workspaceDir);
 
   return {
     ...base,
@@ -221,6 +260,8 @@ function resolveConfig(base: z.infer<typeof ConfigSchema>): AntConfig {
       routing,
       logFilePath,
       logFileLevel,
+      configPath,
+      uiStaticDir,
     },
   };
 }
