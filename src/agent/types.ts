@@ -179,7 +179,7 @@ export type ProviderType = "cli" | "openai" | "ollama";
 /**
  * CLI Provider type
  */
-export type CLIProviderType = "copilot" | "claude" | "codex";
+export type CLIProviderType = "copilot" | "claude" | "codex" | "kimi";
 
 /**
  * Chat completion options

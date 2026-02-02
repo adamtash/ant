@@ -27,6 +27,7 @@ import type {
   GatewayStatus,
 } from "./types.js";
 import type { AgentEngine } from "../agent/engine.js";
+import type { MainAgent } from "../agent/main-agent.js";
 
 /**
  * Gateway configuration
@@ -53,7 +54,16 @@ export class GatewayServer {
   private readonly sessions: SessionManager;
   private readonly agentEngine?: AgentEngine;
   private readonly router?: MessageRouter;
+  private mainAgent?: MainAgent;
   private startTime: number = 0;
+  private mainAgentRunning: boolean = false;
+  private startupHealthCheck: {
+    lastCheckAt?: number;
+    ok?: boolean;
+    error?: string;
+    latencyMs?: number;
+    responsePreview?: string;
+  } = {};
   private tasks: Map<
     string,
     {
@@ -75,12 +85,14 @@ export class GatewayServer {
     logger: Logger;
     agentEngine?: AgentEngine;
     router?: MessageRouter;
+    mainAgent?: MainAgent;
   }) {
     this.config = params.config;
     this.logger = params.logger.child({ component: "gateway" });
     this.eventBus = new EventBus(this.logger);
     this.agentEngine = params.agentEngine;
     this.router = params.router;
+    this.mainAgent = params.mainAgent;
     this.sessions = new SessionManager({
       stateDir: params.config.stateDir,
       logger: this.logger,
@@ -115,6 +127,19 @@ export class GatewayServer {
         queue: [],
         running,
         subagents: [],
+        mainAgent: {
+          enabled: this.mainAgentRunning,
+          running: this.mainAgentRunning,
+          lastCheckAt: this.startupHealthCheck.lastCheckAt ?? null,
+          lastError: this.startupHealthCheck.ok ? null : this.startupHealthCheck.error ?? null,
+        },
+        startupHealthCheck: {
+          lastCheckAt: this.startupHealthCheck.lastCheckAt ?? null,
+          ok: this.startupHealthCheck.ok ?? null,
+          error: this.startupHealthCheck.error ?? null,
+          latencyMs: this.startupHealthCheck.latencyMs ?? null,
+          responsePreview: this.startupHealthCheck.responsePreview ?? null,
+        },
         health: {
           cpu: 0,
           memory: process.memoryUsage().heapUsed,
@@ -390,6 +415,55 @@ export class GatewayServer {
         unsubscribe();
       });
     });
+
+    // Main Agent Routes
+    // List Main Agent tasks
+    app.get("/api/main-agent/tasks", (req, res) => {
+      if (!this.mainAgent) {
+        res.status(503).json({ ok: false, error: "Main Agent not available" });
+        return;
+      }
+      const tasks = this.mainAgent.getAllTasks();
+      res.json({ ok: true, tasks });
+    });
+
+    // Get specific Main Agent task
+    app.get("/api/main-agent/tasks/:id", (req, res) => {
+      if (!this.mainAgent) {
+        res.status(503).json({ ok: false, error: "Main Agent not available" });
+        return;
+      }
+      const task = this.mainAgent.getTask(req.params.id);
+      if (!task) {
+        res.status(404).json({ ok: false, error: "Task not found" });
+        return;
+      }
+      res.json({ ok: true, task });
+    });
+
+    // Assign new task to Main Agent
+    app.post("/api/main-agent/tasks", async (req, res) => {
+      if (!this.mainAgent) {
+        res.status(503).json({ ok: false, error: "Main Agent not available" });
+        return;
+      }
+
+      const { description } = req.body;
+      if (!description) {
+        res.status(400).json({ ok: false, error: "Description is required" });
+        return;
+      }
+
+      try {
+        const taskId = await this.mainAgent.assignTask(description);
+        res.json({ ok: true, taskId, status: "pending" });
+      } catch (err) {
+        res.status(500).json({ 
+          ok: false, 
+          error: err instanceof Error ? err.message : String(err) 
+        });
+      }
+    });
   }
 
   /**
@@ -469,6 +543,91 @@ export class GatewayServer {
     this.wss = null;
     this.httpServer = null;
     this.logger.info("Gateway server stopped");
+  }
+
+  /**
+   * Mark main agent running state (for status surfaces)
+   */
+  setMainAgentRunning(running: boolean): void {
+    this.mainAgentRunning = running;
+  }
+
+  /**
+   * Set the Main Agent instance
+   */
+  setMainAgent(mainAgent: MainAgent): void {
+    this.mainAgent = mainAgent;
+  }
+
+  /**
+   * Run a lightweight startup health check through the agent engine
+   */
+  async runStartupHealthCheck(options?: { prompt?: string; timeoutMs?: number; delayMs?: number }): Promise<void> {
+    if (!this.agentEngine) {
+      this.startupHealthCheck = {
+        lastCheckAt: Date.now(),
+        ok: false,
+        error: "Agent engine not available",
+      };
+      return;
+    }
+
+    const prompt = options?.prompt ?? "Health check: respond with OK.";
+    const timeoutMs = options?.timeoutMs ?? 30000;
+    const delayMs = options?.delayMs ?? 3000;
+    const startedAt = Date.now();
+
+    this.startupHealthCheck = {
+      lastCheckAt: startedAt,
+      ok: false,
+    };
+
+    try {
+      if (delayMs > 0) {
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+      }
+
+      const timeout = new Promise<never>((_, reject) => {
+        setTimeout(() => reject(new Error(`Health check timed out after ${timeoutMs}ms`)), timeoutMs);
+      });
+
+      const result = await Promise.race([
+        this.agentEngine.execute({
+          sessionKey: "healthcheck:startup",
+          query: prompt,
+          channel: "web",
+          chatId: "healthcheck:startup",
+        }),
+        timeout,
+      ]);
+
+      let responsePreview: string | undefined;
+      try {
+        if (typeof result === "string") {
+          responsePreview = result;
+        } else {
+          responsePreview = JSON.stringify(result);
+        }
+      } catch {
+        responsePreview = String(result);
+      }
+
+      this.startupHealthCheck = {
+        lastCheckAt: startedAt,
+        ok: true,
+        latencyMs: Date.now() - startedAt,
+        responsePreview: responsePreview?.slice(0, 200),
+      };
+
+      this.logger.info({ latencyMs: this.startupHealthCheck.latencyMs }, "Startup health check succeeded");
+    } catch (err) {
+      this.startupHealthCheck = {
+        lastCheckAt: startedAt,
+        ok: false,
+        error: err instanceof Error ? err.message : String(err),
+      };
+      this.logger.warn({ error: this.startupHealthCheck.error }, "Startup health check failed");
+    }
   }
 
   /**

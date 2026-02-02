@@ -549,6 +549,11 @@ export class MemoryManager {
     // Generate embeddings
     const embeddings = await this.embedder.embed(chunks.map((c) => c.text));
 
+    // Update file record first (required for foreign key constraint)
+    const stats = await fs.stat(absPath);
+    const lines = raw.split("\n").length;
+    this.store.upsertFile(relPath, source, hash, stats.size, lines);
+
     // Store in database
     this.store.storeChunks(relPath, chunks);
     this.store.storeEmbeddings(
@@ -558,11 +563,6 @@ export class MemoryManager {
         model: this.embedder.getModel(),
       })),
     );
-
-    // Update file record
-    const stats = await fs.stat(absPath);
-    const lines = raw.split("\n").length;
-    this.store.upsertFile(relPath, source, hash, stats.size, lines);
 
     // Update sync state
     this.syncState.files[relPath] = {

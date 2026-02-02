@@ -18,7 +18,8 @@ import type { NormalizedMessage, MessageMedia } from "../types.js";
 /**
  * Extract text content from a WhatsApp message
  */
-export function extractTextFromMessage(msg: WAMessage): string | null {
+export function extractTextFromMessage(msg: WAMessage | null | undefined): string | null {
+  if (!msg) return null;
   const message = msg.message;
   if (!message) return null;
 

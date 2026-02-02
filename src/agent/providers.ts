@@ -387,12 +387,14 @@ export class CLIProvider implements LLMProvider {
   readonly type: ProviderType = "cli";
   readonly id: string;
   readonly name: string;
-  private readonly cliType: CLIProviderType;
+
   private readonly model: string;
   private readonly logger: Logger;
   private readonly command: string;
   private readonly args: string[];
   private readonly timeoutMs: number;
+
+  readonly cliType: CLIProviderType;
 
   constructor(options: CLIProviderOptions) {
     this.id = options.id;
@@ -419,8 +421,15 @@ export class CLIProvider implements LLMProvider {
       };
     }
 
-    // Parse output - CLI tools typically return plain text
-    const content = this.stripReasoning(result.output);
+    // Parse output based on CLI type
+    let content: string;
+    if (this.cliType === "kimi") {
+      // Kimi outputs ACP protocol format - parse it
+      content = this.parseKimiOutput(result.output);
+    } else {
+      // Other CLIs return plain text
+      content = this.stripReasoning(result.output);
+    }
 
     return {
       content,
@@ -465,7 +474,9 @@ export class CLIProvider implements LLMProvider {
           break;
         case "codex":
           args.push("-q", prompt);
-
+          break;
+        case "kimi":
+          args.push("-p", prompt, "--print");
           break;
       }
 
@@ -520,12 +531,85 @@ export class CLIProvider implements LLMProvider {
 
   private stripReasoning(text: string): string {
     if (!text) return text;
+    
+    // Strip <think> tags (Claude-style reasoning)
     const endTag = "</think>";
     const idx = text.lastIndexOf(endTag);
     if (idx !== -1) {
-      return text.slice(idx + endTag.length).trim();
+      text = text.slice(idx + endTag.length).trim();
     }
-    return text.replace(/<think>[\s\S]*?<\/think>/g, "").trim();
+    text = text.replace(/<think>[\s\S]*?<\/think>/g, "").trim();
+    
+    // Strip <choice> tags (Kimi-style control tokens)
+    text = text.replace(/<choice>.*?<\/choice>/gs, "").trim();
+    
+    return text;
+  }
+
+  /**
+   * Parse Kimi CLI output format (ACP protocol) to extract assistant's text
+   */
+  private parseKimiOutput(output: string): string {
+    if (!output) return "";
+    
+    // Strip any echo of the input prompt that appears before the first TurnBegin
+    const firstTurnBegin = output.indexOf("TurnBegin(");
+    if (firstTurnBegin > 0) {
+      output = output.slice(firstTurnBegin);
+    }
+    
+    // Split output into turns
+    const turns: string[] = [];
+    let currentTurn: string[] = [];
+    
+    for (const line of output.split("\n")) {
+      if (line.trim().startsWith("TurnBegin(")) {
+        if (currentTurn.length > 0) {
+          turns.push(currentTurn.join("\n"));
+        }
+        currentTurn = [line];
+      } else {
+        currentTurn.push(line);
+      }
+    }
+    if (currentTurn.length > 0) {
+      turns.push(currentTurn.join("\n"));
+    }
+    
+    const textParts: string[] = [];
+    
+    for (const turn of turns) {
+      // Skip turns with loop control messages (these are Kimi's internal loop controls)
+      if (turn.includes("You are running in an automated loop") ||
+          turn.includes("Available branches:")) {
+        continue;
+      }
+      
+      // Find all TextPart blocks in this turn using regex
+      // TextPart can be multiline, so we need to match across lines
+      const textPartRegex = /TextPart\([\s\S]*?type=['"]text['"][\s\S]*?text=['"]([\s\S]*?)['"]\s*\)/g;
+      let match;
+      
+      while ((match = textPartRegex.exec(turn)) !== null) {
+        let text = match[1];
+        
+        // Unescape quotes
+        text = text.replace(/\\'/g, "'").replace(/\\"/g, '"').replace(/\\n/g, "\n");
+        
+        // Skip if it looks like system or user content
+        if (text.startsWith("System:") || text.startsWith("User:")) {
+          continue;
+        }
+        
+        textParts.push(text);
+      }
+    }
+    
+    // Join and clean up
+    let result = textParts.join("\n").trim();
+    result = result.replace(/<choice>.*?<\/choice>/gs, "").trim();
+    
+    return result;
   }
 
   async health(): Promise<boolean> {

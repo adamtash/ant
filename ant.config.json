@@ -32,15 +32,22 @@
           "--yolo",
           "--no-ask-user"
         ]
+      },
+      "kimi": {
+        "type": "cli",
+        "cliProvider": "kimi",
+        "model": "kimi-k2",
+        "command": "kimi",
+        "args": ["--yolo"]
       }
     }
   },
 
   "routing": {
-    "chat": "copilot",
-    "tools": "copilot",
+    "chat": "kimi",
+    "tools": "kimi",
     "embeddings": "lmstudio",
-    "parentForCli": "lmstudio"
+    "parentForCli": "kimi"
   },
   "ui": {
     "enabled": true,
@@ -91,6 +98,10 @@
       "claude": {
         "command": "claude",
         "args": []
+      },
+      "kimi": {
+        "command": "kimi",
+        "args": ["--yolo"]
       }
     }
   },
@@ -113,6 +124,11 @@
   "logging": {
     "level": "debug",
     "fileLevel": "trace"
+  },
+  "mainAgent": {
+    "enabled": true,
+    "intervalMs": 300000,
+    "dutiesFile": "AGENT_DUTIES.md"
   },
   "runtime": {
     "restart": {

@@ -129,8 +129,8 @@ export const useColonyStore = create<ColonyState>((set, get) => ({
 
     // Create default chambers
     const chambers = new Map<string, Chamber>();
-    const centerX = width / 2;
-    const centerY = height / 2;
+    const centerX = 0; // Center at origin (0,0) for better camera alignment
+    const centerY = 0;
 
     // Royal chamber (center)
     chambers.set('royal', {
@@ -202,12 +202,39 @@ export const useColonyStore = create<ColonyState>((set, get) => ({
       connections: ['builders', 'war'],
     });
 
+    // Generate tunnels from connections
+    const tunnels = new Map<string, Tunnel>();
+    const processedPairs = new Set<string>();
+
+    chambers.forEach((chamber) => {
+      chamber.connections.forEach((targetId) => {
+        const target = chambers.get(targetId);
+        if (target) {
+          // Sort IDs to ensure unique key for pair A-B vs B-A
+          const pairKey = [chamber.id, targetId].sort().join('-');
+          
+          if (!processedPairs.has(pairKey)) {
+            processedPairs.add(pairKey);
+            const tunnelId = `tunnel-${pairKey}`;
+            
+            tunnels.set(tunnelId, {
+               id: tunnelId,
+               from: chamber.id,
+               to: targetId,
+               path: [chamber.position, target.position],
+               width: 12 // Visible connection width
+            });
+          }
+        }
+      });
+    });
+
     set({
       width,
       height,
       pheromoneMap,
       chambers,
-      tunnels: new Map(),
+      tunnels,
     });
 
     // Create queen in royal chamber

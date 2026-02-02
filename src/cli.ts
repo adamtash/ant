@@ -45,6 +45,9 @@ import { sessionsList } from "./cli/commands/sessions/list.js";
 import { sessionsView } from "./cli/commands/sessions/view.js";
 import { sessionsClear } from "./cli/commands/sessions/clear.js";
 
+// Import diagnostics commands
+import { testAll, endpoints, agentHealth, whatsapp } from "./cli/commands/diagnostics/index.js";
+
 const program = new Command();
 const out = new OutputFormatter();
 
@@ -420,6 +423,59 @@ program
     out.header("ANT Setup Wizard");
     out.info("This wizard will help you set up ANT.");
     out.info("Coming soon - use 'ant doctor' to check your configuration.");
+  });
+
+// =============================================================================
+// DIAGNOSTICS
+// =============================================================================
+
+const diagnostics = program
+  .command("diagnostics")
+  .description("Run diagnostics and tests on the ANT system");
+
+diagnostics
+  .command("test-all")
+  .description("Run all diagnostic tests")
+  .option("-g, --gateway <url>", "Gateway URL")
+  .option("-t, --timeout <ms>", "Timeout in milliseconds", "30000")
+  .option("--json", "Output as JSON")
+  .option("-s, --suite <name>", "Run specific test suite (endpoints, agent, whatsapp)")
+  .action(async (options, cmd) => {
+    const cfg = await loadConfig(cmd.optsWithGlobals().config);
+    await handleError(() => testAll(cfg, options));
+  });
+
+diagnostics
+  .command("endpoints")
+  .description("Test HTTP endpoints")
+  .option("-g, --gateway <url>", "Gateway URL")
+  .option("-t, --timeout <ms>", "Timeout in milliseconds", "30000")
+  .option("--json", "Output as JSON")
+  .action(async (options, cmd) => {
+    const cfg = await loadConfig(cmd.optsWithGlobals().config);
+    await handleError(() => endpoints(cfg, options));
+  });
+
+diagnostics
+  .command("agent-health")
+  .description("Test agent startup and health")
+  .option("-g, --gateway <url>", "Gateway URL")
+  .option("-t, --timeout <ms>", "Timeout in milliseconds", "30000")
+  .option("--json", "Output as JSON")
+  .action(async (options, cmd) => {
+    const cfg = await loadConfig(cmd.optsWithGlobals().config);
+    await handleError(() => agentHealth(cfg, options));
+  });
+
+diagnostics
+  .command("whatsapp")
+  .description("Test WhatsApp integration")
+  .option("-g, --gateway <url>", "Gateway URL")
+  .option("-t, --timeout <ms>", "Timeout in milliseconds", "30000")
+  .option("--json", "Output as JSON")
+  .action(async (options, cmd) => {
+    const cfg = await loadConfig(cmd.optsWithGlobals().config);
+    await handleError(() => whatsapp(cfg, options));
   });
 
 // =============================================================================

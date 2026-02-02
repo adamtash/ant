@@ -9,7 +9,7 @@ const DEFAULT_CONFIG_PATH = "ant.config.json";
 const ProviderItemSchema = z
   .object({
     type: z.enum(["openai", "cli"]).default("openai"),
-    cliProvider: z.enum(["codex", "copilot", "claude"]).default("codex"),
+    cliProvider: z.enum(["codex", "copilot", "claude", "kimi"]).default("codex"),
     baseUrl: z.string().optional(),
     apiKey: z.string().optional(),
     model: z.string().min(1),
@@ -93,6 +93,7 @@ const AgentSchema = z.object({
   systemPrompt: z.string().optional(),
   maxHistoryTokens: z.number().int().positive().default(40_000),
   temperature: z.number().min(0).max(2).default(0.2),
+  maxToolIterations: z.number().int().positive().default(6),
 });
 
 const MainAgentSchema = z.object({
@@ -103,15 +104,28 @@ const MainAgentSchema = z.object({
 });
 
 const SubagentsSchema = z.object({
-
   enabled: z.boolean().default(true),
   timeoutMs: z.number().int().positive().default(300_000),
   archiveAfterMinutes: z.number().int().positive().default(60),
 });
 
+const GatewaySchema = z.object({
+  enabled: z.boolean().default(true),
+  port: z.number().int().positive().default(18789),
+  host: z.string().min(1).default("127.0.0.1"),
+});
+
 const CliToolProviderSchema = z.object({
   command: z.string().min(1),
   args: z.array(z.string()).default([]),
+});
+
+const KimiProviderSchema = z.object({
+  type: z.literal("cli"),
+  cliProvider: z.literal("kimi"),
+  model: z.string().default("kimi-k2"),
+  command: z.string().default("kimi"),
+  args: z.array(z.string()).default(["--yolo"]),
 });
 
 const CliToolsSchema = z.object({
@@ -128,11 +142,13 @@ const CliToolsSchema = z.object({
       codex: CliToolProviderSchema.default({ command: "codex", args: [] }),
       copilot: CliToolProviderSchema.default({ command: "copilot", args: [] }),
       claude: CliToolProviderSchema.default({ command: "claude", args: [] }),
+      kimi: CliToolProviderSchema.default({ command: "kimi", args: ["--yolo"] }),
     })
     .default({
       codex: { command: "codex", args: [] },
       copilot: { command: "copilot", args: [] },
       claude: { command: "claude", args: [] },
+      kimi: { command: "kimi", args: ["--yolo"] },
     }),
 });
 
@@ -203,7 +219,7 @@ const ConfigSchema = z.object({
   agent: AgentSchema.default({}),
   mainAgent: MainAgentSchema.default({}),
   subagents: SubagentsSchema.default({}),
-
+  gateway: GatewaySchema.default({}),
   cliTools: CliToolsSchema.default({}),
   queue: QueueSchema.default({}),
   logging: LoggingSchema.default({}),

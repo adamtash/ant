@@ -106,7 +106,7 @@ export async function start(cfg: AntConfig, options: StartOptions = {}): Promise
       config: {
         maxHistoryTokens: cfg.agent.maxHistoryTokens,
         temperature: cfg.agent.temperature,
-        maxToolIterations: 20, // Default or config? Config doesn't have it explicitly in AgentSchema, verify in config.ts
+        maxToolIterations: cfg.agent.maxToolIterations,
       },
       providerConfig: {
         providers: cfg.resolved.providers.items as any,
@@ -117,20 +117,56 @@ export async function start(cfg: AntConfig, options: StartOptions = {}): Promise
       logger,
       workspaceDir: cfg.resolved.workspaceDir,
       stateDir: cfg.resolved.stateDir,
-      // memorySearch: ... // Optional, skip for now to simplify
     });
 
-    // Initialize Main Agent
+    // Set up message routing from router to agent engine
+    router.setDefaultHandler(async (message) => {
+      try {
+        const result = await agentEngine.execute({
+          sessionKey: message.context.sessionKey,
+          query: message.content,
+          chatId: message.context.chatId,
+          channel: message.channel,
+        });
+
+        // Send response back through the router
+        await router.sendToSession(message.context.sessionKey, result.response);
+
+        return {
+          id: message.id,
+          channel: message.channel,
+          sender: { id: "agent", name: "Agent", isAgent: true },
+          content: result.response,
+          context: message.context,
+          timestamp: Date.now(),
+          priority: message.priority,
+        };
+      } catch (error) {
+        logger.error(
+          { error: error instanceof Error ? error.message : String(error), sessionKey: message.context.sessionKey },
+          "Agent execution failed"
+        );
+        throw error;
+      }
+    });
+
+    logger.info("Agent handler registered with message router");
+
+    // Initialize Gateway Server first (so UI is available immediately)
     const { MainAgent } = await import("../../../agent/main-agent.js");
     const mainAgent = new MainAgent({
       config: cfg,
       agentEngine,
       logger,
+      sendMessage: async (jid: string, message: string) => {
+        // Send message via WhatsApp adapter
+        if (whatsapp.isConnected()) {
+          await whatsapp.sendText(jid, message);
+        }
+      },
     });
-    mainAgent.start();
 
     const server = new GatewayServer({
-
       config: {
         port: cfg.ui.port,
         host: cfg.ui.host,
@@ -142,9 +178,13 @@ export async function start(cfg: AntConfig, options: StartOptions = {}): Promise
       logger,
       agentEngine,
       router,
+      mainAgent,
     });
 
     await server.start();
+
+    const mainAgentEnabled = cfg.mainAgent?.enabled ?? true;
+    server.setMainAgentRunning(mainAgentEnabled);
 
     out.success("Agent runtime started");
     if (cfg.ui.enabled) {
@@ -157,6 +197,7 @@ export async function start(cfg: AntConfig, options: StartOptions = {}): Promise
       const shutdown = async () => {
         out.info("\nShutting down...");
         mainAgent.stop();
+        server.setMainAgentRunning(false);
         await router.stop();
         server.stop().then(() => resolve());
       };

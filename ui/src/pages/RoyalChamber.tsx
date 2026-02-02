@@ -9,7 +9,7 @@ import { useColonyStore } from '../stores/colonyStore';
 import { useSystemStore } from '../stores/systemStore';
 import { useUIStore } from '../stores/uiStore';
 import { Card, Badge, Button, Skeleton } from '../components/base';
-import { ColonyCanvas } from '../colony/renderer/ColonyCanvas';
+import { ColonyScene3D } from '../colony/renderer/ColonyScene3D';
 import { getStatus } from '../api/client';
 import type { StatusResponse, SubagentRecord } from '../api/types';
 
@@ -364,6 +364,49 @@ const QuickActions: React.FC = () => {
 };
 
 // ============================================
+// Scene Controls Component
+// ============================================
+
+const SceneControls: React.FC = () => {
+  const { zoomBy, setViewport } = useColonyStore();
+
+  return (
+    <div className="absolute bottom-6 right-6 flex flex-col gap-2">
+      <div className="bg-chamber-dark/80 backdrop-blur border border-chamber-wall rounded-lg p-1 flex flex-col gap-1">
+        <Button
+          variant="ghost"
+          size="sm"
+          onClick={() => zoomBy(1.2)}
+          title="Zoom In"
+          className="w-10 h-10"
+        >
+          ➕
+        </Button>
+        <Button
+          variant="ghost"
+          size="sm"
+          onClick={() => zoomBy(0.8)}
+          title="Zoom Out"
+          className="w-10 h-10"
+        >
+          ➖
+        </Button>
+        <div className="h-px bg-chamber-wall my-1" />
+        <Button
+          variant="ghost"
+          size="sm"
+          onClick={() => setViewport({ x: 0, y: 0 }, 1)}
+          title="Recenter"
+          className="w-10 h-10 text-xs"
+        >
+          🎯
+        </Button>
+      </div>
+    </div>
+  );
+};
+
+// ============================================
 // Main Royal Chamber Page
 // ============================================
 
@@ -445,7 +488,7 @@ export const RoyalChamber: React.FC = () => {
       <div className="flex-1 flex">
         {/* Colony visualization (center) */}
         <div className="flex-1 relative">
-          <ColonyCanvas width={800} height={600} className="w-full h-full" />
+          <ColonyScene3D className="w-full h-full" />
 
           {/* Overlay stats */}
           <div className="absolute top-4 left-4">
@@ -455,6 +498,9 @@ export const RoyalChamber: React.FC = () => {
               iterationCount={runningTasks}
             />
           </div>
+
+          {/* Scene Controls */}
+          <SceneControls />
         </div>
 
         {/* Right sidebar */}

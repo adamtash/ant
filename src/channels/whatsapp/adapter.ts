@@ -85,8 +85,8 @@ export class WhatsAppAdapter extends BaseChannelAdapter {
       cfg: this.cfg,
       logger: this.logger,
       onMessage: async (inbound) => {
-        // The existing client already does filtering, but we still normalize
-        // This is a passthrough for now - raw message handling below
+        // Process incoming messages through the adapter's normalization pipeline
+        this.handleIncomingMessage(inbound.message);
       },
       onStatus: (status) => {
         this.onStatusUpdate?.(status);
@@ -98,6 +98,11 @@ export class WhatsAppAdapter extends BaseChannelAdapter {
           this.setConnected(false, status.loggedOut ? "logged_out" : "disconnected");
         }
       },
+    });
+
+    // Listen for messages from the client (backup path)
+    this.client.on("message", (inbound) => {
+      this.handleIncomingMessage(inbound.message);
     });
 
     // Set initial connection state
@@ -125,6 +130,13 @@ export class WhatsAppAdapter extends BaseChannelAdapter {
           selfJid: this.client.getSelfJid(),
           ...this.client.getStatus(),
       };
+  }
+
+  /**
+   * Check if WhatsApp is connected
+   */
+  isConnected(): boolean {
+    return this.client?.isConnected() ?? false;
   }
 
   // ==========================================================================
@@ -177,6 +189,16 @@ export class WhatsAppAdapter extends BaseChannelAdapter {
     await this.client.sendTyping(chatId, isTyping);
   }
 
+  /**
+   * Send a simple text message directly to a JID
+   */
+  async sendText(jid: string, text: string): Promise<void> {
+    if (!this.client) {
+      throw new Error("WhatsApp client not connected");
+    }
+    await this.client.sendText(jid, text);
+  }
+
   // ==========================================================================
   // Message Normalization
   // ==========================================================================
@@ -186,35 +208,52 @@ export class WhatsAppAdapter extends BaseChannelAdapter {
 
     // Extract basic info
     const text = extractTextFromMessage(msg);
-    if (!text) return null;
+    if (!text) {
+      this.logger.debug("Message filtered: no text content");
+      return null;
+    }
 
     const chatId = msg.key.remoteJid;
-    if (!chatId) return null;
+    if (!chatId) {
+      this.logger.debug("Message filtered: no chat ID");
+      return null;
+    }
 
     // Skip status broadcasts
-    if (isStatusJid(chatId)) return null;
+    if (isStatusJid(chatId)) {
+      this.logger.debug({ chatId }, "Message filtered: status broadcast");
+      return null;
+    }
 
     const senderInfo = extractSenderInfo(msg);
     const isGroup = isGroupJid(chatId);
 
     // Check group permissions
-    if (isGroup && !this.cfg.whatsapp.respondToGroups) return null;
+    if (isGroup && !this.cfg.whatsapp.respondToGroups) {
+      this.logger.debug({ chatId, isGroup }, "Message filtered: group messages disabled");
+      return null;
+    }
 
     // Check self-only mode
     if (this.cfg.whatsapp.respondToSelfOnly) {
       const isSelf =
         (this.selfJid && areJidsSameUser(chatId, this.selfJid)) ||
         (this.selfLid && areJidsSameUser(chatId, this.selfLid));
-      if (!isSelf) return null;
+      if (!isSelf) {
+        this.logger.debug({ chatId, selfJid: this.selfJid }, "Message filtered: not self-chat");
+        return null;
+      }
     }
 
     // Check fromMe filtering
     if (senderInfo.isFromMe) {
       if (!this.cfg.whatsapp.allowSelfMessages && !this.cfg.whatsapp.respondToSelfOnly) {
+        this.logger.debug("Message filtered: fromMe not allowed");
         return null;
       }
       // Skip our own sent messages
       if (msg.key.id && this.sentMessageIds.has(msg.key.id)) {
+        this.logger.debug({ msgId: msg.key.id }, "Message filtered: own sent message");
         return null;
       }
     }
@@ -229,12 +268,14 @@ export class WhatsAppAdapter extends BaseChannelAdapter {
       const keywordMentioned = hasKeywordMention(text, this.cfg.whatsapp.mentionKeywords);
 
       if (!botMentioned && !nameMentioned && !keywordMentioned) {
+        this.logger.debug({ text }, "Message filtered: no mention");
         return null;
       }
     }
 
     // Check owner restrictions
     if (!this.isAllowedOwner(senderInfo.id, chatId)) {
+      this.logger.debug({ senderId: senderInfo.id, chatId }, "Message filtered: not allowed owner");
       return null;
     }
 
