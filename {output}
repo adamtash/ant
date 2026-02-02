@@ -1,0 +1,14 @@
+Light Check complete (Mon Feb 2, 2026 18:51:38 UTC).
+
+What I checked
+- Read `/Users/a/.ant/ant.log` tail and `.ant` state dir.
+
+Findings
+- Runtime is active (`/Users/a/.ant/ant.pid` present) and WhatsApp pings are flowing.
+- The Light Check job started, selected `copilot` CLI provider, then the CLI call failed with exit code 1 and opened the circuit breaker.
+- Fallback to `codex-cli` started; no completion logged yet in the last 50 lines.
+- Log also shows “Session not found and could not be recovered” during the provider fallback.
+
+Suggested next steps
+1. Check the latest log lines to confirm whether the `codex-cli` fallback completed and the job finished.
+2. Investigate the `copilot` CLI failure (exit 1) since it’s now tripping the circuit breaker.

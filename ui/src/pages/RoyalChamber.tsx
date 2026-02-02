@@ -3,15 +3,15 @@
  * Main dashboard - the queen's view of the colony
  */
 
-import React, { useEffect, useState, useCallback } from 'react';
+import React, { useEffect, useState } from 'react';
 import { motion } from 'framer-motion';
 import { useColonyStore } from '../stores/colonyStore';
 import { useSystemStore } from '../stores/systemStore';
 import { useUIStore } from '../stores/uiStore';
 import { Card, Badge, Button, Skeleton } from '../components/base';
 import { ColonyScene3D } from '../colony/renderer/ColonyScene3D';
-import { getStatus, getProviderHealth } from '../api/client';
-import type { StatusResponse, SubagentRecord } from '../api/types';
+import { getProviderHealth, getWebSocketClient } from '../api/client';
+import type { StatusResponse, SubagentRecord, SystemEvent } from '../api/types';
 
 // ============================================
 // Provider Health Component
@@ -519,28 +519,66 @@ export const RoyalChamber: React.FC = () => {
   const { queen, isRunning } = useColonyStore();
   const { queenThinking, totalErrors } = useSystemStore();
 
-  // Fetch status and provider health periodically
-  const fetchStatus = useCallback(async () => {
-    try {
-      const [statusData, providerData] = await Promise.all([
-        getStatus(),
-        getProviderHealth().catch(() => ({ ok: true, providers: [] })),
-      ]);
-      setStatus(statusData);
-      setProviders(providerData.providers ?? []);
-      setError(null);
-    } catch (err) {
-      setError('Failed to connect to colony');
-    } finally {
-      setLoading(false);
-    }
+  // Subscribe to WebSocket status updates
+  useEffect(() => {
+    let wsClient = getWebSocketClient({
+      onEvent: (event: SystemEvent) => {
+        if (event.type === 'status_updated' || event.type === 'status_snapshot') {
+          const statusData = (event.data as any)?.data ?? (event.data as any);
+          if (statusData) {
+            setStatus(statusData as StatusResponse);
+            setError(null);
+          }
+        }
+
+        if (event.type === 'status_delta') {
+          const changes = (event.data as any)?.changes as Record<string, unknown> | undefined;
+          if (changes) {
+            setStatus((prev) => (prev ? ({ ...prev, ...changes } as StatusResponse) : prev));
+          }
+        }
+      },
+      onConnect: () => {
+        console.log('RoyalChamber: Connected to status updates');
+        setError(null); // Clear error on successful connection
+      },
+      onDisconnect: () => {
+        console.log('RoyalChamber: Disconnected from status updates');
+      },
+      onError: (error) => {
+        console.error('RoyalChamber: WebSocket error:', error);
+        console.error('RoyalChamber: Error details:', {
+          type: error.type,
+          message: error instanceof Event ? 'WebSocket connection error' : String(error),
+          timestamp: new Date().toISOString(),
+        });
+        setError('WebSocket connection failed');
+      },
+    });
+
+    wsClient.connect();
+    setLoading(false);
+
+    return () => {
+      wsClient.disconnect();
+    };
   }, []);
 
+  // Fetch provider health occasionally (can stay as REST since it's less critical)
   useEffect(() => {
-    fetchStatus();
-    const interval = setInterval(fetchStatus, 3000);
+    const fetchProviders = async () => {
+      try {
+        const providerData = await getProviderHealth().catch(() => ({ ok: true, providers: [] }));
+        setProviders(providerData.providers ?? []);
+      } catch (err) {
+        console.error('Failed to fetch provider health:', err);
+      }
+    };
+
+    fetchProviders();
+    const interval = setInterval(fetchProviders, 10000); // Every 10 seconds
     return () => clearInterval(interval);
-  }, [fetchStatus]);
+  }, []);
 
   // Sync Queen to Main Agent status
   useEffect(() => {
@@ -551,13 +589,15 @@ export const RoyalChamber: React.FC = () => {
       // Activate queen if main agent is enabled
       if (status.mainAgent.running) {
         colonyStore.activateQueen();
+        colonyStore.ensureQueenAttendants(3);
       } else {
         colonyStore.deactivateQueen();
+        colonyStore.clearQueenAttendants();
       }
       
       // Set thinking state based on active tasks
       const hasActiveTask = status.mainAgent.tasks?.some(
-        t => t.status === 'in_progress'
+        t => t.status === 'running'
       );
       colonyStore.setQueenThinking(hasActiveTask ?? false);
       systemStore.queenThinking = hasActiveTask ?? false;

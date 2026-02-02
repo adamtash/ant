@@ -1,46 +1,52 @@
 /**
  * Main Agent - Autonomous Supervisor
- *
- * Features:
- * - Self-directed investigation and problem-solving
- * - Automatic testing and verification
- * - Self-improvement through code analysis
- * - Continuous monitoring and maintenance
- * - Startup health checks with WhatsApp reporting
  */
 
 import fs from "node:fs/promises";
 import path from "node:path";
+import crypto from "node:crypto";
+
 import { type AntConfig } from "../config.js";
 import { type AgentEngine } from "./engine.js";
 import { type Logger } from "../log.js";
 import { type SessionManager } from "../gateway/session-manager.js";
+import { createEventPublishers, getEventStream } from "../monitor/event-stream.js";
+import { TaskStore } from "./task/task-store.js";
+import type { TaskEntry, TaskResult, TaskState } from "./task/types.js";
+import { TaskQueue } from "./concurrency/task-queue.js";
+import { TaskLane } from "./concurrency/lanes.js";
+import { TimeoutMonitor } from "./concurrency/timeout-monitor.js";
+import { PhaseExecutor } from "./subagent/phase-executor.js";
+import { DEFAULT_SUBAGENT_PHASES } from "./subagent/execution-phases.js";
+import {
+  DEFAULT_AGENT_ID,
+  buildAgentScopedSessionKey,
+  buildAgentSubagentSessionKey,
+  buildAgentTaskSessionKey,
+} from "../routing/session-key.js";
 
-export interface MainAgentTask {
-  id: string;
-  description: string;
-  status: "pending" | "in_progress" | "completed" | "failed";
-  createdAt: number;
-  completedAt?: number;
-  result?: string;
-}
+export type MainAgentTask = TaskEntry;
 
 export interface MainAgentSendMessage {
   (jid: string, message: string): Promise<void>;
 }
 
 export class MainAgent {
-  private config: AntConfig;
+  public config: AntConfig;
   private agentEngine: AgentEngine;
   private logger: Logger;
   private sendMessage?: MainAgentSendMessage;
   private sessionManager?: SessionManager;
   private running = false;
   private timer: NodeJS.Timeout | null = null;
-  private tasks: Map<string, MainAgentTask> = new Map();
-  private currentTask: MainAgentTask | null = null;
   private startupHealthCheckDone = false;
-  
+  private taskStore: TaskStore;
+  private taskQueue: TaskQueue;
+  private timeoutMonitor: TimeoutMonitor;
+  private phaseExecutor: PhaseExecutor;
+  private autonomousRunning = false;
+  private readonly agentId: string;
+
   constructor(params: {
     config: AntConfig;
     agentEngine: AgentEngine;
@@ -53,36 +59,273 @@ export class MainAgent {
     this.sendMessage = params.sendMessage;
     this.sessionManager = params.sessionManager;
     this.logger = params.logger.child({ component: "main-agent" });
+    this.agentId = DEFAULT_AGENT_ID;
+
+    const taskConfig = this.config.agentExecution?.tasks;
+    const laneConfig = this.config.agentExecution?.lanes;
+    const cacheTtlMs = taskConfig?.registry?.cacheTtlMs ?? 45_000;
+    const configuredDir = taskConfig?.registry?.dir;
+    const taskDir = configuredDir
+      ? (path.isAbsolute(configuredDir)
+          ? configuredDir
+          : path.resolve(this.config.resolved.workspaceDir, configuredDir))
+      : undefined;
+
+    this.taskStore = new TaskStore({
+      stateDir: this.config.resolved.stateDir,
+      taskDir,
+      logger: this.logger,
+      cacheTtlMs,
+    });
+
+    this.taskQueue = new TaskQueue({
+      logger: this.logger,
+      laneLimits: {
+        [TaskLane.Main]: laneConfig?.main?.maxConcurrent ?? 1,
+        [TaskLane.Autonomous]: laneConfig?.autonomous?.maxConcurrent ?? 5,
+        [TaskLane.Maintenance]: laneConfig?.maintenance?.maxConcurrent ?? 1,
+      },
+    });
+
+    this.phaseExecutor = new PhaseExecutor({
+      agentEngine: this.agentEngine,
+      logger: this.logger,
+      taskStore: this.taskStore,
+    });
+
+    this.timeoutMonitor = new TimeoutMonitor({
+      logger: this.logger,
+      taskStore: this.taskStore,
+      intervalMs: this.config.agentExecution?.monitoring?.timeoutCheckIntervalMs ?? 1000,
+      onWarning: async (task, msUntilTimeout) => {
+        await createEventPublishers(getEventStream()).taskTimeoutWarning({
+          taskId: task.taskId,
+          msUntilTimeout,
+        }, { sessionKey: task.sessionKey, channel: task.metadata.channel });
+      },
+      onTimeout: async (task, reason) => {
+        await this.handleTimeout(task, reason);
+      },
+    });
   }
 
-  async start() {
+  async start(): Promise<void> {
     if (!this.config.mainAgent?.enabled) {
       this.logger.info("Main Agent disabled");
       return;
     }
 
+    await this.taskStore.initialize();
+    this.timeoutMonitor.start();
+
     this.running = true;
     this.logger.info("Main Agent loop started - Autonomous mode enabled");
-    
-    // Send startup message to WhatsApp
+
     await this.sendStartupMessage();
-    
-    // Run startup health check first, then start the regular cycle
     await this.runStartupHealthCheck();
-    
-    // Run regular cycle
+
     this.runCycle();
   }
 
-  stop() {
+  stop(): void {
     this.running = false;
+    this.timeoutMonitor.stop();
     if (this.timer) clearTimeout(this.timer);
     this.logger.info("Main Agent loop stopped");
   }
 
-  /**
-   * Send startup notification to WhatsApp owner
-   */
+  async assignTask(description: string, maxRetries?: number): Promise<string> {
+    const retries = maxRetries ?? this.config.agentExecution?.tasks?.defaults?.maxRetries ?? 3;
+    const sessionKey = buildAgentTaskSessionKey({
+      agentId: this.agentId,
+      taskId: crypto.randomUUID(),
+    });
+
+    const task = await this.taskStore.create({
+      description,
+      sessionKey,
+      lane: TaskLane.Main,
+      metadata: {
+        channel: "cli",
+        priority: "high",
+        tags: [],
+      },
+      retries: { maxAttempts: retries },
+      timeoutMs: this.config.agentExecution?.tasks?.defaults?.timeoutMs ?? 120_000,
+    });
+
+    await this.enqueueTask(task, TaskLane.Main);
+    this.logger.info({ taskId: task.taskId }, "New task assigned to Main Agent");
+
+    return task.taskId;
+  }
+
+  async getTask(taskId: string): Promise<MainAgentTask | undefined> {
+    return this.taskStore.get(taskId);
+  }
+
+  async getAllTasks(): Promise<MainAgentTask[]> {
+    return this.taskStore.list();
+  }
+
+  private async enqueueTask(task: TaskEntry, lane: TaskLane): Promise<void> {
+    await this.taskStore.updateStatus(task.taskId, "queued");
+    this.taskQueue.enqueue(task, lane, async () => this.runTask(task.taskId));
+  }
+
+  private async runTask(taskId: string): Promise<TaskResult> {
+    const task = await this.taskStore.get(taskId);
+    if (!task) throw new Error(`Task not found: ${taskId}`);
+
+    await this.taskStore.updateStatus(task.taskId, "running");
+
+    try {
+      const subTask = await this.spawnSubagent(task);
+      const timeoutMs = this.config.agentExecution?.subagents?.timeoutMs ?? 120_000;
+      const result = await this.taskQueue.waitForCompletion(subTask.taskId, timeoutMs);
+
+      await this.taskStore.setResult(task.taskId, result);
+      await this.taskStore.updateStatus(task.taskId, "succeeded");
+
+      return result;
+    } catch (err) {
+      const error = err instanceof Error ? err.message : String(err);
+      await this.handleFailure(task, error);
+      throw err instanceof Error ? err : new Error(String(err));
+    }
+  }
+
+  private async spawnSubagent(parentTask: TaskEntry): Promise<TaskEntry> {
+    const sessionKey = buildAgentSubagentSessionKey({
+      agentId: this.agentId,
+      subagentId: crypto.randomUUID(),
+      parentTaskId: parentTask.taskId,
+    });
+    const subTask = await this.taskStore.create({
+      parentTaskId: parentTask.taskId,
+      description: parentTask.description,
+      sessionKey,
+      lane: TaskLane.Autonomous,
+      metadata: {
+        channel: parentTask.metadata.channel,
+        priority: "normal",
+        tags: parentTask.metadata.tags,
+      },
+      retries: { maxAttempts: this.config.agentExecution?.subagents?.maxRetries ?? 2 },
+      timeoutMs: this.config.agentExecution?.subagents?.timeoutMs ?? 120_000,
+    });
+
+    await this.taskStore.update(parentTask.taskId, { subagentSessionKey: sessionKey });
+
+    await createEventPublishers(getEventStream()).subagentSpawned(
+      {
+        subagentId: subTask.taskId,
+        task: subTask.description,
+        parentSessionKey: parentTask.sessionKey,
+        parentTaskId: parentTask.taskId,
+      },
+      { sessionKey: parentTask.sessionKey, channel: parentTask.metadata.channel }
+    );
+
+    await this.taskStore.updateStatus(subTask.taskId, "queued");
+
+    this.taskQueue.enqueue(subTask, TaskLane.Autonomous, async () => {
+      const fresh = await this.taskStore.get(subTask.taskId);
+      if (!fresh) throw new Error(`Subtask not found: ${subTask.taskId}`);
+
+      await this.taskStore.updateStatus(fresh.taskId, "running");
+
+      try {
+        const result = await this.phaseExecutor.execute(fresh, DEFAULT_SUBAGENT_PHASES);
+        await this.taskStore.setResult(fresh.taskId, result);
+        await this.taskStore.updateStatus(fresh.taskId, "succeeded");
+        return result;
+      } catch (err) {
+        const error = err instanceof Error ? err.message : String(err);
+        await this.taskStore.update(fresh.taskId, { error });
+        await this.taskStore.updateStatus(fresh.taskId, "failed", error);
+        throw err instanceof Error ? err : new Error(String(err));
+      }
+    });
+
+    return subTask;
+  }
+
+  private async handleFailure(task: TaskEntry, error: string): Promise<void> {
+    const attempted = task.retries.attempted + 1;
+    const maxAttempts = task.retries.maxAttempts;
+
+    if (attempted >= maxAttempts) {
+      await this.taskStore.update(task.taskId, { error });
+      await this.taskStore.updateStatus(task.taskId, "failed", error);
+      return;
+    }
+
+    const defaults = this.config.agentExecution?.tasks?.defaults;
+    const base = defaults?.retryBackoffMs ?? 1000;
+    const multiplier = defaults?.retryBackoffMultiplier ?? 2;
+    const cap = defaults?.retryBackoffCap ?? 60_000;
+    const backoffMs = Math.min(base * Math.pow(multiplier, attempted - 1), cap);
+    const nextRetryAt = Date.now() + backoffMs;
+
+    await this.taskStore.update(task.taskId, {
+      retries: {
+        ...task.retries,
+        attempted,
+        nextRetryAt,
+        backoffMs,
+      },
+      error,
+    });
+
+    await this.taskStore.updateStatus(task.taskId, "retrying", error);
+
+    await createEventPublishers(getEventStream()).taskRetryScheduled({
+      taskId: task.taskId,
+      attempt: attempted,
+      nextRetryAt,
+      backoffMs,
+    }, { sessionKey: task.sessionKey, channel: task.metadata.channel });
+
+    this.taskQueue.enqueueWithDelay(
+      task,
+      TaskLane.Main,
+      async () => {
+        await this.taskStore.updateStatus(task.taskId, "queued");
+        return this.runTask(task.taskId);
+      },
+      backoffMs
+    );
+  }
+
+  private async handleTimeout(task: TaskEntry, reason: string): Promise<void> {
+    await this.taskStore.update(task.taskId, { error: reason });
+    await this.taskStore.updateStatus(task.taskId, "failed", reason);
+
+    await createEventPublishers(getEventStream()).taskTimeout({
+      taskId: task.taskId,
+      reason,
+      timestamp: Date.now(),
+    }, { sessionKey: task.sessionKey, channel: task.metadata.channel });
+  }
+
+  private async runCycle(): Promise<void> {
+    if (!this.running) return;
+
+    try {
+      const active = await this.taskStore.getActiveTasks();
+      if (active.length === 0 && !this.autonomousRunning) {
+        this.autonomousRunning = true;
+        await this.runAutonomousDuties();
+        this.autonomousRunning = false;
+      }
+    } catch (err) {
+      this.logger.error({ error: err instanceof Error ? err.message : String(err) }, "Main Agent cycle failed");
+    }
+
+    this.scheduleNext_();
+  }
+
   private async sendStartupMessage(): Promise<void> {
     const ownerJids = this.config.whatsapp?.ownerJids || [];
     const startupRecipients = this.config.whatsapp?.startupRecipients || [];
@@ -104,69 +347,43 @@ export class MainAgent {
       }
     }
   }
+
   private async runStartupHealthCheck(): Promise<void> {
     if (this.startupHealthCheckDone) return;
-    
+
     this.logger.info("Running startup health check...");
-    
+
     const ownerJids = this.config.whatsapp?.ownerJids || [];
     const startupRecipients = this.config.whatsapp?.startupRecipients || [];
     const recipients = startupRecipients.length > 0 ? startupRecipients : ownerJids;
-    
+
     try {
       const duties = await this.loadDuties();
-      
+
+      const sessionKey = buildAgentScopedSessionKey({
+        agentId: this.agentId,
+        scope: "startup-health",
+      });
       const result = await this.agentEngine.execute({
-        query: `You are the Main Agent running a STARTUP HEALTH CHECK.
-
-Perform a comprehensive system health check and report the status:
-
-HEALTH CHECK ITEMS:
-1. **System Status**: Check if all components are running
-   - Gateway server
-   - WhatsApp connection  
-   - Agent engine
-   - Memory system
-
-2. **Diagnostics**: Run system diagnostics
-   - Check disk usage in .ant/ directory
-   - Review recent logs for errors
-   - Verify provider connectivity
-
-3. **Test Basic Operations**:
-   - Try a simple memory search to verify embeddings
-   - Check if tools are accessible
-
-4. **Summary Report**: Provide a concise health report with:
-   - ✅ Working components
-   - ⚠️ Warnings (if any)
-   - ❌ Issues found (if any)
-
-FORMAT YOUR RESPONSE FOR WHATSAPP:
-Keep it concise and readable. Use emoji indicators.
-Example:
-🤖 *Startup Health Check*
-
-✅ Gateway: Running
-✅ WhatsApp: Connected
-✅ Agent Engine: Ready
-⚠️ Memory: 234 MB (12% usage)
-
-System is healthy and ready!`,
-        sessionKey: "main-agent:startup-health",
+        query: `You are the Main Agent running a STARTUP HEALTH CHECK.\n\nPerform a comprehensive system health check and report the status:\n\nHEALTH CHECK ITEMS:\n1. **System Status**: Check if all components are running\n   - Gateway server\n   - WhatsApp connection  \n   - Agent engine\n   - Memory system\n\n2. **Diagnostics**: Run system diagnostics\n   - Check disk usage in .ant/ directory\n   - Review recent logs for errors\n   - Verify provider connectivity\n\n3. **Test Basic Operations**:\n   - Try a simple memory search to verify embeddings\n   - Check if tools are accessible\n\n4. **Summary Report**: Provide a concise health report with:\n   - ✅ Working components\n   - ⚠️ Warnings (if any)\n   - ❌ Issues found (if any)\n\nFORMAT YOUR RESPONSE FOR WHATSAPP:\nKeep it concise and readable. Use emoji indicators.\nExample:\n🤖 *Startup Health Check*\n\n✅ Gateway: Running\n✅ WhatsApp: Connected\n✅ Agent Engine: Ready\n⚠️ Memory: 234 MB (12% usage)\n\nSystem is healthy and ready!`,
+        sessionKey,
         chatId: "system",
         channel: "cli",
       });
 
-      // Persist the health check response
-      await this.persistMessage("main-agent:startup-health", "assistant", result.response, result.providerId, result.model);
+      await this.persistMessage(
+        sessionKey,
+        "assistant",
+        result.response,
+        result.providerId,
+        result.model
+      );
 
       this.startupHealthCheckDone = true;
-      
-      // Send results to WhatsApp owner if configured
+
       if (recipients.length > 0 && this.sendMessage) {
         const message = result.response || "🤖 Startup health check completed.";
-        
+
         for (const jid of recipients) {
           try {
             await this.sendMessage(jid, message);
@@ -178,14 +395,12 @@ System is healthy and ready!`,
       } else {
         this.logger.info("No WhatsApp recipients configured for startup health check");
       }
-      
     } catch (err) {
       this.logger.error({ error: err }, "Startup health check failed");
-      
-      // Send error notification to owner
+
       if (recipients.length > 0 && this.sendMessage) {
         const errorMessage = `🤖 *Startup Health Check*\n\n❌ Health check failed:\n${err instanceof Error ? err.message : String(err)}`;
-        
+
         for (const jid of recipients) {
           try {
             await this.sendMessage(jid, errorMessage);
@@ -197,216 +412,27 @@ System is healthy and ready!`,
     }
   }
 
-  /**
-   * Assign a new task to the Main Agent
-   */
-  async assignTask(description: string): Promise<string> {
-    const taskId = `task-${Date.now()}`;
-    const task: MainAgentTask = {
-      id: taskId,
-      description,
-      status: "pending",
-      createdAt: Date.now(),
-    };
-    this.tasks.set(taskId, task);
-    this.logger.info({ taskId, description }, "New task assigned to Main Agent");
-    
-    // Trigger immediate cycle if not busy
-    if (!this.currentTask) {
-      this.runCycle();
-    }
-    
-    return taskId;
-  }
-
-  /**
-   * Get task status
-   */
-  getTask(taskId: string): MainAgentTask | undefined {
-    return this.tasks.get(taskId);
-  }
-
-  /**
-   * Get all tasks
-   */
-  getAllTasks(): MainAgentTask[] {
-    return Array.from(this.tasks.values()).sort((a, b) => b.createdAt - a.createdAt);
-  }
-
-  /**
-   * Persist a message to session storage
-   */
-  private async persistMessage(sessionKey: string, role: "user" | "assistant", content: string, providerId?: string, model?: string): Promise<void> {
-    if (!this.sessionManager) return;
-    
-    try {
-      await this.sessionManager.appendMessage(sessionKey, {
-        role,
-        content,
-        timestamp: Date.now(),
-        providerId,
-        model,
-      });
-    } catch (err) {
-      this.logger.warn({ error: err, sessionKey }, "Failed to persist Main Agent message");
-    }
-  }
-
-  private async runCycle() {
-    if (!this.running) return;
-
-    try {
-      this.logger.debug("Starting Main Agent duty cycle");
-      
-      // Check for pending tasks first
-      const pendingTask = this.getNextPendingTask();
-      
-      if (pendingTask) {
-        await this.executeTask(pendingTask);
-      } else {
-        // Run autonomous duties
-        await this.runAutonomousDuties();
-      }
-
-    } catch (err) {
-      this.logger.error({ error: err }, "Main Agent cycle failed");
-    }
-    
-    this.scheduleNext_();
-  }
-
-  private getNextPendingTask(): MainAgentTask | null {
-    for (const task of this.tasks.values()) {
-      if (task.status === "pending") {
-        return task;
-      }
-    }
-    return null;
-  }
-
-  private async executeTask(task: MainAgentTask) {
-    this.currentTask = task;
-    task.status = "in_progress";
-    
-    this.logger.info({ taskId: task.id }, "Executing task");
-
-    try {
-      const duties = await this.loadDuties();
-      
-      const result = await this.agentEngine.execute({
-        query: `You are the Main Agent. Execute this assigned task autonomously:
-
-TASK: ${task.description}
-
-Follow this approach:
-1. INVESTIGATE: Analyze the problem thoroughly
-2. PLAN: Determine the best solution approach
-3. EXECUTE: Implement the fix or solution
-4. TEST: Verify the solution works
-5. REPORT: Document what was done
-
-Available tools:
-- read: Read files to understand code
-- write: Write or modify files
-- exec: Run commands (tests, builds, etc.)
-- ls: List directory contents
-- memory_search: Search for relevant context
-
-Current Duties Context:
-${duties}
-
-Work autonomously. If you need to make changes:
-- Read relevant files first
-- Make minimal, focused changes
-- Test your changes
-- Report results
-
-Output <promise>TASK_COMPLETE</promise> when finished.
-Output <promise>NEEDS_HELP</promise> if you need human assistance.`,
-        sessionKey: `main-agent:task:${task.id}`,
-        chatId: "system",
-        channel: "cli",
-      });
-
-      // Persist the task result
-      const sessionKey = `main-agent:task:${task.id}`;
-      await this.persistMessage(sessionKey, "assistant", result.response, result.providerId, result.model);
-
-      task.status = "completed";
-      task.completedAt = Date.now();
-      task.result = result.response;
-      
-      this.logger.info({ taskId: task.id }, "Task completed");
-
-    } catch (err) {
-      task.status = "failed";
-      task.completedAt = Date.now();
-      task.result = err instanceof Error ? err.message : String(err);
-      
-      this.logger.error({ taskId: task.id, error: err }, "Task failed");
-    } finally {
-      this.currentTask = null;
-    }
-  }
-
-  private async runAutonomousDuties() {
+  private async runAutonomousDuties(): Promise<void> {
     const duties = await this.loadDuties();
-    
+
+    const sessionKey = buildAgentScopedSessionKey({
+      agentId: this.agentId,
+      scope: "system",
+    });
     const result = await this.agentEngine.execute({
-      query: `Execute your duties as the Autonomous Main Agent.
-
-PHILOSOPHY: Work like an expert software engineer - investigate, fix, test, iterate.
-
-Current Duties:
-${duties}
-
-AUTONOMOUS WORKFLOW:
-1. CHECK: Run diagnostics to find issues
-   - Check logs for errors
-   - Test endpoints
-   - Verify WhatsApp connectivity
-
-2. INVESTIGATE: If issues found
-   - Read relevant code
-   - Analyze root cause
-   - Search memory for context
-
-3. FIX: Implement solution
-   - Make minimal changes
-   - Follow existing patterns
-   - Update tests if needed
-
-4. TEST: Verify the fix
-   - Run tests
-   - Check functionality
-   - Confirm resolution
-
-5. IMPROVE: Look for enhancements
-   - Code quality improvements
-   - Performance optimizations
-   - Better error handling
-
-6. REPORT: Log actions taken
-   - What was checked
-   - What was found
-   - What was done
-   - Results
-
-You have full autonomy. Use tools to:
-- Read/write files
-- Execute commands (npm run build, npm test, etc.)
-- Search memory
-- Run diagnostics
-
-Output <promise>DUTY_CYCLE_COMPLETE</promise> when finished.
-Output <promise>ISSUES_FOUND</promise> if you found and fixed issues.`,
-      sessionKey: "main-agent:system",
+      query: `Execute your duties as the Autonomous Main Agent.\n\nPHILOSOPHY: Work like an expert software engineer - investigate, fix, test, iterate.\n\nCurrent Duties:\n${duties}\n\nAUTONOMOUS WORKFLOW:\n1. CHECK: Run diagnostics to find issues\n   - Check logs for errors\n   - Test endpoints\n   - Verify WhatsApp connectivity\n\n2. INVESTIGATE: If issues found\n   - Read relevant code\n   - Analyze root cause\n   - Search memory for context\n\n3. FIX: Implement solution\n   - Make minimal changes\n   - Follow existing patterns\n   - Update tests if needed\n\n4. TEST: Verify the fix\n   - Run tests\n   - Check functionality\n   - Confirm resolution\n\n5. IMPROVE: Look for enhancements\n   - Code quality improvements\n   - Performance optimizations\n   - Better error handling\n\n6. REPORT: Log actions taken\n   - What was checked\n   - What was found\n   - What was done\n   - Results\n\nOutput <promise>DUTY_CYCLE_COMPLETE</promise> when finished.\nOutput <promise>ISSUES_FOUND</promise> if you found and fixed issues.`,
+      sessionKey,
       chatId: "system",
       channel: "cli",
     });
 
-    // Persist the autonomous duty cycle result
-    await this.persistMessage("main-agent:system", "assistant", result.response, result.providerId, result.model);
+    await this.persistMessage(
+      sessionKey,
+      "assistant",
+      result.response,
+      result.providerId,
+      result.model
+    );
 
     this.logger.info("Main Agent duty cycle complete");
   }
@@ -414,11 +440,10 @@ Output <promise>ISSUES_FOUND</promise> if you found and fixed issues.`,
   private async loadDuties(): Promise<string> {
     const dutiesFile = this.config.mainAgent.dutiesFile || "AGENT_DUTIES.md";
     const dutiesPath = path.join(this.config.resolved.workspaceDir, dutiesFile);
-    
+
     try {
       return await fs.readFile(dutiesPath, "utf-8");
     } catch {
-      // Fallback: try relative to config file
       const configDir = path.dirname(this.config.resolved.configPath);
       const fallbackPath = path.join(configDir, dutiesFile);
       try {
@@ -430,71 +455,36 @@ Output <promise>ISSUES_FOUND</promise> if you found and fixed issues.`,
     }
   }
 
-  private scheduleNext_() {
+  private scheduleNext_(): void {
     if (this.running) {
       const interval = this.config.mainAgent.intervalMs || 60000;
       this.timer = setTimeout(() => this.runCycle(), interval);
     }
   }
 
-  /**
-   * Get default duties when AGENT_DUTIES.md is not found
-   */
   private getDefaultDuties(): string {
-    return `# Autonomous Main Agent Duties
+    return `# Autonomous Main Agent Duties\n\n## System Health Monitoring\n\n1. Run diagnostics: \`ant diagnostics test-all\`\n2. Check logs for errors and warnings\n3. Verify all services are running:\n   - Gateway HTTP API\n   - WhatsApp connection\n   - Agent engine\n4. Monitor resource usage (memory, CPU)\n\n## Self-Improvement Loop\n\n1. Review recent error patterns in logs\n2. Identify flaky tests or failures\n3. Look for code quality issues\n4. Check for outdated dependencies\n5. Optimize slow operations\n\n## Proactive Maintenance\n\n1. Clean up old session data (>30 days)\n2. Archive completed tasks\n3. Update memory indexes\n4. Verify backup systems\n5. Check disk space\n\n## Investigation Protocol\n\nWhen issues are found:\n1. Read relevant source files\n2. Check test coverage\n3. Analyze error patterns\n4. Search memory for similar issues\n5. Propose and implement fixes\n6. Test the solution\n7. Document the resolution\n\n## Autonomous Actions\n\nYou are empowered to:\n- Read any file in the project\n- Write fixes to source files\n- Run tests and builds\n- Execute diagnostics\n- Search memory and logs\n- Create new tasks for complex issues\n\nAlways:\n- Make minimal, focused changes\n- Follow existing code patterns\n- Test before declaring success\n- Report what you did and why\n`;
+  }
 
-## System Health Monitoring
+  private async persistMessage(
+    sessionKey: string,
+    role: "user" | "assistant",
+    content: string,
+    providerId?: string,
+    model?: string
+  ): Promise<void> {
+    if (!this.sessionManager) return;
 
-1. Run diagnostics: \`ant diagnostics test-all\`
-2. Check logs for errors and warnings
-3. Verify all services are running:
-   - Gateway HTTP API
-   - WhatsApp connection
-   - Agent engine
-4. Monitor resource usage (memory, CPU)
-
-## Self-Improvement Loop
-
-1. Review recent error patterns in logs
-2. Identify flaky tests or failures
-3. Look for code quality issues
-4. Check for outdated dependencies
-5. Optimize slow operations
-
-## Proactive Maintenance
-
-1. Clean up old session data (>30 days)
-2. Archive completed tasks
-3. Update memory indexes
-4. Verify backup systems
-5. Check disk space
-
-## Investigation Protocol
-
-When issues are found:
-1. Read relevant source files
-2. Check test coverage
-3. Analyze error patterns
-4. Search memory for similar issues
-5. Propose and implement fixes
-6. Test the solution
-7. Document the resolution
-
-## Autonomous Actions
-
-You are empowered to:
-- Read any file in the project
-- Write fixes to source files
-- Run tests and builds
-- Execute diagnostics
-- Search memory and logs
-- Create new tasks for complex issues
-
-Always:
-- Make minimal, focused changes
-- Follow existing code patterns
-- Test before declaring success
-- Report what you did and why
-`;
+    try {
+      await this.sessionManager.appendMessage(sessionKey, {
+        role,
+        content,
+        timestamp: Date.now(),
+        providerId,
+        model,
+      });
+    } catch (err) {
+      this.logger.warn({ error: err, sessionKey }, "Failed to persist Main Agent message");
+    }
   }
 }

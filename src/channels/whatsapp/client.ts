@@ -222,7 +222,16 @@ export class WhatsAppClient extends EventEmitter {
    */
   async sendTyping(jid: string, isTyping: boolean): Promise<void> {
     this.ensureConnected();
-    await this.socket!.sendPresenceUpdate(isTyping ? "composing" : "paused", jid);
+    try {
+      const status = isTyping ? "composing" : "paused";
+      this.logger.debug({ jid, status }, "Sending presence update");
+      await this.socket!.sendPresenceUpdate(status, jid);
+      this.logger.debug({ jid, status }, "Presence update sent successfully");
+    } catch (err) {
+      const error = err instanceof Error ? err.message : String(err);
+      this.logger.warn({ jid, isTyping, error }, "Failed to send presence update");
+      throw err;
+    }
   }
 
   /**

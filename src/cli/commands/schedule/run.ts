@@ -41,7 +41,7 @@ export async function scheduleRun(cfg: AntConfig, jobId: string, options: Schedu
 
   try {
     const startTime = Date.now();
-    const res = await fetch(`${base}/api/schedule/${encodeURIComponent(jobId)}/run`, {
+    const res = await fetch(`${base}/api/jobs/${encodeURIComponent(jobId)}/run`, {
       method: "POST",
     });
 

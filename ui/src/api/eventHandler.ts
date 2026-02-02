@@ -56,6 +56,122 @@ function getWarRoomPosition(): Vector2D {
 }
 
 // ============================================
+// Foraging Expedition Simulation (Request/Response)
+// ============================================
+
+const EXPEDITION_SIZE = 4;
+const EXPEDITION_RETURN_DELAY_MS = 1200;
+const EXPEDITION_CLEANUP_DELAY_MS = 12000;
+
+type ExpeditionState = {
+  antIds: string[];
+  returnTimeout?: number;
+  cleanupTimeout?: number;
+};
+
+const activeExpeditions = new Map<string, ExpeditionState>();
+
+function getRandomTunnelPosition(): Vector2D {
+  const colonyStore = useColonyStore.getState();
+  const tunnels = Array.from(colonyStore.tunnels.values());
+
+  if (tunnels.length === 0) {
+    return getForagingPosition();
+  }
+
+  const tunnel = tunnels[Math.floor(Math.random() * tunnels.length)];
+  const fromChamber = colonyStore.chambers.get(tunnel.from);
+  const toChamber = colonyStore.chambers.get(tunnel.to);
+
+  if (!fromChamber || !toChamber) {
+    return getForagingPosition();
+  }
+
+  const t = 0.2 + Math.random() * 0.6;
+  return {
+    x: fromChamber.position.x + (toChamber.position.x - fromChamber.position.x) * t,
+    y: fromChamber.position.y + (toChamber.position.y - fromChamber.position.y) * t,
+  };
+}
+
+function getSurfaceExitPosition(): Vector2D {
+  const colonyStore = useColonyStore.getState();
+  const chambers = colonyStore.chambers;
+
+  for (const [, chamber] of chambers) {
+    if (chamber.type === 'foraging') {
+      return {
+        x: chamber.position.x + chamber.radius + 140 + Math.random() * 80,
+        y: chamber.position.y + (Math.random() - 0.5) * 80,
+      };
+    }
+  }
+
+  return { x: 260 + Math.random() * 80, y: 80 + Math.random() * 60 };
+}
+
+function clearExpedition(sessionKey: string, removeAnts: boolean): void {
+  const colonyStore = useColonyStore.getState();
+  const expedition = activeExpeditions.get(sessionKey);
+  if (!expedition) return;
+
+  if (expedition.returnTimeout) {
+    window.clearTimeout(expedition.returnTimeout);
+  }
+  if (expedition.cleanupTimeout) {
+    window.clearTimeout(expedition.cleanupTimeout);
+  }
+
+  if (removeAnts) {
+    expedition.antIds.forEach((id) => colonyStore.removeAnt(id));
+  }
+
+  activeExpeditions.delete(sessionKey);
+}
+
+function dispatchExpedition(sessionKey: string): void {
+  const colonyStore = useColonyStore.getState();
+  clearExpedition(sessionKey, true);
+
+  const antIds: string[] = [];
+  const surfaceTarget = getSurfaceExitPosition();
+
+  for (let i = 0; i < EXPEDITION_SIZE; i++) {
+    const id = colonyStore.spawnAnt('forager', getRandomTunnelPosition());
+    const ant = colonyStore.getAnt(id);
+    if (ant) {
+      ant.setState('exploring');
+      ant.setTarget(surfaceTarget);
+    }
+    antIds.push(id);
+  }
+
+  activeExpeditions.set(sessionKey, { antIds });
+}
+
+function recallExpedition(sessionKey: string, delayMs: number): void {
+  const colonyStore = useColonyStore.getState();
+  const expedition = activeExpeditions.get(sessionKey);
+  if (!expedition || expedition.returnTimeout) return;
+
+  expedition.returnTimeout = window.setTimeout(() => {
+    const home = getRoyalPosition();
+
+    expedition.antIds.forEach((id) => {
+      const ant = colonyStore.getAnt(id);
+      if (!ant) return;
+      ant.pickUp({ type: 'response' });
+      ant.setTarget(home);
+    });
+
+    expedition.cleanupTimeout = window.setTimeout(() => {
+      expedition.antIds.forEach((id) => colonyStore.removeAnt(id));
+      activeExpeditions.delete(sessionKey);
+    }, EXPEDITION_CLEANUP_DELAY_MS);
+  }, delayMs);
+}
+
+// ============================================
 // Event Handlers
 // ============================================
 
@@ -92,22 +208,27 @@ function handleTaskStarted(event: SystemEvent): void {
   // Set queen to thinking
   systemStore.queenThinking = true;
   colonyStore.setQueenThinking(true);
+
+  if (event.sessionKey) {
+    recallExpedition(event.sessionKey, EXPEDITION_RETURN_DELAY_MS);
+  }
 }
 
 function handleTaskCompleted(event: SystemEvent): void {
   const systemStore = useSystemStore.getState();
   const colonyStore = useColonyStore.getState();
 
-  const taskData = event.data as { id: string; result?: string; taskId?: string };
+  const taskData = event.data as { id: string; result?: string; taskId?: string; error?: string };
   const entityId = taskData.id || taskData.taskId;
   
   if (!entityId) return;
 
   // Update task in system store
   systemStore.updateTask(entityId, {
-    status: 'completed',
+    status: taskData.error ? 'error' : 'completed',
     completedAt: event.timestamp,
     result: taskData.result,
+    error: taskData.error ? { message: taskData.error, stack: '', code: 'task_failed' } : undefined,
   });
 
   // Remove the forager ant (task completed) using entity tracking
@@ -123,6 +244,10 @@ function handleTaskCompleted(event: SystemEvent): void {
   if (!hasRunningTasks) {
     systemStore.queenThinking = false;
     colonyStore.setQueenThinking(false);
+  }
+
+  if (event.sessionKey) {
+    recallExpedition(event.sessionKey, 0);
   }
 }
 
@@ -310,20 +435,24 @@ function handleMessageReceived(event: SystemEvent): void {
   // Deposit pheromone trail from entrance to queen
   colonyStore.depositPheromone(getRoyalPosition(), 'trail', 0.5);
 
+  if (event.sessionKey) {
+    dispatchExpedition(event.sessionKey);
+  }
+
   // Add event
   systemStore.addEvent(event);
 }
 
 function handleJobCreated(event: SystemEvent): void {
   const systemStore = useSystemStore.getState();
-  const data = event.data as { jobId: string; name: string; schedule: string };
+  const data = event.data as { jobId: string; name?: string; schedule?: string };
   
-  // Add job to store
+  // Add job to store with defaults if details are missing
   systemStore.addJob({
     id: data.jobId,
-    name: data.name,
-    schedule: data.schedule,
-    naturalLanguage: data.schedule,
+    name: data.name || `Job ${data.jobId}`,
+    schedule: data.schedule || '',
+    naturalLanguage: data.schedule || '',
     enabled: true,
     nextRunAt: Date.now() + 3600000, // Placeholder
     trigger: { type: 'agent_ask', data: {} },
@@ -371,6 +500,26 @@ function handleJobFailed(event: SystemEvent): void {
   colonyStore.createAlarm(getWarRoomPosition(), 'medium');
 }
 
+function handleJobEnabled(event: SystemEvent): void {
+  const systemStore = useSystemStore.getState();
+  const data = event.data as { jobId: string };
+  systemStore.updateJob(data.jobId, { enabled: true });
+}
+
+function handleJobDisabled(event: SystemEvent): void {
+  const systemStore = useSystemStore.getState();
+  const data = event.data as { jobId: string };
+  systemStore.updateJob(data.jobId, { enabled: false });
+}
+
+function handleJobRemoved(event: SystemEvent): void {
+  const systemStore = useSystemStore.getState();
+  const colonyStore = useColonyStore.getState();
+  const data = event.data as { jobId: string };
+  systemStore.removeJob(data.jobId);
+  colonyStore.removeAntByEntityId(data.jobId);
+}
+
 function handleSkillCreated(event: SystemEvent): void {
   const systemStore = useSystemStore.getState();
   const data = event.data as { name: string; description: string; author: string };
@@ -396,53 +545,98 @@ function handleSkillCreated(event: SystemEvent): void {
 export function processEvent(event: SystemEvent): void {
   const systemStore = useSystemStore.getState();
 
+  // Reduce noise for status updates (sent very frequently)
+  const isStatusUpdate =
+    event.type === 'status_updated' || event.type === 'status_snapshot' || event.type === 'status_delta';
+  if (!isStatusUpdate) {
+    console.log('[EventHandler] Processing event:', { type: event.type, id: event.id, timestamp: event.timestamp });
+  }
+
   // Always add event to the log
   systemStore.addEvent(event);
 
   // Route to specific handler
   switch (event.type) {
     case 'task_started':
+      console.log('[EventHandler] Routing to handleTaskStarted');
       handleTaskStarted(event);
       break;
     case 'task_completed':
+      console.log('[EventHandler] Routing to handleTaskCompleted');
       handleTaskCompleted(event);
       break;
     case 'agent_spawned':
+      console.log('[EventHandler] Routing to handleAgentSpawned');
       handleAgentSpawned(event);
       break;
     case 'agent_retired':
+      console.log('[EventHandler] Routing to handleAgentRetired');
       handleAgentRetired(event);
       break;
     case 'error_occurred':
+      console.log('[EventHandler] Routing to handleErrorOccurred');
       handleErrorOccurred(event);
       break;
     case 'tool_executed':
+      console.log('[EventHandler] Routing to handleToolExecuted');
       handleToolExecuted(event);
       break;
     case 'cron_triggered':
+      console.log('[EventHandler] Routing to handleCronTriggered');
       handleCronTriggered(event);
       break;
     case 'memory_indexed':
+      console.log('[EventHandler] Routing to handleMemoryIndexed');
       handleMemoryIndexed(event);
       break;
     case 'message_received':
+      console.log('[EventHandler] Routing to handleMessageReceived');
       handleMessageReceived(event);
       break;
     case 'job_created':
+      console.log('[EventHandler] Routing to handleJobCreated');
       handleJobCreated(event);
       break;
     case 'job_started':
+      console.log('[EventHandler] Routing to handleJobStarted');
       handleJobStarted(event);
       break;
     case 'job_completed':
+      console.log('[EventHandler] Routing to handleJobCompleted');
       handleJobCompleted(event);
       break;
     case 'job_failed':
+      console.log('[EventHandler] Routing to handleJobFailed');
       handleJobFailed(event);
       break;
+    case 'job_enabled':
+      console.log('[EventHandler] Routing to handleJobEnabled');
+      handleJobEnabled(event);
+      break;
+    case 'job_disabled':
+      console.log('[EventHandler] Routing to handleJobDisabled');
+      handleJobDisabled(event);
+      break;
+    case 'job_removed':
+      console.log('[EventHandler] Routing to handleJobRemoved');
+      handleJobRemoved(event);
+      break;
     case 'skill_created':
+      console.log('[EventHandler] Routing to handleSkillCreated');
       handleSkillCreated(event);
       break;
+    case 'status_updated':
+    case 'status_snapshot':
+    case 'status_delta':
+      // Status updates are handled by RoyalChamber component directly
+      // Just log that we received it
+      if (!isStatusUpdate) console.log('[EventHandler] Received status update');
+      break;
+    case 'agent_event':
+      // Agent run events are logged for observability only
+      break;
+    default:
+      console.warn('[EventHandler] No handler for event type:', event.type);
   }
 }
 

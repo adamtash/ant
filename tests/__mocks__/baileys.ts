@@ -5,12 +5,41 @@
  */
 
 import { vi } from "vitest";
-import type {
-  WAMessage,
-  proto,
-  AnyMessageContent,
-  WAConnectionState,
-} from "@whiskeysockets/baileys";
+import { proto } from "@whiskeysockets/baileys";
+import type { WAMessage, AnyMessageContent, WAConnectionState } from "@whiskeysockets/baileys";
+
+const mockUseMultiFileAuthState = vi.hoisted(() =>
+  vi.fn().mockResolvedValue({
+    state: {
+      creds: {
+        me: { id: "mock-me@s.whatsapp.net", name: "Mock User" },
+        platform: "web",
+      },
+      keys: {},
+    },
+    saveCreds: vi.fn().mockResolvedValue(undefined),
+  })
+);
+
+const mockDisconnectReason = vi.hoisted(() => ({
+  connectionLost: 408,
+  connectionReplaced: 440,
+  connectionClosed: 428,
+  timedOut: 408,
+  loggedOut: 401,
+  badSession: 500,
+  restartRequired: 515,
+}));
+
+const mockBrowsers = vi.hoisted(() => ({
+  macOS: ["Chrome (macOS)", "", ""],
+  ubuntu: ["Chrome (Linux)", "", ""],
+  windows: ["Chrome (Windows)", "", ""],
+}));
+
+const mockFetchLatestBaileysVersion = vi.hoisted(() =>
+  vi.fn().mockResolvedValue({ version: [2, 3000, 1015901307], isLatest: true })
+);
 
 // ============================================================================
 // Mock Types
@@ -71,7 +100,7 @@ export function createMockEventEmitter(): MockEventEmitter {
 }
 
 export function createMockWASocket(): MockWASocket {
-  return {
+  const socket = {
     ev: createMockEventEmitter(),
     ws: {} as WebSocket,
     sendMessage: vi.fn().mockResolvedValue({ key: { id: "mock-msg-id" } }),
@@ -82,6 +111,10 @@ export function createMockWASocket(): MockWASocket {
     user: { id: "mock-user@s.whatsapp.net", name: "Test User" },
     end: vi.fn(),
   };
+  setTimeout(() => {
+    socket.ev.emit("connection.update", { connection: "open" });
+  }, 0);
+  return socket;
 }
 
 // ============================================================================
@@ -207,40 +240,7 @@ export function createMockGroupMessage(options: {
 // Mock Connection Functions
 // ============================================================================
 
-export const mockMakeWASocket = vi.fn().mockReturnValue(createMockWASocket());
-
-export const mockUseMultiFileAuthState = vi
-  .fn()
-  .mockResolvedValue({
-    state: {
-      creds: {
-        me: { id: "mock-me@s.whatsapp.net", name: "Mock User" },
-        platform: "web",
-      },
-      keys: {},
-    },
-    saveCreds: vi.fn().mockResolvedValue(undefined),
-  });
-
-export const mockDisconnectReason = {
-  connectionLost: 408,
-  connectionReplaced: 440,
-  connectionClosed: 428,
-  timedOut: 408,
-  loggedOut: 401,
-  badSession: 500,
-  restartRequired: 515,
-};
-
-export const mockBrowsers = {
-  macOS: ["Chrome (macOS)", "", ""],
-  ubuntu: ["Chrome (Linux)", "", ""],
-  windows: ["Chrome (Windows)", "", ""],
-};
-
-export const mockFetchLatestBaileysVersion = vi
-  .fn()
-  .mockResolvedValue({ version: [2, 3000, 1015901307], isLatest: true });
+export { mockUseMultiFileAuthState, mockDisconnectReason, mockBrowsers, mockFetchLatestBaileysVersion };
 
 // ============================================================================
 // Helper Functions
@@ -278,11 +278,11 @@ export function simulateGroupJoin(
 // ============================================================================
 // Module Mock
 // ============================================================================
-
 vi.mock("@whiskeysockets/baileys", async () => {
   const actual = await vi.importActual<typeof import("@whiskeysockets/baileys")>(
     "@whiskeysockets/baileys"
   );
+  const mockMakeWASocket = vi.fn().mockReturnValue(createMockWASocket());
   return {
     ...actual,
     default: mockMakeWASocket,

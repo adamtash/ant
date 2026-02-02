@@ -130,6 +130,8 @@ async function askDirect(cfg: AntConfig, prompt: string, options: AskOptions): P
         healthCheckCacheTtlMinutes?: number;
       }>,
       defaultProvider: cfg.resolved.providers.default,
+      routing: cfg.resolved.routing,
+      fallbackChain: cfg.resolved.providers.fallbackChain,
     };
 
     const sessionManager = new SessionManager({
@@ -154,6 +156,12 @@ async function askDirect(cfg: AntConfig, prompt: string, options: AskOptions): P
       stateDir: cfg.resolved.stateDir,
       toolPolicies: cfg.toolPolicies,
       sessionManager,
+      onProviderError: async (params) => {
+        const errorMsg = params.retryingProvider
+          ? `\n⚠️  ${params.failedProvider} failed: ${params.error}\n→ Trying ${params.retryingProvider}...\n`
+          : `\n⚠️  ${params.failedProvider} failed: ${params.error}\n`;
+        process.stderr.write(errorMsg);
+      },
     });
 
     const result = await engine.execute({

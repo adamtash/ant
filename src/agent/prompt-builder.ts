@@ -244,9 +244,9 @@ export async function loadBootstrapFiles(params: {
   const fileNames = [
     "MEMORY.md",
     "PROJECT.md",
-    "CLAUDE.md",
     "AGENTS.md",
     "SKILL_REGISTRY.md",
+    "AGENT_LOG.md"
   ];
 
   // For subagents, only load essential files
@@ -311,11 +311,13 @@ function truncateContent(content: string, maxLength: number): string {
 }
 
 /**
- * Estimate tokens in a prompt (rough approximation)
+ * Estimate tokens in a prompt (rough approximation with safety margin)
+ * Using 1.2x safety factor per openclaw's approach to avoid overrunning context
  */
 export function estimateTokens(text: string): number {
   if (!text) return 0;
-  return Math.ceil(text.length / 4);
+  const SAFETY_MARGIN = 1.2; // 20% buffer for inaccuracy
+  return Math.ceil((text.length / 4) * SAFETY_MARGIN);
 }
 
 /**

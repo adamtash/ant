@@ -170,6 +170,7 @@ export interface AgentInput {
   isSubagent?: boolean;
   cronContext?: CronContext;
   history?: Message[];
+  runId?: string;
 }
 
 /**
@@ -179,6 +180,7 @@ export interface AgentOutput {
   response: string;
   toolsUsed: string[];
   iterations: number;
+  runId?: string;
   media?: {
     path: string;
     type: "image" | "video" | "audio" | "file";

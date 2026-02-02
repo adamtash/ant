@@ -8,7 +8,7 @@ const DEFAULT_CONFIG_PATH = "ant.config.json";
 
 const ProviderItemSchema = z
   .object({
-    type: z.enum(["openai", "cli"]).default("openai"),
+    type: z.enum(["openai", "cli", "ollama"]).default("openai"),
     cliProvider: z.enum(["codex", "copilot", "claude", "kimi"]).default("codex"),
     baseUrl: z.string().optional(),
     apiKey: z.string().optional(),
@@ -46,6 +46,7 @@ const ProviderItemSchema = z
 const ProvidersSchema = z.object({
   default: z.string().min(1),
   items: z.record(ProviderItemSchema),
+  fallbackChain: z.array(z.string()).optional().default([]),
 });
 
 type ProvidersOutput = z.infer<typeof ProvidersSchema>;
@@ -171,7 +172,7 @@ const AgentSchema = z.object({
     .object({
       timeoutPerIterationMs: z.number().int().positive().default(30_000),
       timeoutPerToolMs: z.number().int().positive().default(30_000),
-      contextWindowThresholdPercent: z.number().int().min(1).max(100).default(80),
+      contextWindowThresholdPercent: z.number().int().min(1).max(100).default(50), // Proactive compaction
     })
     .default({}),
   compaction: z
@@ -207,6 +208,62 @@ const SubagentsSchema = z.object({
   timeoutMs: z.number().int().positive().default(300_000),
   archiveAfterMinutes: z.number().int().positive().default(60),
 });
+
+const AgentExecutionSchema = z
+  .object({
+    tasks: z
+      .object({
+        registry: z
+          .object({
+            dir: z.string().default("./.ant/tasks"),
+            cacheTtlMs: z.number().int().positive().default(45_000),
+            maxHistorySize: z.number().int().positive().default(1000),
+          })
+          .default({}),
+        defaults: z
+          .object({
+            timeoutMs: z.number().int().positive().default(120_000),
+            maxRetries: z.number().int().positive().default(3),
+            retryBackoffMs: z.number().int().positive().default(1000),
+            retryBackoffMultiplier: z.number().int().positive().default(2),
+            retryBackoffCap: z.number().int().positive().default(60_000),
+          })
+          .default({}),
+      })
+      .default({}),
+    lanes: z
+      .object({
+        main: z
+          .object({
+            maxConcurrent: z.number().int().positive().default(1),
+          })
+          .default({}),
+        autonomous: z
+          .object({
+            maxConcurrent: z.number().int().positive().default(5),
+          })
+          .default({}),
+        maintenance: z
+          .object({
+            maxConcurrent: z.number().int().positive().default(1),
+          })
+          .default({}),
+      })
+      .default({}),
+    subagents: z
+      .object({
+        timeoutMs: z.number().int().positive().default(120_000),
+        maxRetries: z.number().int().positive().default(2),
+      })
+      .default({}),
+    monitoring: z
+      .object({
+        timeoutCheckIntervalMs: z.number().int().positive().default(1000),
+        statusBroadcastDebounceMs: z.number().int().positive().default(200),
+      })
+      .default({}),
+  })
+  .default({});
 
 const GatewaySchema = z.object({
   enabled: z.boolean().default(true),
@@ -338,6 +395,7 @@ const ConfigSchema = z.object({
   toolPolicies: ToolPoliciesSchema,
   mainAgent: MainAgentSchema.default({}),
   subagents: SubagentsSchema.default({}),
+  agentExecution: AgentExecutionSchema.default({}),
   gateway: GatewaySchema.default({}),
   cliTools: CliToolsSchema.default({}),
   queue: QueueSchema.default({}),
@@ -429,6 +487,7 @@ function normalizeProviders(base: z.infer<typeof ConfigSchema>): ProvidersOutput
       items: {
         default: base.provider,
       },
+      fallbackChain: [],
     };
   }
   return {
@@ -443,6 +502,7 @@ function normalizeProviders(base: z.infer<typeof ConfigSchema>): ProvidersOutput
         authProfiles: [],
       },
     },
+    fallbackChain: [],
   };
 }
 

@@ -320,10 +320,23 @@ export type SystemEvent = {
     | 'skill_created'
     | 'skill_deleted'
     | 'provider_cooldown'
-    | 'provider_recovery';
+    | 'provider_recovery'
+    | 'status_updated'
+    | 'status_snapshot'
+    | 'status_delta'
+    | 'task_created'
+    | 'task_status_changed'
+    | 'task_phase_changed'
+    | 'task_progress_updated'
+    | 'task_timeout_warning'
+    | 'task_timeout'
+    | 'task_retry_scheduled'
+    | 'agent_event';
   data: Record<string, unknown>;
   severity: 'info' | 'warn' | 'error' | 'critical';
   source: 'agent' | 'system' | 'user';
+  sessionKey?: string;
+  channel?: string;
 };
 
 export type EventsResponse = {
@@ -367,7 +380,7 @@ export type StatusResponse = {
     tasks?: Array<{
       id: string;
       description: string;
-      status: "pending" | "in_progress" | "completed" | "failed";
+      status: "pending" | "queued" | "running" | "succeeded" | "failed" | "retrying" | "canceled";
       createdAt: number;
       completedAt?: number;
       result?: string;

@@ -366,36 +366,65 @@ export class WebSocketClient {
     }
 
     try {
+      console.log(`[WebSocket] Connecting to ${this.url}`);
       this.ws = new WebSocket(this.url);
 
       this.ws.onopen = () => {
+        console.log(`[WebSocket] Connected successfully`);
         this.reconnectAttempts = 0;
         this.handlers.onConnect?.();
         this.startPing();
       };
 
-      this.ws.onclose = () => {
+      this.ws.onclose = (event) => {
+        console.warn(`[WebSocket] Disconnected (code: ${event.code}, reason: ${event.reason})`);
         this.handlers.onDisconnect?.();
         this.stopPing();
         this.tryReconnect();
       };
 
       this.ws.onerror = (error) => {
+        console.error(`[WebSocket] Error event:`, error);
+        console.error(`[WebSocket] Connection state: readyState=${this.ws?.readyState}`);
         this.handlers.onError?.(error);
       };
 
       this.ws.onmessage = (event) => {
         try {
           const message = JSON.parse(event.data);
+          
+          // Reduce noise for high-frequency messages
+          const isHighFrequency =
+            message.payload?.type === 'status_updated' ||
+            message.payload?.type === 'status_snapshot' ||
+            message.payload?.type === 'status_delta' ||
+            message.type === 'pong';
+          if (!isHighFrequency) {
+            console.log('[WebSocket] Received message:', { type: message.type, payload: message.payload });
+          }
+          
           if (message.type === 'event' && this.handlers.onEvent) {
+            if (!isHighFrequency) {
+              console.log('[WebSocket] Dispatching event to handler:', message.payload?.type);
+            }
             this.handlers.onEvent(message.payload as SystemEvent);
+          } else if (message.type === 'event' && !this.handlers.onEvent) {
+            console.warn('[WebSocket] Event received but no onEvent handler registered');
+          } else if (message.type === 'pong') {
+            // Silently ignore pong messages (just keep-alive)
+          } else if (!isHighFrequency) {
+            console.log('[WebSocket] Ignoring message type:', message.type);
           }
         } catch (e) {
-          console.error('Failed to parse WebSocket message:', e);
+          console.error('Failed to parse WebSocket message:', e, 'Raw data:', event.data);
         }
       };
     } catch (error) {
-      console.error('WebSocket connection failed:', error);
+      console.error('[WebSocket] Connection attempt failed:', error);
+      console.error('[WebSocket] This usually means:', {
+        url: this.url,
+        message: error instanceof Error ? error.message : String(error),
+      });
       this.tryReconnect();
     }
   }
@@ -437,10 +466,13 @@ export class WebSocketClient {
   private tryReconnect(): void {
     if (this.reconnectAttempts < this.maxReconnectAttempts) {
       this.reconnectAttempts++;
+      const delay = this.reconnectDelay * this.reconnectAttempts;
+      console.log(`[WebSocket] Reconnecting in ${delay}ms... (attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts})`);
       setTimeout(() => {
-        console.log(`Reconnecting... (attempt ${this.reconnectAttempts})`);
         this.connect();
-      }, this.reconnectDelay * this.reconnectAttempts);
+      }, delay);
+    } else {
+      console.error(`[WebSocket] Failed to reconnect after ${this.maxReconnectAttempts} attempts. Check that backend is running on ${this.url}`);
     }
   }
 
@@ -458,6 +490,8 @@ let wsClient: WebSocketClient | null = null;
 export function getWebSocketClient(handlers: WebSocketHandler): WebSocketClient {
   if (!wsClient) {
     const wsUrl = `ws://${window.location.host}/api/ws`;
+    console.log(`[WebSocket] Initializing client with URL: ${wsUrl}`);
+    console.log(`[WebSocket] window.location.host: ${window.location.host}`);
     wsClient = new WebSocketClient(wsUrl, handlers);
   }
   return wsClient;

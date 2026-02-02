@@ -152,10 +152,8 @@ export class WhatsAppAdapter extends BaseChannelAdapter {
         },
       });
 
-      // Listen for messages from the client (backup path)
-      this.client.on("message", (inbound) => {
-        this.handleIncomingMessage(inbound.message);
-      });
+      // Listen for messages from the client (backup path).
+      // Note: disabled to avoid duplicate handling; onMessage already processes upserts.
 
       // Listen for socket-level errors
       this.client.on("error", (error: Error) => {
@@ -261,7 +259,11 @@ export class WhatsAppAdapter extends BaseChannelAdapter {
 
     try {
       if (this.cfg.whatsapp.typingIndicator) {
-        await this.sendTyping(chatId, true);
+        try {
+          await this.sendTyping(chatId, true);
+        } catch (typingErr) {
+          this.logger.warn({ error: typingErr instanceof Error ? typingErr.message : String(typingErr), chatId }, "Failed to send typing indicator start");
+        }
       }
 
       // Handle media if present
@@ -300,7 +302,11 @@ export class WhatsAppAdapter extends BaseChannelAdapter {
       return { ok: false, error };
     } finally {
       if (this.cfg.whatsapp.typingIndicator) {
-        await this.sendTyping(chatId, false);
+        try {
+          await this.sendTyping(chatId, false);
+        } catch (typingErr) {
+          this.logger.warn({ error: typingErr instanceof Error ? typingErr.message : String(typingErr), chatId }, "Failed to send typing indicator stop");
+        }
       }
     }
   }

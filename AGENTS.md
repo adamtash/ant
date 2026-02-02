@@ -139,12 +139,25 @@
 - **Context Documents**:
   - `AGENT_DUTIES.md` - Defines responsibilities (subagent management, maintenance, monitoring, improvements)
   - `MEMORY.md` - Persistent knowledge base
-- **Session key**: `main-agent:system`
+- **Session key**: `agent:main:system`
 - **Loop**: Endless iteration with configurable delay between cycles
 - **Safety**: Max iterations per task, max consecutive failures, alert owner on critical issues
 - **Completion**: Outputs `<promise>DUTY_CYCLE_COMPLETE</promise>` after each successful cycle
 - **Implementation**: `src/runtime/main-agent.ts` (to be created)
 - **Log**: All actions logged to `AGENT_LOG.md`
+
+### Drone Flights (Scheduled Maintenance Tasks)
+- **Purpose**: Autonomous scheduled maintenance tasks running on cron jobs
+- **Concept**: "Drone Flights" are worker bees performing routine maintenance at specific times
+- **Implementation**: `src/scheduler/drone-flights.ts` with node-cron integration
+- **Documentation**: See [DRONE_FLIGHTS.md](DRONE_FLIGHTS.md) for detailed reference
+- **Three Flight Types**:
+  - **Light Check** (every 5 min): Quick health checks, error monitoring
+  - **Hourly Deep Maintenance** (every hour): Log analysis, auto-fix known issues
+  - **Weekly Deep Dive** (every Monday 00:00): Comprehensive review, trend analysis
+- **Session keys**: `drone-flight:<flightId>` (separate from main agent)
+- **Auto-initialization**: Flights register with scheduler on runtime start
+- **Customizable**: Edit cron expressions and timeouts in `src/scheduler/drone-flights.ts`
 
 ## Current Status (as of 2026-02-02)
 
@@ -163,6 +176,10 @@
   - Runs diagnostics, monitors health, manages subagents
   - Task assignment API via `/api/main-agent/tasks`
   - Startup health checks with WhatsApp reporting
+- **Drone Flights**: Scheduled maintenance tasks (cron jobs)
+  - Light Check, Hourly Deep Maintenance, Weekly Deep Dive
+  - Auto-initialization on runtime start
+  - Integrated with scheduler system
 - Supervisor: Process supervisor for graceful restarts (exit code 42)
 
 ### Recently Completed ✅
@@ -173,6 +190,12 @@
   - Safety mechanisms: iteration limits, failure thresholds, owner alerts
   - Implementation: `src/agent/main-agent.ts`
   - API endpoints: `/api/main-agent/tasks`
+- **Drone Flights**: Scheduled maintenance tasks (cron job based)
+  - Light Check, Hourly Deep Maintenance, Weekly Deep Dive
+  - Auto-initialization on runtime start
+  - Integrated with scheduler system
+  - Implementation: `src/scheduler/drone-flights.ts` and `src/scheduler/drone-flights-init.ts`
+  - Documentation: `DRONE_FLIGHTS.md`
 
 ### Known Issues
 - **TSX restart failure**: `restart_ant` can fail with "pipe permission denied"
@@ -248,7 +271,7 @@ npm run dev -- debug simulate "message"      # Full inbound flow (no WhatsApp)
 - **Owner allowlist**: `whatsapp.ownerJids: ["123@s.whatsapp.net"]` restricts access
 - **Startup message**: `whatsapp.startupMessage` sends a message when runtime boots
 - **Memory sync**: Tune `memory.sync.sessionsDeltaMessages` and `sessionsDeltaBytes` to control reindex frequency
-- **CLI tool timeout**: `cliTools.timeoutMs` (default: 120000 ms)
+- **CLI tool timeout**: `cliTools.timeoutMs` (default: 1200000 ms)
 - **Tool policies**: Configure `toolPolicies` and select with `agent.toolPolicy`
 - **Compaction**: `agent.compaction` summarizes older context when near the token threshold
 - **Thinking level**: `agent.thinking.level` toggles reasoning output
@@ -263,13 +286,19 @@ npm run dev -- debug simulate "message"      # Full inbound flow (no WhatsApp)
 - [x] Integrate Main Agent with gateway server
 - [x] Add Main Agent status to Web UI
 - [x] Fix Main Agent auto-start on runtime boot
-- [ ] Add Main Agent status to TUI
-- [ ] Decide on restart strategy: keep TSX or switch to `node dist/cli.js`
+- [x] Implement Drone Flights (scheduled maintenance tasks)
+- [x] Create three flight types: Light Check, Hourly, Weekly
+- [x] Auto-register flights on runtime startup
+- [ ] Add Drone Flights status to TUI
 - [ ] Add more fast-path intents (screenshot, open browser, list files)
 - [ ] Improve retry/backoff for WhatsApp disconnects
 - [ ] Improve retry/backoff for provider API errors
 
 ### Mid-term
+- [ ] Drone Flight analytics and reporting dashboard
+- [ ] Custom flight creation via CLI
+- [ ] Flight templates (backup, optimization, reporting)
+- [ ] Priority-based flight execution
 - [ ] Main Agent learning: pattern detection and optimization
 - [ ] Main Agent pause/resume commands
 - [ ] Add optional media size limits + downscaling for large images

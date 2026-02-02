@@ -7,7 +7,10 @@
  * - Memory context integration
  * - Error recovery and retry logic
  * - Subagent spawning support
+ * - Dynamic context window detection
  */
+
+import crypto from "node:crypto";
 
 import type {
   AgentInput,
@@ -31,8 +34,15 @@ import {
   ProviderManager,
   withRetry,
   coerceToFailoverError,
+  isFailoverError,
+  resolveFailoverReasonFromError,
+  type FailoverReason,
 } from "./providers.js";
 import { getEventStream, createEventPublishers } from "../monitor/event-stream.js";
+import { emitAgentEvent, registerAgentRunContext, clearAgentRunContext } from "../monitor/agent-events.js";
+import { createClassifiedErrorData } from "../monitor/error-classifier.js";
+import { getModelContextInfo } from "./context-window-registry.js";
+import { registerActiveRun, clearActiveRun } from "./active-runs.js";
 import {
   buildSystemPrompt,
   loadBootstrapFiles,
@@ -56,6 +66,12 @@ export interface AgentEngineConfig {
   memorySearch?: (query: string, maxResults?: number) => Promise<string[]>;
   toolPolicies?: Record<string, ToolPolicy>;
   sessionManager?: SessionManager;
+  onProviderError?: (params: {
+    sessionKey: string;
+    failedProvider: string;
+    error: string;
+    retryingProvider?: string;
+  }) => Promise<void>;
 }
 
 /**
@@ -71,6 +87,12 @@ export class AgentEngine {
   private readonly memorySearch?: (query: string, maxResults?: number) => Promise<string[]>;
   private readonly toolPolicies?: Record<string, ToolPolicy>;
   private readonly sessionManager?: SessionManager;
+  private readonly onProviderError?: (params: {
+    sessionKey: string;
+    failedProvider: string;
+    error: string;
+    retryingProvider?: string;
+  }) => Promise<void>;
 
   constructor(params: AgentEngineConfig) {
     this.config = params.config;
@@ -82,6 +104,7 @@ export class AgentEngine {
     this.memorySearch = params.memorySearch;
     this.toolPolicies = params.toolPolicies;
     this.sessionManager = params.sessionManager;
+    this.onProviderError = params.onProviderError;
   }
 
   /**
@@ -95,14 +118,49 @@ export class AgentEngine {
     const toolParts = new Map<string, ToolPart>();
     const blockedTools = new Map<string, number>();
     const maxDeniedAttempts = 3;
+    const agentType = input.isSubagent ? "subagent" : "agent";
+    const promptPreview = input.query.slice(0, 300);
+    const runId = input.runId ?? `run-${crypto.randomUUID()}`;
+    let runOutcome: "success" | "error" | "max_iterations" | "unknown" = "unknown";
+
+    registerAgentRunContext(runId, { sessionKey: input.sessionKey, agentType });
+    registerActiveRun({
+      runId,
+      sessionKey: input.sessionKey,
+      agentType,
+      startedAt: startTime,
+      metadata: { channel: input.channel },
+    });
+
+    emitAgentEvent({
+      runId,
+      stream: "lifecycle",
+      data: {
+        stage: "start",
+        agentType,
+        channel: input.channel,
+        promptPreview,
+      },
+      sessionKey: input.sessionKey,
+    });
 
     try {
-      this.logger.info({ sessionKey: input.sessionKey, query: input.query.slice(0, 100) }, "Agent execution started");
+      this.logger.info(
+        {
+          sessionKey: input.sessionKey,
+          channel: input.channel,
+          agentType,
+          promptPreview,
+          runId,
+        },
+        "Agent execution started"
+      );
 
       // Publish reasoning start
       await events.agentThinking({
         query: input.query,
-        iterationCount: 0 
+        iterationCount: 0,
+        agentType,
       }, { sessionKey: input.sessionKey, channel: input.channel });
 
       // 1. Build enhanced prompt with context
@@ -121,22 +179,22 @@ export class AgentEngine {
         this.config.maxHistoryTokens
       );
 
-      // 4. Get provider and tool definitions
-      const provider = await this.providers.selectBestProvider();
+      // 4. Get provider and tool definitions (will fallback if needed during execution)
+      let selectedProvider = await this.providers.selectBestProvider();
       this.logger.info({
         sessionKey: input.sessionKey,
-        providerId: provider.id,
-        providerType: provider.type,
-        model: provider.model,
+        providerId: selectedProvider.id,
+        providerType: selectedProvider.type,
+        model: selectedProvider.model,
         query: input.query.slice(0, 100),
-      }, "Provider selected for execution");
+      }, "Primary provider selected for execution");
       const toolPolicyName = this.config.toolPolicy;
       const toolPolicy = toolPolicyName ? this.toolPolicies?.[toolPolicyName] : undefined;
       const toolPolicyContext = {
         channel: input.channel,
         sessionKey: input.sessionKey,
         chatId: input.chatId,
-        model: provider.model,
+        model: selectedProvider.model,
         isSubagent: input.isSubagent,
       };
       const toolDefs = typeof (this.tools as ToolRegistry).getDefinitionsForPolicy === "function"
@@ -150,7 +208,7 @@ export class AgentEngine {
       const toolLoopConfig = this.config.toolLoop ?? {};
       const iterationTimeoutMs = toolLoopConfig.timeoutPerIterationMs ?? 30_000;
       const toolTimeoutMs = toolLoopConfig.timeoutPerToolMs ?? 30_000;
-      const contextThresholdPercent = toolLoopConfig.contextWindowThresholdPercent ?? 80;
+      const contextThresholdPercent = toolLoopConfig.contextWindowThresholdPercent ?? 50; // Lower default to trigger compaction earlier
       const maxHistoryTokens = this.config.maxHistoryTokens;
 
       while (iterations < maxIterations) {
@@ -178,49 +236,51 @@ export class AgentEngine {
           }
         }
 
-        // Call LLM with retry
+        // Call LLM with provider fallback
         const sanitizedMessages = this.ensureToolResults(currentMessages);
         if (sanitizedMessages !== currentMessages) {
           currentMessages = sanitizedMessages;
         }
-        const response = await withRetry(
-          () =>
-            this.callProviderWithTimeout(
-              provider,
-              sanitizedMessages,
-              {
-                temperature: this.config.temperature,
-                tools: toolDefs,
-                toolChoice: "auto",
-                thinking: this.config.thinking?.level
-                  ? { level: this.config.thinking.level }
-                  : undefined,
-              },
-              iterationTimeoutMs
-            ),
-          {
-            onRetry: ({ attempt, delayMs, error, reason }) => {
-              this.logger.warn(
-                { attempt, delayMs, reason, error: error.message },
-                "Provider call failed, retrying"
-              );
+        
+        let response: ChatResponse;
+        try {
+          const callResult = await this.callProviderWithFallback(
+            selectedProvider,
+            sanitizedMessages,
+            {
+              temperature: this.config.temperature,
+              tools: toolDefs,
+              toolChoice: "auto",
+              thinking: this.config.thinking?.level
+                ? { level: this.config.thinking.level }
+                : undefined,
             },
-          }
-        ).catch((err) => {
-          const failover = coerceToFailoverError(err, { providerId: provider.id, model: provider.model });
+            iterationTimeoutMs,
+            input.sessionKey
+          );
+          response = callResult.response;
+          // Update selectedProvider in case fallback was used
+          selectedProvider = callResult.provider;
+        } catch (err) {
+          // Final error after all fallbacks exhausted
+          const providerError = err instanceof Error ? err : new Error(String(err));
+          await events.errorOccurred(
+            createClassifiedErrorData(providerError, "high", {
+              providerId: selectedProvider.id,
+              model: selectedProvider.model,
+              sessionKey: input.sessionKey,
+            }),
+            { sessionKey: input.sessionKey, channel: input.channel }
+          );
+          const failover = coerceToFailoverError(err, { providerId: selectedProvider.id, model: selectedProvider.model });
           if (failover) {
-            const providerWithAuth = provider as LLMProvider & { markAuthFailure?: () => void };
-            if (failover.reason === "auth" && typeof providerWithAuth.markAuthFailure === "function") {
-              providerWithAuth.markAuthFailure();
-            }
-            this.logger.warn(
-              { providerId: provider.id, model: provider.model, reason: failover.reason, error: failover.message },
-              "Provider call failed with classified error"
+            this.logger.error(
+              { sessionKey: input.sessionKey, reason: failover.reason, error: failover.message },
+              "All provider fallbacks exhausted"
             );
-            throw failover;
           }
           throw err;
-        });
+        }
 
         // Check if we have tool calls
         if (!response.toolCalls || response.toolCalls.length === 0) {
@@ -230,14 +290,18 @@ export class AgentEngine {
              : this.stripReasoning(response.content);
 
           this.logger.info(
-            { 
-              iterations, 
-              toolsUsed, 
+            {
+              iterations,
+              toolsUsed,
               duration: Date.now() - startTime,
+              agentType,
+              promptPreview,
               rawResponseLength: response.content?.length || 0,
-              rawResponsePreview: response.content?.slice(0, 200) || "(empty)",
+              rawResponsePreview: response.content?.slice(0, 300) || "(empty)",
               finalResponseLength: finalResponse?.length || 0,
-              finalResponsePreview: finalResponse?.slice(0, 200) || "(empty)",
+              finalResponsePreview: finalResponse?.slice(0, 300) || "(empty)",
+              providerId: selectedProvider.id,
+              model: selectedProvider.model,
             },
             "Agent execution complete"
           );
@@ -246,15 +310,39 @@ export class AgentEngine {
             iterations,
             toolsUsed,
             duration: Date.now() - startTime,
-            success: true
+            success: true,
+            responsePreview: finalResponse?.slice(0, 300) || "",
+            promptPreview,
+            providerId: selectedProvider.id,
+            model: selectedProvider.model,
+            agentType,
           }, { sessionKey: input.sessionKey, channel: input.channel });
+
+          emitAgentEvent({
+            runId,
+            stream: "assistant",
+            data: {
+              responsePreview: finalResponse?.slice(0, 300) || "",
+              success: true,
+              iterations,
+              toolsUsed,
+              duration: Date.now() - startTime,
+              providerId: selectedProvider.id,
+              model: selectedProvider.model,
+              agentType,
+            },
+            sessionKey: input.sessionKey,
+          });
+
+          runOutcome = "success";
 
           return {
             response: finalResponse,
             toolsUsed,
             iterations,
-            providerId: provider.id,
-            model: provider.model,
+            providerId: selectedProvider.id,
+            model: selectedProvider.model,
+            runId,
           };
         }
 
@@ -264,8 +352,8 @@ export class AgentEngine {
           content: response.content,
           toolCalls: response.toolCalls,
           metadata: {
-            providerId: provider.id,
-            model: provider.model,
+            providerId: selectedProvider.id,
+            model: selectedProvider.model,
             usage: response.usage,
             finishReason: response.finishReason,
           },
@@ -273,17 +361,65 @@ export class AgentEngine {
 
         if (this.isContextThresholdReached(currentMessages, maxHistoryTokens, contextThresholdPercent)) {
           this.logger.warn(
-            { thresholdPercent: contextThresholdPercent },
-            "Context window threshold reached, stopping tool loop"
+            { 
+              currentTokens: this.estimateMessageTokens(currentMessages),
+              maxTokens: maxHistoryTokens,
+              thresholdPercent: contextThresholdPercent,
+              messageCount: currentMessages.length 
+            },
+            "Context threshold reached, attempting emergency compaction"
           );
-          return {
-            response: "Context window nearly full. Stopping tool calls and responding with available information.",
-            toolsUsed,
-            iterations,
-            providerId: provider.id,
-            model: provider.model,
-            error: "Context window threshold reached",
-          };
+
+          // Try emergency compaction before giving up
+          const emergencyCompacted = await this.aggressivelyCompactHistory(
+            currentMessages,
+            maxHistoryTokens,
+            selectedProvider,
+            input.sessionKey
+          );
+
+          if (this.estimateMessageTokens(emergencyCompacted) < this.estimateMessageTokens(currentMessages)) {
+            currentMessages = emergencyCompacted;
+            this.logger.info(
+              { 
+                beforeTokens: this.estimateMessageTokens(emergencyCompacted),
+                afterTokens: this.estimateMessageTokens(currentMessages)
+              },
+              "Emergency compaction successful, continuing tool loop"
+            );
+          } else {
+            // Compaction didn't help, must stop
+            this.logger.error(
+              { thresholdPercent: contextThresholdPercent },
+              "Context window full even after emergency compaction, stopping tool loop"
+            );
+            emitAgentEvent({
+              runId,
+              stream: "assistant",
+              data: {
+                responsePreview: "Context window nearly full. Stopping tool calls and responding with available information.",
+                success: false,
+                iterations,
+                toolsUsed,
+                duration: Date.now() - startTime,
+                providerId: selectedProvider.id,
+                model: selectedProvider.model,
+                agentType,
+                reason: "context_threshold",
+              },
+              sessionKey: input.sessionKey,
+            });
+            runOutcome = "error";
+            return {
+              response: "Context window nearly full. Stopping tool calls and responding with available information.",
+              toolsUsed,
+              iterations,
+              providerId: selectedProvider.id,
+              model: selectedProvider.model,
+              error: "Context window threshold reached",
+              runId,
+            };
+          }
         }
 
         // Execute tools
@@ -331,13 +467,31 @@ export class AgentEngine {
                 { tool: toolCall.name, attempts },
                 "Blocked tool called repeatedly; stopping tool loop"
               );
+              emitAgentEvent({
+                runId,
+                stream: "assistant",
+                data: {
+                  responsePreview: `Tool '${toolCall.name}' is blocked. Please approve or adjust tool policy.`,
+                  success: false,
+                  iterations,
+                  toolsUsed,
+                  duration: Date.now() - startTime,
+                  providerId: selectedProvider.id,
+                  model: selectedProvider.model,
+                  agentType,
+                  reason: "tool_blocked",
+                },
+                sessionKey: input.sessionKey,
+              });
+              runOutcome = "error";
               return {
                 response: `Tool '${toolCall.name}' is blocked. Please approve or adjust tool policy.`,
                 toolsUsed,
                 iterations,
-                providerId: provider.id,
-                model: provider.model,
+                providerId: selectedProvider.id,
+                model: selectedProvider.model,
                 error: "Tool blocked by policy",
+                runId,
               };
             }
             continue;
@@ -347,6 +501,17 @@ export class AgentEngine {
             { name: toolCall.name, args: toolCall.arguments },
             { sessionKey: input.sessionKey, channel: input.channel }
           );
+
+          emitAgentEvent({
+            runId,
+            stream: "tool",
+            data: {
+              name: toolCall.name,
+              args: toolCall.arguments,
+              status: "start",
+            },
+            sessionKey: input.sessionKey,
+          });
 
           const pendingPart = this.createToolPart(toolCall, "pending", {
             raw: "",
@@ -395,6 +560,28 @@ export class AgentEngine {
             error: result.error,
           }, { sessionKey: input.sessionKey, channel: input.channel });
 
+          emitAgentEvent({
+            runId,
+            stream: "tool",
+            data: {
+              name: toolCall.name,
+              status: result.ok ? "completed" : "error",
+              duration: result.metadata?.duration || 0,
+              error: result.error,
+            },
+            sessionKey: input.sessionKey,
+          });
+
+          if (!result.ok) {
+            await events.errorOccurred(
+              createClassifiedErrorData(result.error ?? "Tool execution failed", "medium", {
+                tool: toolCall.name,
+                sessionKey: input.sessionKey,
+              }),
+              { sessionKey: input.sessionKey, channel: input.channel }
+            );
+          }
+
           // Add tool result to messages
           currentMessages.push({
             role: "tool",
@@ -402,6 +589,22 @@ export class AgentEngine {
             toolCallId: toolCall.id,
             name: toolCall.name,
           });
+
+          // Check and apply aggressive compaction if approaching threshold
+          // This is more aggressive than the iteration-start compaction
+          const currentTokens = this.estimateMessageTokens(currentMessages);
+          const AggressiveThreshold = Math.floor((maxHistoryTokens * 60) / 100); // 60% threshold for mid-loop
+          if (currentTokens > AggressiveThreshold) {
+            const aggressivelyCompacted = await this.aggressivelyCompactHistory(
+              currentMessages,
+              maxHistoryTokens,
+              selectedProvider,
+              input.sessionKey
+            );
+            if (aggressivelyCompacted !== currentMessages) {
+              currentMessages = aggressivelyCompacted;
+            }
+          }
         }
       }
 
@@ -414,14 +617,39 @@ export class AgentEngine {
         iterations,
         toolsUsed,
         duration: Date.now() - startTime,
-        success: false
+        success: false,
+        responsePreview: finalResponse.slice(0, 300),
+        promptPreview,
+        providerId: selectedProvider.id,
+        model: selectedProvider.model,
+        agentType,
       }, { sessionKey: input.sessionKey, channel: input.channel });
+
+      emitAgentEvent({
+        runId,
+        stream: "assistant",
+        data: {
+          responsePreview: finalResponse.slice(0, 300),
+          success: false,
+          iterations,
+          toolsUsed,
+          duration: Date.now() - startTime,
+          providerId: selectedProvider.id,
+          model: selectedProvider.model,
+          agentType,
+          reason: "max_iterations",
+        },
+        sessionKey: input.sessionKey,
+      });
+
+      runOutcome = "max_iterations";
 
       return {
         response: finalResponse,
         toolsUsed,
         iterations,
         error: "Max iterations reached",
+        runId,
       };
     } catch (err) {
       const error = err instanceof Error ? err.message : String(err);
@@ -438,12 +666,40 @@ export class AgentEngine {
         }, { sessionKey: input.sessionKey, channel: input.channel });
       } catch {}
 
+      emitAgentEvent({
+        runId,
+        stream: "error",
+        data: {
+          message: error,
+          duration: Date.now() - startTime,
+          agentType,
+        },
+        sessionKey: input.sessionKey,
+      });
+
+      runOutcome = "error";
+
       return {
         response: `I encountered an error: ${error}`,
         toolsUsed,
         iterations,
         error,
+        runId,
       };
+    } finally {
+      emitAgentEvent({
+        runId,
+        stream: "lifecycle",
+        data: {
+          stage: "end",
+          outcome: runOutcome,
+          duration: Date.now() - startTime,
+          agentType,
+        },
+        sessionKey: input.sessionKey,
+      });
+      clearActiveRun(runId);
+      clearAgentRunContext(runId);
     }
   }
 
@@ -570,7 +826,7 @@ export class AgentEngine {
   }
 
   private async callProviderWithTimeout(
-    provider: { chat: (messages: Message[], options?: ChatOptions) => Promise<ChatResponse> },
+    provider: LLMProvider,
     messages: Message[],
     options: ChatOptions,
     timeoutMs: number
@@ -578,7 +834,7 @@ export class AgentEngine {
     return this.withTimeout(
       provider.chat(messages, options),
       timeoutMs,
-      `Provider call timed out after ${timeoutMs}ms`
+      `Provider ${provider.id} (${provider.name}/${provider.model}) called timed out after ${timeoutMs}ms`
     );
   }
 
@@ -806,10 +1062,354 @@ export class AgentEngine {
   }
 
   /**
+   * Estimate total tokens in a message array
+   */
+  private estimateMessageTokens(messages: Message[]): number {
+    return messages.reduce((sum, msg) => sum + estimateTokens(msg.content ?? ""), 0);
+  }
+
+  /**
+   * Aggressively compact history when approaching context limit
+   * Uses staged approach: first try simple summaries, then progressively prune
+   */
+  private async aggressivelyCompactHistory(
+    messages: Message[],
+    maxHistoryTokens: number,
+    provider: LLMProvider,
+    sessionKey: string
+  ): Promise<Message[]> {
+    const config = this.config.compaction ?? {};
+    const targetTokens = Math.floor((maxHistoryTokens * 50) / 100); // Aim for 50% of max
+
+    this.logger.info(
+      {
+        currentTokens: this.estimateMessageTokens(messages),
+        targetTokens,
+        messageCount: messages.length,
+      },
+      "Starting aggressive context compaction"
+    );
+
+    // Step 1: Extract system message (keep it)
+    const systemMsg = messages.find((m) => m.role === "system");
+    const nonSystemMsgs = messages.filter((m) => m.role !== "system");
+
+    if (nonSystemMsgs.length <= 4) {
+      // Too few messages to compact, try pruning instead
+      return this.pruneOldestMessages(messages, targetTokens, systemMsg);
+    }
+
+    // Step 2: Try simple compaction first (keep last 4 messages, summarize rest)
+    const minRecentMessages = config.minRecentMessages ?? 4;
+    if (nonSystemMsgs.length > minRecentMessages) {
+      const older = nonSystemMsgs.slice(0, -minRecentMessages);
+      const recent = nonSystemMsgs.slice(-minRecentMessages);
+
+      // Build summary with marker indicating it was compacted
+      const summary = this.buildSummaryMessage(older, config.maxSummaryTokens ?? 600);
+      const compacted = systemMsg ? [systemMsg, summary, ...recent] : [summary, ...recent];
+      const compactedTokens = this.estimateMessageTokens(compacted);
+
+      this.logger.debug(
+        { beforeTokens: this.estimateMessageTokens(messages), afterTokens: compactedTokens },
+        "Simple compaction applied"
+      );
+
+      if (compactedTokens <= targetTokens) {
+        return compacted;
+      }
+    }
+
+    // Step 3: If simple compaction didn't work, try aggressive pruning
+    this.logger.warn(
+      { messageCount: nonSystemMsgs.length },
+      "Simple compaction insufficient, using aggressive pruning"
+    );
+    return this.pruneOldestMessages(messages, targetTokens, systemMsg);
+  }
+
+  /**
+   * Split messages into chunks by rough token distribution
+   */
+  private splitMessagesIntoChunks(messages: Message[], numChunks: number): Message[][] {
+    if (messages.length <= numChunks) {
+      return messages.map((m) => [m]);
+    }
+
+    const totalTokens = this.estimateMessageTokens(messages);
+    const tokensPerChunk = Math.ceil(totalTokens / numChunks);
+
+    const chunks: Message[][] = [];
+    let currentChunk: Message[] = [];
+    let currentTokens = 0;
+
+    for (const msg of messages) {
+      const msgTokens = estimateTokens(msg.content ?? "");
+      currentChunk.push(msg);
+      currentTokens += msgTokens;
+
+      if (currentTokens >= tokensPerChunk && chunks.length < numChunks - 1) {
+        chunks.push(currentChunk);
+        currentChunk = [];
+        currentTokens = 0;
+      }
+    }
+
+    if (currentChunk.length > 0) {
+      chunks.push(currentChunk);
+    }
+
+    return chunks;
+  }
+
+  /**
+   * Aggressively prune oldest messages until within token budget
+   */
+  private pruneOldestMessages(
+    messages: Message[],
+    targetTokens: number,
+    systemMsg?: Message
+  ): Message[] {
+    const nonSystemMsgs = messages.filter((m) => m.role !== "system");
+    const kept: Message[] = systemMsg ? [systemMsg] : [];
+
+    // Keep last N messages, drop oldest
+    const NUM_PARTS = 3;
+    const chunks = this.splitMessagesIntoChunks(nonSystemMsgs, NUM_PARTS);
+
+    // Try to keep last chunk first, then progressively add earlier chunks
+    for (let i = chunks.length - 1; i >= 0; i--) {
+      const testMessages = [...kept, ...chunks[i], ...chunks.slice(i + 1).flat()];
+      const tokens = this.estimateMessageTokens(testMessages);
+
+      if (tokens <= targetTokens) {
+        kept.push(...chunks[i]);
+      }
+    }
+
+    // If still over budget, keep only system + last few messages
+    if (this.estimateMessageTokens(kept) > targetTokens) {
+      const kept2 = systemMsg ? [systemMsg] : [];
+      kept2.push(...nonSystemMsgs.slice(-2)); // Keep just last 2 messages
+      return kept2;
+    }
+
+    return kept;
+  }
+
+  /**
    * Get tool registry (for external access)
    */
   getToolRegistry(): ToolRegistry {
     return this.tools;
+  }
+
+  /**
+   * Call a provider with fallback to other providers on failure
+   * Tries providers in order: first the given provider, then others from fallback chain
+   */
+  private async callProviderWithFallback(
+    provider: LLMProvider,
+    messages: Message[],
+    options: ChatOptions,
+    iterationTimeoutMs: number,
+    sessionKey: string
+  ): Promise<{ response: ChatResponse; provider: LLMProvider }> {
+    const events = createEventPublishers(getEventStream());
+    const mapCooldownReason = (reason?: FailoverReason | null): "rate_limit" | "quota" | "auth" | "maintenance" | "error" => {
+      switch (reason) {
+        case "rate_limit":
+          return "rate_limit";
+        case "billing":
+          return "quota";
+        case "auth":
+          return "auth";
+        default:
+          return "error";
+      }
+    };
+    // Prioritize the primary provider first, then fallback chain
+    const providerIds = this.providers.getPrioritizedProviderIds(provider.id);
+    
+    this.logger.debug(
+      { primaryProvider: provider.id, providerOrder: providerIds },
+      "Provider fallback order"
+    );
+    
+    let lastError: Error | null = null;
+    
+    for (const attemptedProviderId of providerIds) {
+      const attemptedProvider = this.providers.getProviderById(attemptedProviderId);
+      if (!attemptedProvider) continue;
+
+      if (this.providers.isProviderCoolingDown(attemptedProviderId)) {
+        this.logger.warn({ providerId: attemptedProviderId }, "Provider in cooldown, skipping attempt");
+        continue;
+      }
+
+      // Skip if this is not our primary provider and we haven't exhausted the primary yet
+      // (unless the primary has already failed with a fatal error)
+      const isPrimary = attemptedProvider.id === provider.id;
+      
+      this.logger.debug(
+        { attemptedProviderId, isPrimary, providerId: provider.id },
+        "Attempting provider"
+      );
+
+      try {
+        const response = await withRetry(
+          () =>
+            this.callProviderWithTimeout(
+              attemptedProvider,
+              messages,
+              options,
+              iterationTimeoutMs
+            ),
+          {
+            maxRetries: isPrimary ? 3 : 1, // Retry primary more aggressively
+            onRetry: ({ attempt, delayMs, error, reason }) => {
+              this.logger.warn(
+                { attempt, delayMs, reason, error: error.message, providerId: attemptedProviderId },
+                "Provider call failed, retrying"
+              );
+            },
+          }
+        );
+
+        this.logger.info(
+          {
+            sessionKey,
+            providerId: attemptedProvider.id,
+            succeeded: true,
+            contentLength: response.content?.length || 0,
+            contentPreview: response.content?.slice(0, 100) || "(no content)",
+            finishReason: response.finishReason,
+            hasToolCalls: (response.toolCalls?.length || 0) > 0,
+            toolCallCount: response.toolCalls?.length || 0,
+            usage: response.usage,
+          },
+          "Provider call succeeded"
+        );
+
+        const recovery = this.providers.recordProviderSuccess(attemptedProvider.id);
+        if (recovery.recovered) {
+          await events.providerRecovery({
+            providerId: attemptedProvider.id,
+            providerName: attemptedProvider.name,
+            recoveredAt: Date.now(),
+          }, { sessionKey });
+        }
+
+        return { response, provider: attemptedProvider };
+      } catch (err) {
+        lastError = err instanceof Error ? err : new Error(String(err));
+        await events.errorOccurred(
+          createClassifiedErrorData(lastError, "medium", {
+            providerId: attemptedProvider.id,
+            model: attemptedProvider.model,
+            sessionKey,
+          }),
+          { sessionKey }
+        );
+        const failover = coerceToFailoverError(lastError, {
+          providerId: attemptedProvider.id,
+          model: attemptedProvider.model,
+        });
+        const failoverReason = failover?.reason ?? resolveFailoverReasonFromError(lastError);
+        const cooldown = this.providers.recordProviderFailure(attemptedProvider.id, failoverReason);
+        if (cooldown.opened) {
+          await events.providerCooldown({
+            providerId: attemptedProvider.id,
+            providerName: attemptedProvider.name,
+            reason: mapCooldownReason(failoverReason),
+            until: cooldown.cooldownUntil,
+          }, { sessionKey });
+        }
+
+        // Mark auth failures
+        if (failover && isFailoverError(failover)) {
+          const providerWithAuth = attemptedProvider as LLMProvider & { markAuthFailure?: () => void };
+          if (failover.reason === "auth" && typeof providerWithAuth.markAuthFailure === "function") {
+            providerWithAuth.markAuthFailure();
+          }
+
+          // Check if this is a fatal error that should cause immediate fallback
+          const isFatalError = ["auth", "billing", "format"].includes(failover.reason);
+          
+          this.logger.error(
+            {
+              sessionKey,
+              providerId: attemptedProvider.id,
+              model: attemptedProvider.model,
+              reason: failover.reason,
+              errorMessage: failover.message,
+              isFatal: isFatalError,
+              attemptedProviderId,
+              nextProvider: providerIds[providerIds.indexOf(attemptedProviderId) + 1],
+              rawError: lastError.message,
+              fullStack: lastError.stack,
+            },
+            "Provider call failed with classified error"
+          );
+
+          // Notify user if switching providers
+          const nextProviderIndex = providerIds.indexOf(attemptedProviderId) + 1;
+          if (nextProviderIndex < providerIds.length && this.onProviderError) {
+            const nextProviderId = providerIds[nextProviderIndex];
+            try {
+              await this.onProviderError({
+                sessionKey,
+                failedProvider: attemptedProviderId,
+                error: `${failover.reason}: ${failover.message}`,
+                retryingProvider: nextProviderId,
+              });
+            } catch (err2) {
+              this.logger.warn({ error: err2 }, "Failed to send provider error notification");
+            }
+          }
+
+          // Continue to next provider in fallback chain
+        } else {
+          this.logger.error(
+            {
+              sessionKey,
+              providerId: attemptedProvider.id,
+              error: lastError.message,
+              fullStack: lastError.stack,
+              attemptedProviderId,
+              nextProvider: providerIds[providerIds.indexOf(attemptedProviderId) + 1],
+              willRetryOtherProviders: true,
+            },
+            "Provider call failed"
+          );
+
+          // Notify user if switching providers
+          const nextProviderIndex = providerIds.indexOf(attemptedProviderId) + 1;
+          if (nextProviderIndex < providerIds.length && this.onProviderError) {
+            const nextProviderId = providerIds[nextProviderIndex];
+            try {
+              await this.onProviderError({
+                sessionKey,
+                failedProvider: attemptedProviderId,
+                error: lastError.message,
+                retryingProvider: nextProviderId,
+              });
+            } catch (err2) {
+              this.logger.warn({ error: err2 }, "Failed to send provider error notification");
+            }
+          }
+        }
+
+        // Continue to next provider in priority order
+      }
+    }
+
+    // All providers exhausted
+    this.logger.error(
+      { sessionKey, lastError: lastError?.message, totalProviders: providerIds.length },
+      "All providers exhausted"
+    );
+    throw lastError || new Error("No providers available");
   }
 
   /**
@@ -839,6 +1439,7 @@ export async function createAgentEngine(params: {
       healthCheckCacheTtlMinutes?: number;
     }>;
     defaultProvider: string;
+    fallbackChain?: string[];
     routing?: {
       chat?: string;
       tools?: string;
@@ -853,6 +1454,12 @@ export async function createAgentEngine(params: {
   memorySearch?: (query: string, maxResults?: number) => Promise<string[]>;
   toolPolicies?: Record<string, ToolPolicy>;
   sessionManager?: SessionManager;
+  onProviderError?: (params: {
+    sessionKey: string;
+    failedProvider: string;
+    error: string;
+    retryingProvider?: string;
+  }) => Promise<void>;
 }): Promise<AgentEngine> {
   // Initialize provider manager
   const defaultHealthTimeout = Math.min(params.config.toolLoop?.timeoutPerIterationMs ?? 5000, 10_000);
@@ -875,6 +1482,42 @@ export async function createAgentEngine(params: {
   );
   await providerManager.initialize();
 
+  // Detect model context window and auto-adjust maxHistoryTokens if needed
+  let effectiveConfig = { ...params.config };
+  const defaultMaxHistoryTokens = 40_000; // Default from config schema
+  
+  if (effectiveConfig.maxHistoryTokens === defaultMaxHistoryTokens) {
+    // User hasn't explicitly set maxHistoryTokens, try to auto-detect from model
+    try {
+      const defaultProviderId = params.providerConfig.defaultProvider;
+      const defaultProvider = params.providerConfig.providers[defaultProviderId];
+      
+      if (defaultProvider?.model) {
+        const contextInfo = getModelContextInfo(defaultProvider.model);
+        if (contextInfo.maxHistoryTokens > defaultMaxHistoryTokens) {
+          const oldValue = effectiveConfig.maxHistoryTokens;
+          effectiveConfig.maxHistoryTokens = contextInfo.maxHistoryTokens;
+          
+          params.logger.info(
+            {
+              model: defaultProvider.model,
+              contextWindow: contextInfo.contextWindow,
+              oldMaxHistory: oldValue,
+              newMaxHistory: contextInfo.maxHistoryTokens,
+              label: contextInfo.label,
+            },
+            "Auto-detected model context window, increased maxHistoryTokens"
+          );
+        }
+      }
+    } catch (err) {
+      params.logger.debug(
+        { error: err instanceof Error ? err.message : String(err) },
+        "Failed to auto-detect context window, using default"
+      );
+    }
+  }
+
   // Initialize tool registry
   const toolRegistry = new ToolRegistry({
     logger: params.logger,
@@ -885,7 +1528,7 @@ export async function createAgentEngine(params: {
 
   // Create and return engine
   return new AgentEngine({
-    config: params.config,
+    config: effectiveConfig,
     logger: params.logger,
     providerManager,
     toolRegistry,
@@ -894,5 +1537,6 @@ export async function createAgentEngine(params: {
     memorySearch: params.memorySearch,
     toolPolicies: params.toolPolicies,
     sessionManager: params.sessionManager,
+    onProviderError: params.onProviderError,
   });
 }

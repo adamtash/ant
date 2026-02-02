@@ -269,7 +269,7 @@ If `startupRecipients` is empty, ant falls back to `ownerJids` or your own JID w
     "toolLoop": {
       "timeoutPerIterationMs": 30000,
       "timeoutPerToolMs": 30000,
-      "contextWindowThresholdPercent": 80
+      "contextWindowThresholdPercent": 50
     },
     "compaction": {
       "enabled": true,
@@ -302,9 +302,38 @@ If `startupRecipients` is empty, ant falls back to `ownerJids` or your own JID w
   "subagents": {
     "enabled": true
   },
+  "agentExecution": {
+    "tasks": {
+      "registry": {
+        "dir": "./.ant/tasks",
+        "cacheTtlMs": 45000,
+        "maxHistorySize": 1000
+      },
+      "defaults": {
+        "timeoutMs": 120000,
+        "maxRetries": 3,
+        "retryBackoffMs": 1000,
+        "retryBackoffMultiplier": 2,
+        "retryBackoffCap": 60000
+      }
+    },
+    "lanes": {
+      "main": { "maxConcurrent": 1 },
+      "autonomous": { "maxConcurrent": 5 },
+      "maintenance": { "maxConcurrent": 1 }
+    },
+    "subagents": {
+      "timeoutMs": 120000,
+      "maxRetries": 2
+    },
+    "monitoring": {
+      "timeoutCheckIntervalMs": 1000,
+      "statusBroadcastDebounceMs": 200
+    }
+  },
   "cliTools": {
     "enabled": true,
-    "timeoutMs": 120000,
+    "timeoutMs": 1200000,
     "mcp": {
       "enabled": true,
       "tools": ["memory_search", "memory_get"]
@@ -698,7 +727,7 @@ export async function startMainAgent(params: {
     return;
   }
 
-  const sessionKey = "main-agent:system";
+  const sessionKey = "agent:main:system";
   const config = params.cfg.mainAgent;
   let consecutiveFailures = 0;
 
@@ -869,7 +898,7 @@ Check Main Agent status:
 tail -f AGENT_LOG.md
 
 # Check agent session
-npm run dev -- sessions show "main-agent:system" -c ant.config.json
+npm run dev -- sessions show "agent:main:system" -c ant.config.json
 
 # Monitor in TUI
 npm run dev -- run -c ant.config.json --tui

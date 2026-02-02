@@ -60,6 +60,53 @@ export class SessionManager {
   }
 
   /**
+   * Initialize and load all sessions from disk
+   */
+  async initialize(): Promise<void> {
+    const sessionsDir = path.join(this.stateDir, "sessions");
+    
+    try {
+      const files = await fs.readdir(sessionsDir);
+      const sessionFiles = files.filter((f) => f.endsWith(".jsonl"));
+      
+      for (const file of sessionFiles) {
+        try {
+          // Read the first line to get the actual sessionKey
+          const filePath = path.join(sessionsDir, file);
+          const content = await fs.readFile(filePath, "utf-8");
+          const firstLine = content.trim().split("\n")[0];
+          
+          if (!firstLine) continue;
+          
+          const firstMessage = JSON.parse(firstLine);
+          const actualSessionKey = firstMessage.sessionKey;
+          
+          if (actualSessionKey) {
+            const session = await this.loadSession(actualSessionKey);
+            if (session) {
+              this.sessions.set(session.sessionKey, session);
+            }
+          }
+        } catch (err) {
+          this.logger.debug(
+            { file, error: err instanceof Error ? err.message : String(err) },
+            "Failed to load session from file"
+          );
+        }
+      }
+      
+      this.logger.info({ count: this.sessions.size }, "Sessions loaded from disk");
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") {
+        this.logger.warn(
+          { error: err instanceof Error ? err.message : String(err) },
+          "Failed to load sessions from disk"
+        );
+      }
+    }
+  }
+
+  /**
    * Get or create a session
    */
   async getOrCreate(params: {

@@ -60,7 +60,7 @@ npm run ui:dev
 cd ui && npm run dev
 ```
 
-The UI will be available at `http://localhost:5173` (Vite dev server) with API proxy to the runtime at `:5117`.
+The UI will be available at `http://localhost:5117` (Vite dev server) with API proxy to the runtime at `:5117`.
 
 ### Build for Production
 
@@ -237,7 +237,7 @@ const classes = getDynamicClasses('bg', 'ant-dark');
 
 1. **Start runtime**: `npm run dev -- run -c ant.config.json`
 2. **Start UI dev server**: `npm run ui:dev`
-3. **Open browser**: `http://localhost:5173`
+3. **Open browser**: `http://localhost:5117`
 4. **Make changes**: Files auto-reload on save
 5. **Build for production**: `npm run ui:build`
 

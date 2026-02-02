@@ -500,7 +500,7 @@ After checking all duties, output:
 tail -f AGENT_LOG.md
 
 # Check Main Agent session
-ant sessions view "main-agent:system"
+ant sessions view "agent:main:system"
 
 # Monitor in TUI dashboard
 ant start --tui

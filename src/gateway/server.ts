@@ -28,14 +28,20 @@ import type {
   GatewayStatus,
 } from "./types.js";
 import type { AgentEngine } from "../agent/engine.js";
-import type { MainAgent } from "../agent/main-agent.js";
+import type { MainAgent, MainAgentTask } from "../agent/index.js";
 import type { MemoryManager } from "../memory/manager.js";
 import type { Scheduler } from "../scheduler/scheduler.js";
+import { Scheduler as SchedulerUtils } from "../scheduler/scheduler.js";
+import { initializeDroneFlights } from "../scheduler/drone-flights-init.js";
 import type { SkillRegistryManager } from "../agent/skill-registry.js";
 import type { ToolRegistry } from "../agent/tool-registry.js";
 import os from "node:os";
-import { classifyError, type ClassificationResult } from "../monitor/error-classifier.js";
+import { classifyError, type ClassificationResult, createClassifiedErrorData } from "../monitor/error-classifier.js";
 import { ProviderHealthTracker } from "../monitor/provider-health.js";
+import type { MonitorEvent, ErrorOccurredData } from "../monitor/types.js";
+import { buildAgentScopedSessionKey, buildAgentTaskSessionKey, normalizeAgentId } from "../routing/session-key.js";
+import { onAgentEvent, type AgentEventPayload } from "../monitor/agent-events.js";
+import { listActiveRuns } from "../agent/active-runs.js";
 
 /**
  * Gateway configuration
@@ -111,6 +117,11 @@ export class GatewayServer {
   private eventStream = getEventStream();
   private events = createEventPublishers(this.eventStream);
   private providerHealthTracker: ProviderHealthTracker;
+  private agentEventUnsubscribe?: () => void;
+
+  /** Status broadcast state */
+  private lastStatus: Record<string, unknown> | null = null;
+  private statusDeltaTimer: NodeJS.Timeout | null = null;
 
   constructor(params: {
     config: GatewayConfig;
@@ -154,6 +165,139 @@ export class GatewayServer {
         this.lastErrorTime = Date.now();
       }
     });
+  }
+
+  private mapMonitorEventToSystemEvent(event: MonitorEvent): {
+    id: string;
+    timestamp: number;
+    type: string;
+    data: Record<string, unknown>;
+    severity: "info" | "warn" | "error" | "critical";
+    source: "agent" | "system" | "user";
+    sessionKey?: string;
+    channel?: string;
+  } {
+    const base = {
+      id: event.id,
+      timestamp: event.timestamp || Date.now(),
+      data: (event.data || {}) as Record<string, unknown>,
+      sessionKey: event.sessionKey ?? undefined,
+      channel: event.channel ?? undefined,
+    };
+
+    let severity: "info" | "warn" | "error" | "critical" = "info";
+    if (event.type === "error_occurred") {
+      const errorData = event.data as ErrorOccurredData;
+      if (errorData?.severity === "critical") severity = "critical";
+      else if (errorData?.severity === "high") severity = "error";
+      else if (errorData?.severity === "medium") severity = "warn";
+      else severity = "warn";
+      if (errorData?.context && typeof errorData.context === "object") {
+        const context = errorData.context as Record<string, unknown>;
+        if (context.taskId && !base.data.taskId) {
+          base.data.taskId = context.taskId;
+        }
+      }
+    } else if (
+      event.type === "job_failed" ||
+      event.type === "job_completed" ||
+      event.type === "job_started" ||
+      event.type === "job_enabled" ||
+      event.type === "job_disabled" ||
+      event.type === "job_created" ||
+      event.type === "job_removed"
+    ) {
+      const jobData = event.data as Record<string, unknown>;
+      if (jobData.jobId && !base.data.jobId) {
+        base.data.jobId = jobData.jobId;
+      }
+      if (jobData.name && !base.data.name) {
+        base.data.name = jobData.name;
+      }
+      if (event.type === "job_failed") {
+        severity = "error";
+      } else {
+        severity = "info";
+      }
+    } else if (event.type === "provider_cooldown") {
+      severity = "warn";
+    } else if (event.type === "provider_recovery") {
+      severity = "info";
+    } else if (event.type === "tool_executed") {
+      const toolData = event.data as { success?: boolean };
+      if (toolData && toolData.success === false) {
+        severity = "warn";
+      }
+    }
+
+    const source: "agent" | "system" | "user" = "system";
+
+    let type = event.type === "subagent_spawned" ? "agent_spawned" : event.type;
+    if (event.type === "subagent_spawned") {
+      const subagentData = event.data as {
+        subagentId?: string;
+        task?: string;
+        parentTaskId?: string;
+      };
+      base.data = {
+        id: subagentData.subagentId ?? String(base.id),
+        label: subagentData.task ?? "subagent",
+        taskId: subagentData.parentTaskId,
+      };
+    }
+    if (event.type === "task_started") {
+      const taskData = event.data as { taskId?: string; description?: string };
+      base.data = {
+        id: taskData.taskId ?? String(base.id),
+        prompt: taskData.description ?? "Task started",
+        description: taskData.description,
+      };
+    }
+    if (event.type === "task_completed") {
+      const taskData = event.data as { taskId?: string; result?: unknown; error?: string };
+      base.data = {
+        id: taskData.taskId ?? String(base.id),
+        taskId: taskData.taskId,
+        result: taskData.result,
+        error: taskData.error,
+      };
+    }
+
+    return {
+      ...base,
+      type,
+      severity,
+      source,
+    };
+  }
+
+  private mapAgentEventToSystemEvent(event: AgentEventPayload): {
+    id: string;
+    timestamp: number;
+    type: string;
+    data: Record<string, unknown>;
+    severity: "info" | "warn" | "error" | "critical";
+    source: "agent" | "system" | "user";
+    sessionKey?: string;
+    channel?: string;
+  } {
+    const severity = event.stream === "error" ? "error" : "info";
+    const data = {
+      runId: event.runId,
+      seq: event.seq,
+      stream: event.stream,
+      ts: event.ts,
+      payload: event.data,
+    };
+    return {
+      id: `agent-${event.runId}-${event.seq}`,
+      timestamp: event.ts,
+      type: "agent_event",
+      data,
+      severity,
+      source: "agent",
+      sessionKey: event.sessionKey,
+    };
   }
 
   /**
@@ -212,51 +356,8 @@ export class GatewayServer {
     app.use(express.json());
 
     // Status
-    app.get("/api/status", (req, res) => {
-      const running = Array.from(this.tasks.values())
-        .filter((task) => task.status === "queued" || task.status === "running")
-        .map((task) => ({
-          sessionKey: task.sessionKey,
-          chatId: task.chatId,
-          text: task.description,
-          status: task.status === "failed" ? "error" : task.status,
-          startedAt: task.startedAt ?? task.createdAt,
-          endedAt: task.endedAt,
-          error: task.error,
-        }));
-      const status = {
-        ok: true,
-        time: Date.now(),
-        runtime: {
-          providers: [],
-        },
-        queue: [],
-        running,
-        subagents: [],
-        mainAgent: {
-          enabled: this.mainAgentRunning,
-          running: this.mainAgentRunning,
-          tasks: this.mainAgent?.getAllTasks() || [],
-          lastCheckAt: this.startupHealthCheck.lastCheckAt ?? null,
-          lastError: this.startupHealthCheck.ok ? null : this.startupHealthCheck.error ?? null,
-        },
-        startupHealthCheck: {
-          lastCheckAt: this.startupHealthCheck.lastCheckAt ?? null,
-          ok: this.startupHealthCheck.ok ?? null,
-          error: this.startupHealthCheck.error ?? null,
-          latencyMs: this.startupHealthCheck.latencyMs ?? null,
-          responsePreview: this.startupHealthCheck.responsePreview ?? null,
-        },
-        health: {
-          cpu: 0,
-          memory: process.memoryUsage().heapUsed,
-          disk: 0,
-          uptime: Date.now() - this.startTime,
-          lastRestart: this.startTime,
-          queueDepth: this.router?.getSessionQueueStats().queued ?? 0,
-          activeConnections: this.connections.size,
-        },
-      };
+    app.get("/api/status", async (req, res) => {
+      const status = await this.buildStatusResponse();
       res.json(status);
     });
 
@@ -319,7 +420,12 @@ export class GatewayServer {
 
     app.post("/api/config", async (req, res) => {
         try {
-            await saveConfig(req.body, this.config.configPath);
+            const current = await loadConfig(this.config.configPath);
+            const merged: Record<string, unknown> = { ...current, ...req.body };
+            if ("resolved" in merged) {
+              delete (merged as { resolved?: unknown }).resolved;
+            }
+            await saveConfig(merged, this.config.configPath);
             res.json({ ok: true });
         } catch (err) {
             res.status(400).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
@@ -331,7 +437,7 @@ export class GatewayServer {
     // ============================================
     
     // GET /api/agents
-    app.get("/api/agents", (req, res) => {
+    app.get("/api/agents", async (req, res) => {
       // Build agent list from main agent tasks and subagent records
       const agents: Array<{
         id: string;
@@ -356,20 +462,20 @@ export class GatewayServer {
       
       // Add main agent as queen
       if (this.mainAgent) {
-        const mainTasks = this.mainAgent.getAllTasks();
+        const mainTasks = (await this.mainAgent.getAllTasks()) as MainAgentTask[];
         agents.push({
           id: "main-agent",
           caste: "queen",
           name: "Queen",
           status: this.mainAgentRunning ? "active" : "idle",
-          currentTask: mainTasks.find(t => t.status === "in_progress")?.description,
+          currentTask: mainTasks.find((t) => t.status === "running")?.description,
           progress: mainTasks.length > 0 
-            ? mainTasks.filter(t => t.status === "completed").length / mainTasks.length 
+            ? mainTasks.filter((t) => t.status === "succeeded").length / mainTasks.length 
             : 0,
           toolsUsed: [],
           taskCount: mainTasks.length,
           averageDuration: 0,
-          errorCount: mainTasks.filter(t => t.status === "failed").length,
+          errorCount: mainTasks.filter((t) => t.status === "failed").length,
           createdAt: this.startTime,
           metadata: {
             age: Math.floor((Date.now() - this.startTime) / 1000 / 60), // minutes
@@ -379,7 +485,7 @@ export class GatewayServer {
         });
       }
       
-      // Add running tasks as worker agents
+      // Add running web tasks as worker agents
       for (const task of this.tasks.values()) {
         if (task.status === "running" || task.status === "queued") {
           agents.push({
@@ -403,17 +509,47 @@ export class GatewayServer {
           });
         }
       }
+
+      // Add subagent tasks as worker agents
+      if (this.mainAgent) {
+        const mainTasks = (await this.mainAgent.getAllTasks()) as MainAgentTask[];
+        for (const task of mainTasks) {
+          if (!task.parentTaskId) continue;
+          const isActive = ["queued", "running", "retrying"].includes(task.status);
+          agents.push({
+            id: task.taskId,
+            caste: "worker",
+            name: `Subagent-${task.taskId.slice(-4)}`,
+            status: isActive ? "active" : task.status === "failed" ? "error" : "retired",
+            currentTask: task.description,
+            progress: task.progress?.total
+              ? Math.min(1, task.progress.completed / task.progress.total)
+              : 0,
+            toolsUsed: task.result?.toolsUsed ?? [],
+            taskCount: 1,
+            averageDuration: task.updatedAt - task.createdAt,
+            errorCount: task.error ? 1 : 0,
+            createdAt: task.createdAt,
+            parentAgentId: "main-agent",
+            metadata: {
+              age: Math.floor((Date.now() - task.createdAt) / 1000 / 60),
+              energy: isActive ? 70 : 100,
+              specialization: [task.phase ?? "execution"],
+            },
+          });
+        }
+      }
       
       res.json({ ok: true, agents });
     });
 
     // GET /api/agents/:id
-    app.get("/api/agents/:id", (req, res) => {
+    app.get("/api/agents/:id", async (req, res) => {
       const { id } = req.params;
       
       // Handle main agent
       if (id === "main-agent" && this.mainAgent) {
-        const mainTasks = this.mainAgent.getAllTasks();
+        const mainTasks = (await this.mainAgent.getAllTasks()) as MainAgentTask[];
         res.json({
           ok: true,
           agent: {
@@ -421,14 +557,14 @@ export class GatewayServer {
             caste: "queen",
             name: "Queen",
             status: this.mainAgentRunning ? "active" : "idle",
-            currentTask: mainTasks.find(t => t.status === "in_progress")?.description,
+            currentTask: mainTasks.find((t) => t.status === "running")?.description,
             progress: mainTasks.length > 0 
-              ? mainTasks.filter(t => t.status === "completed").length / mainTasks.length 
+              ? mainTasks.filter((t) => t.status === "succeeded").length / mainTasks.length 
               : 0,
             toolsUsed: [],
             taskCount: mainTasks.length,
             averageDuration: 0,
-            errorCount: mainTasks.filter(t => t.status === "failed").length,
+            errorCount: mainTasks.filter((t) => t.status === "failed").length,
             createdAt: this.startTime,
             metadata: {
               age: Math.floor((Date.now() - this.startTime) / 1000 / 60),
@@ -468,6 +604,39 @@ export class GatewayServer {
           },
         });
         return;
+      }
+
+      if (this.mainAgent) {
+        const mainTasks = (await this.mainAgent.getAllTasks()) as MainAgentTask[];
+        const subagent = mainTasks.find((entry) => entry.taskId === id);
+        if (subagent) {
+          const isActive = ["queued", "running", "retrying"].includes(subagent.status);
+          res.json({
+            ok: true,
+            agent: {
+              id: subagent.taskId,
+              caste: "worker",
+              name: `Subagent-${subagent.taskId.slice(-4)}`,
+              status: isActive ? "active" : subagent.status === "failed" ? "error" : "retired",
+              currentTask: subagent.description,
+              progress: subagent.progress?.total
+                ? Math.min(1, subagent.progress.completed / subagent.progress.total)
+                : 0,
+              toolsUsed: subagent.result?.toolsUsed ?? [],
+              taskCount: 1,
+              averageDuration: subagent.updatedAt - subagent.createdAt,
+              errorCount: subagent.error ? 1 : 0,
+              createdAt: subagent.createdAt,
+              parentAgentId: "main-agent",
+              metadata: {
+                age: Math.floor((Date.now() - subagent.createdAt) / 1000 / 60),
+                energy: isActive ? 70 : 100,
+                specialization: [subagent.phase ?? "execution"],
+              },
+            },
+          });
+          return;
+        }
       }
       
       res.status(404).json({ ok: false, error: "Agent not found" });
@@ -549,7 +718,7 @@ export class GatewayServer {
       }
 
       const taskId = `task-${Date.now()}`;
-      const sessionKey = `task-${taskId}`; // New session for the task
+      const sessionKey = buildAgentTaskSessionKey({ agentId: normalizeAgentId("web"), taskId });
       const chatId = taskId;
 
       this.tasks.set(taskId, {
@@ -569,6 +738,10 @@ export class GatewayServer {
           if (!task) return;
           task.status = "running";
           task.startedAt = Date.now();
+          await this.events.taskStarted({
+            taskId,
+            description: taskDescription,
+          }, { sessionKey, channel: "web" });
           this.eventBus.emit({
             id: `evt-${Date.now()}`,
             type: "task_started",
@@ -589,6 +762,10 @@ export class GatewayServer {
           completed.status = "completed";
           completed.result = result;
           completed.endedAt = Date.now();
+          await this.events.taskCompleted({
+            taskId,
+            result,
+          }, { sessionKey, channel: "web" });
 
           this.eventBus.emit({
             id: `evt-${Date.now()}`,
@@ -604,6 +781,16 @@ export class GatewayServer {
           failed.status = "failed";
           failed.error = errorMsg;
           failed.endedAt = Date.now();
+
+          await this.events.taskCompleted({
+            taskId,
+            error: errorMsg,
+          }, { sessionKey, channel: "web" });
+
+          await this.events.errorOccurred(
+            createClassifiedErrorData(errorMsg, "high", { taskId, sessionKey, channel: "web" }),
+            { sessionKey, channel: "web" }
+          );
 
           this.eventBus.emit({
             id: `evt-${Date.now()}`,
@@ -755,15 +942,22 @@ export class GatewayServer {
         "Cache-Control": "no-cache",
         "Connection": "keep-alive",
       });
+      res.write(": ok\n\n");
 
       // Subscribe to global event stream
       const unsubscribe = getEventStream().subscribeAll((event) => {
-        res.write(`event: event\ndata: ${JSON.stringify(event)}\n\n`);
+        const normalized = this.mapMonitorEventToSystemEvent(event as MonitorEvent);
+        res.write(`event: event\ndata: ${JSON.stringify(normalized)}\n\n`);
+      });
+      const unsubscribeAgent = onAgentEvent((event) => {
+        const normalized = this.mapAgentEventToSystemEvent(event);
+        res.write(`event: event\ndata: ${JSON.stringify(normalized)}\n\n`);
       });
 
       // Cleanup on disconnect
       req.on("close", () => {
         unsubscribe();
+        unsubscribeAgent();
       });
     });
 
@@ -1018,7 +1212,7 @@ export class GatewayServer {
     // GET /api/jobs (paginated)
     app.get("/api/jobs", (req, res) => {
       if (!this.scheduler) {
-        res.json({ ok: true, data: [], total: 0, limit: 20, offset: 0 });
+        res.json({ ok: true, jobs: [], data: [], total: 0, limit: 20, offset: 0 });
         return;
       }
       
@@ -1036,7 +1230,7 @@ export class GatewayServer {
           naturalLanguage: job.schedule, // Could be improved with natural language parsing
           enabled: job.enabled,
           lastRunAt: job.lastRun,
-          nextRunAt: Date.now() + 3600000, // Placeholder - would need cron-parser
+          nextRunAt: SchedulerUtils.getNextRunTime(job.schedule)?.getTime() ?? Date.now(),
           trigger: {
             type: job.trigger.type as "agent_ask" | "tool_call" | "webhook",
             data: job.trigger.type === "agent_ask" 
@@ -1061,7 +1255,7 @@ export class GatewayServer {
         const total = allJobs.length;
         const data = allJobs.slice(offset, offset + limit);
         
-        res.json({ ok: true, data, total, limit, offset });
+        res.json({ ok: true, jobs: data, data, total, limit, offset });
       } catch (err) {
         res.status(500).json({ 
           ok: false, 
@@ -1465,22 +1659,22 @@ export class GatewayServer {
     // ============================================
     
     // List Main Agent tasks
-    app.get("/api/main-agent/tasks", (req, res) => {
+    app.get("/api/main-agent/tasks", async (req, res) => {
       if (!this.mainAgent) {
         res.status(503).json({ ok: false, error: "Main Agent not available" });
         return;
       }
-      const tasks = this.mainAgent.getAllTasks();
+      const tasks = await this.mainAgent.getAllTasks();
       res.json({ ok: true, tasks });
     });
 
     // Get specific Main Agent task
-    app.get("/api/main-agent/tasks/:id", (req, res) => {
+    app.get("/api/main-agent/tasks/:id", async (req, res) => {
       if (!this.mainAgent) {
         res.status(503).json({ ok: false, error: "Main Agent not available" });
         return;
       }
-      const task = this.mainAgent.getTask(req.params.id);
+      const task = await this.mainAgent.getTask(req.params.id);
       if (!task) {
         res.status(404).json({ ok: false, error: "Task not found" });
         return;
@@ -1524,6 +1718,14 @@ export class GatewayServer {
 
     this.startTime = Date.now();
 
+    if (this.scheduler) {
+      const droneFlightCount = await initializeDroneFlights(this.scheduler, this.logger, { emitEvents: true });
+      this.logger.info({ count: droneFlightCount }, "Drone Flights initialized");
+    }
+
+    // Load all existing sessions from disk
+    await this.sessions.initialize();
+
     const app = express();
     this.setupApiRoutes(app);
 
@@ -1552,6 +1754,10 @@ export class GatewayServer {
 
     this.wss.on("error", (error) => {
       this.logger.error({ error: error.message }, "Gateway server error");
+      this.events.errorOccurred(
+        createClassifiedErrorData(error, "high", { component: "gateway", area: "wss" }),
+        { channel: "web" }
+      ).catch(() => {});
     });
 
     await new Promise<void>((resolve) => {
@@ -1562,14 +1768,16 @@ export class GatewayServer {
     });
     // Wire up global event stream to gateway broadcast
     getEventStream().subscribeAll((event) => {
-      this.broadcast({
-        type: event.type as any, // Cast to match GatewayEvent type mostly
-        sessionKey: event.sessionKey ?? undefined,
-        channel: event.channel,
-        data: event.data,
-        timestamp: event.timestamp || Date.now(),
-      });
-    });  }
+      const normalized = this.mapMonitorEventToSystemEvent(event as MonitorEvent);
+      this.broadcast(normalized);
+      this.scheduleStatusDelta();
+    });
+    this.agentEventUnsubscribe = onAgentEvent((event) => {
+      const normalized = this.mapAgentEventToSystemEvent(event);
+      this.broadcast(normalized);
+      this.scheduleStatusDelta();
+    });
+  }
 
   /**
    * Stop the gateway server
@@ -1598,6 +1806,10 @@ export class GatewayServer {
 
     this.wss = null;
     this.httpServer = null;
+    if (this.agentEventUnsubscribe) {
+      this.agentEventUnsubscribe();
+      this.agentEventUnsubscribe = undefined;
+    }
     this.logger.info("Gateway server stopped");
   }
 
@@ -1647,12 +1859,16 @@ export class GatewayServer {
         setTimeout(() => reject(new Error(`Health check timed out after ${timeoutMs}ms`)), timeoutMs);
       });
 
+      const sessionKey = buildAgentScopedSessionKey({
+        agentId: normalizeAgentId("main"),
+        scope: "healthcheck:startup",
+      });
       const result = await Promise.race([
         this.agentEngine.execute({
-          sessionKey: "healthcheck:startup",
+          sessionKey,
           query: prompt,
           channel: "web",
-          chatId: "healthcheck:startup",
+          chatId: sessionKey,
         }),
         timeout,
       ]);
@@ -1704,6 +1920,8 @@ export class GatewayServer {
 
     this.connections.set(connectionId, { ws, connection });
 
+    this.scheduleStatusDelta();
+
     this.logger.info({ connectionId, sessionKey, channel }, "Client connected");
 
     // Emit connection event
@@ -1732,6 +1950,8 @@ export class GatewayServer {
       this.connections.delete(connectionId);
       this.logger.info({ connectionId, code, reason: reason.toString() }, "Client disconnected");
 
+      this.scheduleStatusDelta();
+
       this.eventBus.emit({
         type: "disconnection",
         connectionId,
@@ -1745,6 +1965,10 @@ export class GatewayServer {
     // Set up error handler
     ws.on("error", (error) => {
       this.logger.error({ connectionId, error: error.message }, "WebSocket error");
+      this.events.errorOccurred(
+        createClassifiedErrorData(error, "medium", { component: "gateway", area: "ws", connectionId }),
+        { sessionKey, channel }
+      ).catch(() => {});
     });
 
     // Send welcome message
@@ -1758,6 +1982,9 @@ export class GatewayServer {
       },
       timestamp: Date.now(),
     });
+
+    // Send initial status snapshot
+    this.sendStatusSnapshot(ws).catch(() => {});
   }
 
   /**
@@ -1805,7 +2032,7 @@ export class GatewayServer {
             id: this.generateId(),
             requestId: request.id,
             success: true,
-            data: this.getStatus(),
+            data: await this.getStatus(),
           };
           break;
 
@@ -1856,7 +2083,7 @@ export class GatewayServer {
   /**
    * Broadcast event to all connections
    */
-  broadcast(event: GatewayEvent): void {
+  broadcast(event: GatewayEvent | Record<string, unknown>): void {
     const message: GatewayMessage = {
       id: this.generateId(),
       type: "event",
@@ -1866,7 +2093,8 @@ export class GatewayServer {
 
     for (const { ws, connection } of this.connections.values()) {
       // Only send to relevant sessions
-      if (event.sessionKey && connection.sessionKey !== event.sessionKey) {
+      const sessionKey = "sessionKey" in event ? (event.sessionKey as string | undefined) : undefined;
+      if (sessionKey && connection.sessionKey !== sessionKey) {
         continue;
       }
       this.send(ws, message);
@@ -1895,9 +2123,73 @@ export class GatewayServer {
   }
 
   /**
+   * Schedule a debounced status delta broadcast
+   */
+  private scheduleStatusDelta(): void {
+    if (this.statusDeltaTimer) return;
+    const debounceMs = 200;
+    this.statusDeltaTimer = setTimeout(() => {
+      this.statusDeltaTimer = null;
+      void this.broadcastStatusDelta();
+    }, debounceMs);
+  }
+
+  /**
+   * Send full status snapshot to a single connection
+   */
+  private async sendStatusSnapshot(ws: WebSocket): Promise<void> {
+    const status = await this.buildStatusResponse();
+    this.send(ws, {
+      id: this.generateId(),
+      type: "event",
+      payload: {
+        type: "status_snapshot",
+        data: { data: status },
+        timestamp: Date.now(),
+      },
+      timestamp: Date.now(),
+    });
+  }
+
+  /**
+   * Broadcast status deltas to all connections
+   */
+  private async broadcastStatusDelta(): Promise<void> {
+    const status = await this.buildStatusResponse();
+    if (!this.lastStatus) {
+      this.lastStatus = status;
+      for (const { ws } of this.connections.values()) {
+        if (ws.readyState === WebSocket.OPEN) {
+          await this.sendStatusSnapshot(ws);
+        }
+      }
+      return;
+    }
+
+    const changes = this.diffStatus(this.lastStatus, status);
+    if (Object.keys(changes).length === 0) return;
+    this.lastStatus = status;
+
+    for (const { ws } of this.connections.values()) {
+      if (ws.readyState === WebSocket.OPEN) {
+        this.send(ws, {
+          id: this.generateId(),
+          type: "event",
+          payload: {
+            type: "status_delta",
+            data: { changes },
+            timestamp: Date.now(),
+          },
+          timestamp: Date.now(),
+        });
+      }
+    }
+  }
+
+  /**
    * Get gateway status
    */
-  getStatus(): GatewayStatus {
+  async getStatus(): Promise<GatewayStatus> {
     return {
       connected: this.wss !== null,
       uptime: this.startTime ? Date.now() - this.startTime : 0,
@@ -1916,6 +2208,103 @@ export class GatewayServer {
         discord: { enabled: false, connected: false },
       },
     };
+  }
+
+  private async buildStatusResponse(): Promise<Record<string, unknown>> {
+    const mainAgentTasks = (this.mainAgent ? await this.mainAgent.getAllTasks() : []) as MainAgentTask[];
+    const subagents = mainAgentTasks
+      .filter((task) => task.parentTaskId)
+      .map((task) => {
+        const startedAt =
+          task.history.find((entry: { state: string; at: number }) => entry.state === "running")?.at ??
+          task.createdAt;
+        const endedAt = ["succeeded", "failed", "canceled"].includes(task.status)
+          ? task.history.find((entry: { state: string; at: number }) => entry.state === task.status)?.at ??
+            task.updatedAt
+          : undefined;
+
+        return {
+          id: task.taskId,
+          task: task.description,
+          label: task.phase ?? "subagent",
+          status: task.status,
+          createdAt: task.createdAt,
+          startedAt,
+          endedAt,
+        };
+      });
+    const activeRuns = listActiveRuns().map((run) => ({
+      runId: run.runId,
+      sessionKey: run.sessionKey,
+      agentType: run.agentType,
+      startedAt: run.startedAt,
+      metadata: run.metadata,
+    }));
+    const running = Array.from(this.tasks.values())
+      .filter((task) => task.status === "queued" || task.status === "running")
+      .map((task) => ({
+        sessionKey: task.sessionKey,
+        chatId: task.chatId,
+        text: task.description,
+        status: task.status === "failed" ? "error" : task.status,
+        startedAt: task.startedAt ?? task.createdAt,
+        endedAt: task.endedAt,
+        error: task.error,
+      }));
+
+    return {
+      ok: true,
+      time: Date.now(),
+      runtime: {
+        providers: [],
+      },
+      queue: [],
+      running,
+      activeRuns,
+      subagents,
+      mainAgent: {
+        enabled: this.mainAgent?.config?.mainAgent?.enabled ?? false,
+        running: this.mainAgentRunning,
+        tasks: mainAgentTasks.map((task) => ({
+          id: task.taskId,
+          description: task.description,
+          status: task.status,
+          createdAt: task.createdAt,
+          completedAt: task.status === "succeeded" || task.status === "failed" ? task.updatedAt : undefined,
+          result: task.result?.content,
+        })),
+        lastCheckAt: this.startupHealthCheck.lastCheckAt ?? null,
+        lastError: this.startupHealthCheck.ok ? null : this.startupHealthCheck.error ?? null,
+      },
+      startupHealthCheck: {
+        lastCheckAt: this.startupHealthCheck.lastCheckAt ?? null,
+        ok: this.startupHealthCheck.ok ?? null,
+        error: this.startupHealthCheck.error ?? null,
+        latencyMs: this.startupHealthCheck.latencyMs ?? null,
+        responsePreview: this.startupHealthCheck.responsePreview ?? null,
+      },
+      health: {
+        cpu: 0,
+        memory: process.memoryUsage().heapUsed,
+        disk: 0,
+        uptime: Date.now() - this.startTime,
+        lastRestart: this.startTime,
+        queueDepth: this.router?.getSessionQueueStats().queued ?? 0,
+        activeConnections: this.connections.size,
+      },
+    };
+  }
+
+  private diffStatus(prev: Record<string, unknown>, next: Record<string, unknown>): Record<string, unknown> {
+    const changes: Record<string, unknown> = {};
+    for (const key of Object.keys(next) as Array<keyof GatewayStatus>) {
+      const prevValue = prev[key];
+      const nextValue = next[key];
+      if (JSON.stringify(prevValue) !== JSON.stringify(nextValue)) {
+        changes[key] = nextValue;
+      }
+    }
+    return changes;
   }
 
   /**

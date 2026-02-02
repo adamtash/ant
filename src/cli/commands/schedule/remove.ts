@@ -30,7 +30,7 @@ export async function scheduleRemove(cfg: AntConfig, jobId: string, options: Sch
   const base = `http://${cfg.ui.host}:${cfg.ui.port}`;
 
   try {
-    const res = await fetch(`${base}/api/schedule/${encodeURIComponent(jobId)}`, {
+    const res = await fetch(`${base}/api/jobs/${encodeURIComponent(jobId)}`, {
       method: "DELETE",
     });
 

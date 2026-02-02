@@ -1,0 +1,145 @@
+# Known Issues
+
+This file tracks recurring issues and their solutions for autonomous fixing by the Main Agent.
+
+## Format
+
+```
+## Issue ID: [unique-id]
+**Description**: Brief description
+**Pattern**: Log pattern to match
+**Root Cause**: Why it happens
+**Solution**: How to fix
+**Fixed**: true/false
+**Auto-Fixable**: true/false
+```
+
+---
+
+## Issue ID: INTEGRATION-TEST-TIMEOUT
+**Description**: Integration tests timeout after 120s (vs 300ms normally)
+**Pattern**: "npm test hanging" or "tests have gateway timeout issues" or "Gateway failed to start (timeout after 15000ms)"
+**Root Cause**: Gateway integration tests start server on port 5117, conflicts with running instance
+**Solution**: 
+1. Stop running ant instance before testing, OR
+2. Use different port for tests (configurable), OR
+3. Skip integration tests with `npm run test:unit`
+**Fixed**: false
+**Auto-Fixable**: false (requires architectural change)
+**Workaround**: Use `npm run test:unit` for quick unit test validation
+
+## Issue ID: CLI-PROVIDER-TIMEOUT
+**Description**: CLI providers (Kimi/Copilot) time out after 120s during complex tasks
+**Pattern**: "Provider call timed out after 120000ms" or "Command timed out after 120000ms"
+**Root Cause**: Complex tasks with many tool calls exceed default 120s timeout
+**Solution**: 
+1. Increase timeoutMs in ant.config.json (e.g., 300000 for 5 min)
+2. Break tasks into smaller sub-tasks
+3. Use different provider for complex tasks
+**Fixed**: false
+**Auto-Fixable**: false (user preference)
+**Note**: Current config has timeoutMs: 1200000 - may need increase for heavy tasks
+
+## Issue ID: CODEX-CLI-PROMPT-ARG
+**Description**: Codex CLI fails with "unexpected argument '-q'"
+**Pattern**: "error: unexpected argument '-q' found" or "CLI codex error"
+**Root Cause**: Codex CLI expects prompt via stdin when args include "-" (exec mode), but code passed "-q"
+**Solution**:
+1. When args include "-" (stdin prompt), write the prompt to stdin instead of using -q
+2. Otherwise pass prompt as positional argument
+**Fixed**: true (updated runCLI prompt handling)
+**Auto-Fixable**: true
+
+## Issue ID: ESLINT-MISSING
+**Description**: Lint fails because eslint binary is missing
+**Pattern**: "eslint: command not found"
+**Root Cause**: eslint is not installed in node_modules/.bin
+**Solution**:
+1. Install eslint as a dev dependency, OR
+2. Skip lint in environments without eslint
+**Fixed**: false
+**Auto-Fixable**: false (depends on environment constraints)
+
+## Issue ID: WHATSAPP-RECONNECT-CONFLICT
+**Description**: WhatsApp stream error on reconnect (conflict replaced)
+**Pattern**: "stream:error conflict replaced"
+**Root Cause**: WhatsApp Web session conflict when reconnecting
+**Solution**: Automatic - Baileys handles reconnection with backoff
+**Fixed**: true
+**Auto-Fixable**: true (handled by Baileys library)
+**Note**: Normal behavior, no action needed
+
+## Issue ID: UNCOMMITTED-CHANGES
+**Description**: Large number of uncommitted changes accumulating
+**Pattern**: "[X] uncommitted changes" in logs
+**Root Cause**: Active development without regular commits
+**Solution**: Review changes and commit when stable
+**Fixed**: false
+**Auto-Fixable**: false (requires human decision)
+**Note**: 77+ uncommitted changes including HARDENING_PLAN.md, UI_FIX_PLAN.md, etc.
+
+## Issue ID: MEMORY-DB-SCHEMA
+**Description**: Memory database schema mismatch (historical)
+**Pattern**: "Schema mismatch in memory.sqlite" or "missing 'updated_at' column"
+**Root Cause**: Old SQLite schema vs new code expecting different columns
+**Solution**: 
+1. Delete .ant/memory.sqlite to reset, OR
+2. Run migration if migration tool available
+**Fixed**: true (resolved by fresh setup)
+**Auto-Fixable**: true (delete and reindex)
+**Note**: No longer occurring since memory.sqlite not present
+
+## Issue ID: ESM-CJS-COMPATIBILITY
+**Description**: "require is not defined" in ESM modules
+**Pattern**: "ReferenceError: require is not defined"
+**Root Cause**: Using require() in ESM (TypeScript compiled to ESM)
+**Solution**: Replace require() with ESM import syntax
+**Fixed**: true (fixed in event-store.ts:425)
+**Auto-Fixable**: true
+**Example Fix**: 
+- Before: `const fs = require('node:fs')`
+- After: `import fs from 'node:fs/promises'`
+
+## Issue ID: UNIT-TEST-MOCK-MISSING
+**Description**: Unit tests fail due to missing mock for getDefinitionsForPolicy
+**Pattern**: "should execute tools" or "should respect max iterations" failing
+**Root Cause**: Tests didn't mock new getDefinitionsForPolicy method
+**Solution**: Add mock for getDefinitionsForPolicy in test setup
+**Fixed**: true (fixed in tests/unit/agent/engine.test.ts)
+**Auto-Fixable**: true
+
+---
+
+## Open Issues (Not Yet Fixed)
+
+1. **Integration Test Port Conflict** - Needs architectural change (dynamic test ports)
+2. **Kimi CLI Timeout on Complex Tasks** - May need timeout adjustment or provider switching
+3. **Uncommitted Changes Accumulation** - Needs git workflow decision
+
+## Issue ID: INTEGRATION-TEST-PORT-CONFLICT
+**Description**: Integration tests intermittently fail with ECONNREFUSED on 127.0.0.1:18000
+**Pattern**: "connect ECONNREFUSED 127.0.0.1:18000" or "Gateway failed to start (timeout after 15000ms)"
+**Root Cause**: findAvailablePort() could race by returning a port that is free at check time but used before server binds.
+**Solution**: Use ephemeral port selection (0) and read actual bound port from server.address().
+**Fixed**: true (tests/integration/setup.ts)
+**Auto-Fixable**: true
+
+## Issue ID: CODEX-MODEL-REFRESH-TIMEOUT
+**Description**: Codex CLI logs "failed to refresh available models: timeout waiting for child process to exit"
+**Pattern**: "codex_core::models_manager::manager: failed to refresh available models: timeout waiting for child process to exit"
+**Root Cause**: Codex CLI model manager refresh hangs or takes too long to exit.
+**Solution**:
+1. Retry with provider fallback (copilot/kimi) for the task.
+2. Restart/update codex CLI if the error persists.
+**Fixed**: false
+**Auto-Fixable**: false
+
+## Issue ID: SESSION-NOT-FOUND-WARN
+**Description**: Router warns "Session not found and could not be recovered" for system/cron sessions.
+**Pattern**: "Session not found and could not be recovered"
+**Root Cause**: sendToSession expects session keys like channel:type:chatId; cron/main-agent session keys (e.g., cron:flight:light-check) lack a channel for recovery.
+**Solution**:
+1. Pre-register system sessions or send via channel-specific adapters.
+2. Optionally downgrade or suppress warnings for system-only sessions.
+**Fixed**: false
+**Auto-Fixable**: false

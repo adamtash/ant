@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { AgentEngine, type AgentEngineConfig } from "../../../src/agent/engine.js";
 import { ToolRegistry } from "../../../src/agent/tool-registry.js";
 import { ProviderManager } from "../../../src/agent/providers.js";
-import type { AgentConfig, AgentInput, Message } from "../../../src/agent/types.js";
+import type { AgentConfig, AgentInput, Message, ToolDefinition } from "../../../src/agent/types.js";
 
 // Mock logger
 const mockLogger = {
@@ -24,6 +24,9 @@ const mockToolRegistry = {
 
 // Mock provider
 const mockProvider = {
+  id: "test-provider",
+  type: "openai",
+  model: "test-model",
   chat: vi.fn(),
   getName: vi.fn(() => "test-provider"),
   getModel: vi.fn(() => "test-model"),
@@ -31,7 +34,21 @@ const mockProvider = {
 
 // Mock provider manager
 const mockProviderManager = {
-  selectBestProvider: vi.fn(() => mockProvider),
+  selectBestProvider: vi.fn(async () => mockProvider),
+  getPrioritizedProviderIds: vi.fn((id: string) => [id, "fallback-provider"]),
+  getProviderById: vi.fn((id: string) => id === "test-provider" ? mockProvider : null),
+  getProviderIds: vi.fn(() => ["test-provider", "fallback-provider"]),
+  getProvider: vi.fn(() => mockProvider),
+  isProviderCoolingDown: vi.fn(() => false),
+  recordProviderFailure: vi.fn(() => ({
+    opened: true,
+    attempt: 1,
+    cooldownMs: 2000,
+    cooldownUntil: Date.now() + 2000,
+    reason: "unknown",
+  })),
+  recordProviderSuccess: vi.fn(() => ({ recovered: false })),
+  markAuthFailure: vi.fn(),
   initialize: vi.fn(),
 } as unknown as ProviderManager;
 
@@ -39,9 +56,8 @@ describe("AgentEngine", () => {
   let engine: AgentEngine;
 
   const defaultConfig: AgentConfig = {
-    name: "test-agent",
     maxToolIterations: 3,
-    maxHistoryTokens: 4000,
+    maxHistoryTokens: 12000,
     temperature: 0.7,
   };
 
@@ -84,6 +100,7 @@ describe("AgentEngine", () => {
       const input: AgentInput = {
         sessionKey: "test-session",
         query: "Say hello",
+        channel: "cli",
         chatId: "test-chat",
       };
 
@@ -114,9 +131,21 @@ describe("AgentEngine", () => {
         });
 
       // Set up the mock to return a tool definition so the tool is allowed
-      mockToolRegistry.getDefinitionsForPolicy = vi.fn(() => [
-        { type: "function", function: { name: "test-tool", description: "Test tool" } },
-      ]);
+      const toolDefs: ToolDefinition[] = [
+        {
+          type: "function",
+          function: {
+            name: "test-tool",
+            description: "Test tool",
+            parameters: {
+              type: "object",
+              properties: {},
+              required: [],
+            },
+          },
+        },
+      ];
+      mockToolRegistry.getDefinitionsForPolicy = vi.fn(() => toolDefs);
 
       mockToolRegistry.execute = vi.fn().mockResolvedValue({
         ok: true,
@@ -126,6 +155,7 @@ describe("AgentEngine", () => {
       const input: AgentInput = {
         sessionKey: "test-session",
         query: "Run a tool",
+        channel: "cli",
         chatId: "test-chat",
       };
 
@@ -146,6 +176,7 @@ describe("AgentEngine", () => {
       const input: AgentInput = {
         sessionKey: "test-session",
         query: "Cause an error",
+        channel: "cli",
         chatId: "test-chat",
       };
 
@@ -170,9 +201,21 @@ describe("AgentEngine", () => {
       });
 
       // Set up the mock to return a tool definition so the tool is allowed
-      mockToolRegistry.getDefinitionsForPolicy = vi.fn(() => [
-        { type: "function", function: { name: "looping-tool", description: "Looping tool" } },
-      ]);
+      const toolDefs: ToolDefinition[] = [
+        {
+          type: "function",
+          function: {
+            name: "looping-tool",
+            description: "Looping tool",
+            parameters: {
+              type: "object",
+              properties: {},
+              required: [],
+            },
+          },
+        },
+      ];
+      mockToolRegistry.getDefinitionsForPolicy = vi.fn(() => toolDefs);
 
       mockToolRegistry.execute = vi.fn().mockResolvedValue({
         ok: true,
@@ -182,6 +225,7 @@ describe("AgentEngine", () => {
       const input: AgentInput = {
         sessionKey: "test-session",
         query: "Loop forever",
+        channel: "cli",
         chatId: "test-chat",
       };
 
@@ -202,6 +246,7 @@ describe("AgentEngine", () => {
       const input: AgentInput = {
         sessionKey: "test-session",
         query: "Think about something",
+        channel: "cli",
         chatId: "test-chat",
       };
 

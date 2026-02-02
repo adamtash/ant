@@ -59,6 +59,9 @@ export interface ColonyState {
   selectedAntId: string | null;
   hoveredAntId: string | null;
 
+  // Queen attendants
+  queenAttendantIds: string[];
+
   // Actions
   initialize: (width: number, height: number) => void;
   tick: (deltaTime: number) => void;
@@ -83,6 +86,8 @@ export interface ColonyState {
   activateQueen: () => void;
   deactivateQueen: () => void;
   setQueenThinking: (thinking: boolean) => void;
+  ensureQueenAttendants: (count?: number) => void;
+  clearQueenAttendants: () => void;
 
   // Chamber management
   addChamber: (chamber: Chamber) => void;
@@ -127,6 +132,7 @@ export const useColonyStore = create<ColonyState>((set, get) => ({
   zoom: 1,
   selectedAntId: null,
   hoveredAntId: null,
+  queenAttendantIds: [],
 
   // Initialize colony
   initialize: (width: number, height: number) => {
@@ -402,6 +408,7 @@ export const useColonyStore = create<ColonyState>((set, get) => ({
       tickCount: 0,
       selectedAntId: null,
       hoveredAntId: null,
+      queenAttendantIds: [],
     });
     get().initialize(width, height);
   },
@@ -506,6 +513,40 @@ export const useColonyStore = create<ColonyState>((set, get) => ({
       queen.setThinking(thinking);
       set({ queen });
     }
+  },
+
+  ensureQueenAttendants: (count: number = 3) => {
+    const state = get();
+    if (!state.queen) return;
+
+    const existing = state.queenAttendantIds.filter((id) => state.ants.has(id));
+    const nextIds = [...existing];
+
+    const queenPos = state.queen.position;
+    for (let i = existing.length; i < count; i++) {
+      const angle = (i / Math.max(count, 1)) * Math.PI * 2;
+      const position = {
+        x: queenPos.x + Math.cos(angle) * 45,
+        y: queenPos.y + Math.sin(angle) * 45,
+      };
+      const id = state.spawnAnt('nurse', position);
+      const ant = get().ants.get(id);
+      if (ant) {
+        ant.setState('nursing');
+        ant.setTarget(queenPos);
+      }
+      nextIds.push(id);
+    }
+
+    set({ queenAttendantIds: nextIds });
+  },
+
+  clearQueenAttendants: () => {
+    const state = get();
+    for (const id of state.queenAttendantIds) {
+      state.removeAnt(id);
+    }
+    set({ queenAttendantIds: [] });
   },
 
   // Chamber management

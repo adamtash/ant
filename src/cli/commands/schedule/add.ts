@@ -87,7 +87,7 @@ export async function scheduleAdd(
       };
     }
 
-    const res = await fetch(`${base}/api/schedule`, {
+    const res = await fetch(`${base}/api/jobs`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),

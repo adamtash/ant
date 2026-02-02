@@ -32,7 +32,7 @@ export const LIFESPAN = {
   worker: 180000,  // ~50 minutes (3-5 task cycles)
   soldier: 360000, // ~100 minutes (longer for monitoring)
   nurse: 240000,   // ~66 minutes
-  forager: 120000, // ~33 minutes (shorter, risky work)
+  forager: 1200000, // ~330 minutes (shorter, risky work)
   architect: 200000, // ~55 minutes
   drone: 300000,    // ~8 minutes (short, scheduled)
 } as const;

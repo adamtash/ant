@@ -20,6 +20,9 @@ export interface StartOptions {
  */
 export async function start(cfg: AntConfig, options: StartOptions = {}): Promise<void> {
   const out = new OutputFormatter({ quiet: options.quiet });
+  const gatewayHost = cfg.gateway?.host ?? cfg.ui.host;
+  const gatewayPort = cfg.gateway?.port ?? cfg.ui.port;
+  const uiUrl = cfg.ui.openUrl || `http://${gatewayHost}:${gatewayPort}`;
 
   // Ensure directories exist
   await ensureRuntimePaths(cfg);
@@ -59,8 +62,7 @@ export async function start(cfg: AntConfig, options: StartOptions = {}): Promise
     out.success(`Agent started in background (PID: ${child.pid})`);
 
     if (cfg.ui.enabled) {
-      const url = cfg.ui.openUrl || `http://${cfg.ui.host}:${cfg.ui.port}`;
-      out.info(`Web UI will be available at: ${url}`);
+      out.info(`Web UI will be available at: ${uiUrl}`);
     }
   } else {
     // Start in foreground
@@ -99,17 +101,25 @@ export async function start(cfg: AntConfig, options: StartOptions = {}): Promise
 
     // Initialize WhatsApp Adapter
     const whatsapp = new WhatsAppAdapter({
-        cfg,
-        logger,
-        // onStatusUpdate handled by adapter events/router
+      cfg,
+      logger,
+      // onStatusUpdate handled by adapter events/router
     });
 
-    try {
+    if (process.env.NODE_ENV === "test") {
+      router.registerAdapter(whatsapp);
+      logger.info("WhatsApp adapter registered (test mode)");
+    } else {
+      try {
         await whatsapp.start();
         router.registerAdapter(whatsapp);
         logger.info("WhatsApp adapter registered");
-    } catch (err) {
-        logger.error({ error: err instanceof Error ? err.message : String(err) }, "Failed to start WhatsApp adapter");
+      } catch (err) {
+        logger.error(
+          { error: err instanceof Error ? err.message : String(err) },
+          "Failed to start WhatsApp adapter"
+        );
+      }
     }
 
     const sessionManager = new SessionManager({
@@ -133,6 +143,7 @@ export async function start(cfg: AntConfig, options: StartOptions = {}): Promise
         providers: cfg.resolved.providers.items as any,
         defaultProvider: cfg.resolved.providers.default,
         routing: cfg.resolved.routing,
+        fallbackChain: cfg.resolved.providers.fallbackChain,
       },
 
       logger,
@@ -140,6 +151,20 @@ export async function start(cfg: AntConfig, options: StartOptions = {}): Promise
       stateDir: cfg.resolved.stateDir,
       toolPolicies: cfg.toolPolicies,
       sessionManager,
+      onProviderError: async (params) => {
+        const errorMsg = params.retryingProvider
+          ? `❌ ${params.failedProvider} failed: ${params.error}\n\n⏳ Trying ${params.retryingProvider}...`
+          : `❌ ${params.failedProvider} failed: ${params.error}`;
+        
+        try {
+          await router.sendToSession(params.sessionKey, errorMsg);
+        } catch (err) {
+          logger.warn(
+            { error: err instanceof Error ? err.message : String(err), sessionKey: params.sessionKey },
+            "Failed to send provider error notification"
+          );
+        }
+      },
     });
 
     // Set up message routing from router to agent engine
@@ -190,8 +215,12 @@ export async function start(cfg: AntConfig, options: StartOptions = {}): Promise
 
     // Initialize Memory Manager
     const memoryManager = new MemoryManager(cfg);
-    await memoryManager.start();
-    logger.info("Memory manager started");
+    if (process.env.NODE_ENV === "test" && !cfg.memory.enabled) {
+      logger.info("Memory manager skipped (test mode)");
+    } else {
+      await memoryManager.start();
+      logger.info("Memory manager started");
+    }
 
     // Initialize Scheduler
     const scheduler = new Scheduler({
@@ -223,8 +252,8 @@ export async function start(cfg: AntConfig, options: StartOptions = {}): Promise
     
     const server = new GatewayServer({
       config: {
-        port: cfg.ui.port,
-        host: cfg.ui.host,
+        port: gatewayPort,
+        host: gatewayHost,
         stateDir: cfg.resolved.stateDir,
         staticDir: cfg.resolved.uiStaticDir,
         logFilePath: cfg.resolved.logFilePath,
@@ -267,8 +296,7 @@ export async function start(cfg: AntConfig, options: StartOptions = {}): Promise
 
     out.success("Agent runtime started");
     if (cfg.ui.enabled) {
-      const url = cfg.ui.openUrl || `http://${cfg.ui.host}:${cfg.ui.port}`;
-      out.info(`Web UI available at: ${url}`);
+      out.info(`Web UI available at: ${uiUrl}`);
     }
 
     // Keep running until interrupted

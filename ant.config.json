@@ -1,7 +1,7 @@
 {
   "workspaceDir": "~",
   "providers": {
-    "default": "lmstudio",
+    "default": "copilot",
     "items": {
       "lmstudio": {
         "type": "openai",
@@ -27,7 +27,7 @@
       "copilot": {
         "type": "cli",
         "cliProvider": "copilot",
-        "model": "gpt-4.1",
+        "model": "gpt-5-mini",
          "args": [
           "--yolo",
           "--no-ask-user",
@@ -42,17 +42,19 @@
         "model": "kimi-k2",
         "command": "kimi",
         "args": ["--yolo"],
-        "timeoutMs": 120000
+        "timeoutMs": 1200000
       }
-    }
+    },
+    "fallbackChain": ["copilot", "codex-cli"]
   },
 
   "routing": {
-    "chat": "kimi",
-    "tools": "kimi",
+    "chat": "copilot",
+    "tools": "copilot",
     "embeddings": "lmstudio",
-    "parentForCli": "kimi"
+    "parentForCli": "copilot"
   },
+
   "ui": {
     "enabled": true,
     "host": "127.0.0.1",
@@ -79,12 +81,12 @@
     "enabled": true,
     "indexSessions": true,
     "sqlitePath": "./.ant/memory.sqlite",
-    "embeddingsModel": "text-embedding-nomic-embed-text-v1.5"
+    "embeddingsModel": "qwen3-embedding-0.6b-dwq"
   },
   "agent": {
     "systemPrompt": "",
     "toolLoop": {
-      "timeoutPerIterationMs": 120000
+      "timeoutPerIterationMs": 1200000
     }
   },
   "subagents": {
@@ -92,7 +94,7 @@
   },
   "cliTools": {
     "enabled": true,
-    "timeoutMs": 120000,
+    "timeoutMs": 1200000,
     "providers": {
       "codex": {
         "command": "codex",

@@ -113,6 +113,9 @@ export class MessageRouter extends EventEmitter {
   private readonly sessionQueues: Map<string, QueuedMessage[]> = new Map();
   private readonly sessionProcessing: Map<string, number> = new Map();
 
+  /** Typing indicator tracking: key = "channel:chatId", value = interval ID */
+  private readonly typingIndicators: Map<string, NodeJS.Timeout> = new Map();
+
   /** Cleanup interval */
   private cleanupInterval: NodeJS.Timeout | null = null;
   
@@ -156,10 +159,83 @@ export class MessageRouter extends EventEmitter {
       this.cleanupInterval = null;
     }
 
+    // Clear all typing indicators
+    for (const interval of this.typingIndicators.values()) {
+      clearInterval(interval);
+    }
+    this.typingIndicators.clear();
+
     // Wait for queues to drain
     await this.drainQueues();
 
     this.logger.info("Message router stopped");
+  }
+
+  // ==========================================================================
+  // Typing Indicator Management
+  // ==========================================================================
+
+  /**
+   * Start a persistent typing indicator
+   * Sends typing every 3 seconds to keep it visible in WhatsApp
+   */
+  private startTypingIndicator(channel: Channel, chatId: string): void {
+    const key = `${channel}:${chatId}`;
+    
+    // If already running, don't restart
+    if (this.typingIndicators.has(key)) {
+      return;
+    }
+
+    this.logger.debug({ channel, chatId }, "Starting typing indicator");
+
+    // Send initial typing indicator
+    this.sendTypingUpdate(channel, chatId, true).catch((err) => {
+      this.logger.debug({ error: String(err), channel, chatId }, "Failed to send initial typing indicator");
+    });
+
+    // Refresh every 3 seconds (WhatsApp typing expires after ~30 seconds)
+    const interval = setInterval(() => {
+      this.sendTypingUpdate(channel, chatId, true).catch((err) => {
+        this.logger.debug({ error: String(err), channel, chatId }, "Failed to refresh typing indicator");
+      });
+    }, 3000);
+
+    this.typingIndicators.set(key, interval);
+  }
+
+  /**
+   * Stop a typing indicator
+   */
+  private stopTypingIndicator(channel: Channel, chatId: string): void {
+    const key = `${channel}:${chatId}`;
+    const interval = this.typingIndicators.get(key);
+
+    if (interval) {
+      clearInterval(interval);
+      this.typingIndicators.delete(key);
+      this.logger.debug({ channel, chatId }, "Stopped typing indicator");
+    }
+
+    // Send final "paused" update to clear the indicator
+    this.sendTypingUpdate(channel, chatId, false).catch((err) => {
+      this.logger.debug({ error: String(err), channel, chatId }, "Failed to send paused typing update");
+    });
+  }
+
+  /**
+   * Send a typing update to the adapter
+   */
+  private async sendTypingUpdate(channel: Channel, chatId: string, isTyping: boolean): Promise<void> {
+    const adapter = this.adapters.get(channel);
+    if (!adapter) {
+      return;
+    }
+
+    // Check if adapter has sendTyping method (WhatsApp specific)
+    if (typeof (adapter as any).sendTyping === "function") {
+      await (adapter as any).sendTyping(chatId, isTyping);
+    }
   }
 
   // ==========================================================================
@@ -413,6 +489,11 @@ export class MessageRouter extends EventEmitter {
 
     this.events.messageProcessing({ handler: "agent" }, { sessionKey, channel }).catch(() => {});
 
+    // Start typing indicator (only if chatId is defined)
+    if (item.message.context.chatId) {
+      this.startTypingIndicator(channel, item.message.context.chatId);
+    }
+
     const timeoutPromise = new Promise<never>((_, reject) => {
       setTimeout(
         () =>
@@ -456,6 +537,11 @@ export class MessageRouter extends EventEmitter {
           .catch(() => {});
       })
       .finally(() => {
+        // Stop typing indicator (only if chatId is defined)
+        if (item.message.context.chatId) {
+          this.stopTypingIndicator(channel, item.message.context.chatId);
+        }
+
         if (this.sessionOrderingEnabled) {
           const current = this.sessionProcessing.get(sessionKey) ?? 1;
           this.sessionProcessing.set(sessionKey, Math.max(0, current - 1));

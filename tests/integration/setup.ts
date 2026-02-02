@@ -98,10 +98,14 @@ export async function findAvailablePort(startPort = 18000): Promise<number> {
       });
 
       server.once("listening", () => {
-        server.close(() => resolve(port));
+        const address = server.address();
+        const resolvedPort =
+          typeof address === "object" && address ? address.port : port;
+        server.close(() => resolve(resolvedPort));
       });
 
-      server.listen(port, "127.0.0.1");
+      const listenPort = port === 0 ? 0 : port;
+      server.listen(listenPort, "127.0.0.1");
     };
 
     tryPort();
@@ -141,6 +145,7 @@ async function createTestConfig(config: TestEnvConfig): Promise<void> {
       port: config.uiPort,
       host: "127.0.0.1",
       autoOpen: false,
+      staticDir: path.join(config.tempDir, "ui-dist"),
     },
     whatsapp: {
       sessionDir: path.join(config.tempDir, ".ant", "whatsapp"),
@@ -148,10 +153,11 @@ async function createTestConfig(config: TestEnvConfig): Promise<void> {
       mentionOnly: true,
       respondToSelfOnly: true,
       allowSelfMessages: true,
+      resetOnLogout: false,
     },
     memory: {
       enabled: config.enableMemory,
-      indexSessions: true,
+      indexSessions: config.enableMemory,
       sqlitePath: path.join(config.tempDir, ".ant", "memory.sqlite"),
       embeddingsModel: "text-embedding-test",
       sync: {
@@ -162,7 +168,7 @@ async function createTestConfig(config: TestEnvConfig): Promise<void> {
       },
     },
     agent: {
-      maxHistoryTokens: 4000,
+      maxHistoryTokens: 12000,
       temperature: 0.2,
     },
     mainAgent: {
@@ -231,8 +237,8 @@ export async function spawnTestInstance(
 ): Promise<TestInstance> {
   const testId = generateTestId();
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), `ant-test-${testId}-`));
-  const gatewayPort = await findAvailablePort(18000);
-  const uiPort = await findAvailablePort(gatewayPort + 1);
+  const gatewayPort = await findAvailablePort(0);
+  const uiPort = await findAvailablePort(0);
   const configPath = path.join(tempDir, "test.config.json");
 
   const config: TestEnvConfig = {

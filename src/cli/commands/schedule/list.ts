@@ -40,14 +40,15 @@ export async function scheduleList(cfg: AntConfig, options: ScheduleListOptions 
   const base = `http://${cfg.ui.host}:${cfg.ui.port}`;
 
   try {
-    const res = await fetch(`${base}/api/schedule`);
+    const res = await fetch(`${base}/api/jobs`);
 
     if (!res.ok) {
       const error = await res.text();
       throw new RuntimeError(`Failed to get scheduled jobs: ${error}`);
     }
 
-    const jobs = (await res.json()) as ScheduleJob[];
+    const payload = (await res.json()) as { jobs?: ScheduleJob[] };
+    const jobs = payload.jobs ?? [];
 
     if (options.json) {
       out.json(jobs);

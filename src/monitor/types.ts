@@ -21,6 +21,15 @@ export type EventType =
   | "message_processed"
   | "message_dropped"
   | "message_timeout"
+  | "task_created"
+  | "task_started"
+  | "task_completed"
+  | "task_status_changed"
+  | "task_phase_changed"
+  | "task_progress_updated"
+  | "task_timeout_warning"
+  | "task_timeout"
+  | "task_retry_scheduled"
   | "tool_executing"
   | "tool_executed"
   | "tool_part_updated"
@@ -108,6 +117,72 @@ export interface MessageTimeoutData {
   stage: string;
 }
 
+export interface TaskStartedData {
+  taskId: string;
+  description: string;
+}
+
+export interface TaskCreatedData {
+  taskId: string;
+  description: string;
+  createdAt: number;
+  parentTaskId?: string;
+  lane?: string;
+}
+
+export interface TaskCompletedData {
+  taskId: string;
+  result?: unknown;
+  error?: string;
+}
+
+export interface TaskStatusChangedData {
+  taskId: string;
+  parentTaskId?: string;
+  previousState: string;
+  newState: string;
+  reason?: string;
+  timestamp: number;
+}
+
+export interface TaskPhaseChangedData {
+  taskId: string;
+  previousPhase: string | null;
+  newPhase: string;
+  timestamp: number;
+}
+
+export interface TaskProgressUpdatedData {
+  taskId: string;
+  parentTaskId?: string;
+  phase: string | null;
+  progress: {
+    completed: number;
+    total: number;
+    lastUpdate: number;
+    message?: string;
+  };
+  timestamp: number;
+}
+
+export interface TaskTimeoutWarningData {
+  taskId: string;
+  msUntilTimeout: number;
+}
+
+export interface TaskTimeoutData {
+  taskId: string;
+  reason: string;
+  timestamp: number;
+}
+
+export interface TaskRetryScheduledData {
+  taskId: string;
+  attempt: number;
+  nextRetryAt: number;
+  backoffMs: number;
+}
+
 export interface ToolExecutingData {
   name: string;
   args?: Record<string, unknown>;
@@ -131,6 +206,7 @@ export interface AgentThinkingData {
   iterationCount?: number;
   toolsUsed?: string[];
   elapsed?: number;
+  agentType?: "agent" | "subagent";
 }
 
 export interface AgentResponseData {
@@ -138,12 +214,18 @@ export interface AgentResponseData {
   toolsUsed: string[];
   duration: number;
   success: boolean;
+  responsePreview?: string;
+  promptPreview?: string;
+  providerId?: string;
+  model?: string;
+  agentType?: "agent" | "subagent";
 }
 
 export interface SubagentSpawnedData {
   subagentId: string;
   task: string;
   parentSessionKey?: string;
+  parentTaskId?: string;
 }
 
 export interface CronTriggeredData {
@@ -265,6 +347,15 @@ export type EventData =
   | MessageProcessedData
   | MessageDroppedData
   | MessageTimeoutData
+  | TaskCreatedData
+  | TaskStartedData
+  | TaskCompletedData
+  | TaskStatusChangedData
+  | TaskPhaseChangedData
+  | TaskProgressUpdatedData
+  | TaskTimeoutWarningData
+  | TaskTimeoutData
+  | TaskRetryScheduledData
   | ToolExecutingData
   | ToolExecutedData
   | ToolPartUpdatedData

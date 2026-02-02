@@ -244,6 +244,10 @@ export class ProviderManager {
   private readonly config: ProviderManagerConfig;
   private readonly logger: Logger;
   private readonly healthCache: Map<string, { ok: boolean; checkedAt: number }> = new Map();
+  private readonly failureCounts: Map<string, number> = new Map();
+  private readonly cooldownUntil: Map<string, number> = new Map();
+  private readonly cooldownBaseMs = 2000;
+  private readonly cooldownMaxMs = 5 * 60 * 1000;
 
   constructor(config: ProviderManagerConfig, logger: Logger) {
     this.config = config;
@@ -319,11 +323,11 @@ export class ProviderManager {
     const providerId = this.config.routing?.[action] || this.config.defaultProvider;
     const provider = this.providers.get(providerId);
 
-    if (!provider) {
+    if (!provider || this.isProviderCoolingDown(providerId)) {
       // Try fallback chain
       for (const fallbackId of this.config.fallbackChain || []) {
         const fallback = this.providers.get(fallbackId);
-        if (fallback) {
+        if (fallback && !this.isProviderCoolingDown(fallbackId)) {
           this.logger.debug({ action, fallback: fallbackId }, "Using fallback provider");
           return fallback;
         }
@@ -356,6 +360,10 @@ export class ProviderManager {
     for (const id of preferredOrder) {
       const provider = this.providers.get(id);
       if (provider) {
+        if (this.isProviderCoolingDown(id)) {
+          this.logger.warn({ id, until: this.cooldownUntil.get(id) }, "Provider in cooldown, skipping");
+          continue;
+        }
         this.logger.debug({ id, type: provider.type }, "Checking provider health");
         try {
           const isHealthy = await this.checkProviderHealth(id, provider);
@@ -383,7 +391,41 @@ export class ProviderManager {
     return Array.from(this.providers.keys());
   }
 
+  /**
+   * Get provider IDs with primary provider first, then fallback chain
+   */
+  getPrioritizedProviderIds(primaryProviderId: string): string[] {
+    const all = this.getProviderIds();
+    const prioritized: string[] = [];
+    
+    // Add primary first
+    if (all.includes(primaryProviderId)) {
+      prioritized.push(primaryProviderId);
+    }
+    
+    // Add fallback chain next (in order)
+    if (this.config.fallbackChain) {
+      for (const fallbackId of this.config.fallbackChain) {
+        if (all.includes(fallbackId) && fallbackId !== primaryProviderId) {
+          prioritized.push(fallbackId);
+        }
+      }
+    }
+    
+    // Add remaining providers (shouldn't really get here)
+    for (const id of all) {
+      if (!prioritized.includes(id)) {
+        prioritized.push(id);
+      }
+    }
+    
+    return prioritized;
+  }
+
   private async checkProviderHealth(id: string, provider: LLMProvider): Promise<boolean> {
+    if (this.isProviderCoolingDown(id)) {
+      return false;
+    }
     const cacheTtlMs = this.config.healthCheck?.cacheTtlMs ?? 5 * 60 * 1000;
     const timeoutMs = this.config.healthCheck?.timeoutMs ?? 5000;
     const cached = this.healthCache.get(id);
@@ -409,6 +451,48 @@ export class ProviderManager {
       setTimeout(() => reject(new Error(message)), timeoutMs);
     });
     return Promise.race([promise, timeout]);
+  }
+
+  isProviderCoolingDown(providerId: string): boolean {
+    const until = this.cooldownUntil.get(providerId);
+    if (!until) return false;
+    if (until <= Date.now()) {
+      this.cooldownUntil.delete(providerId);
+      return false;
+    }
+    return true;
+  }
+
+  recordProviderFailure(providerId: string, reason?: FailoverReason | null): {
+    opened: boolean;
+    attempt: number;
+    cooldownMs: number;
+    cooldownUntil: number;
+    reason: FailoverReason | "unknown";
+  } {
+    const attempt = (this.failureCounts.get(providerId) ?? 0) + 1;
+    this.failureCounts.set(providerId, attempt);
+
+    const reasonValue = reason ?? "unknown";
+    const cooldownMs = Math.min(this.cooldownBaseMs * Math.pow(2, attempt - 1), this.cooldownMaxMs);
+    const cooldownUntil = Date.now() + cooldownMs;
+    const opened = !this.isProviderCoolingDown(providerId);
+
+    this.cooldownUntil.set(providerId, cooldownUntil);
+
+    this.logger.warn(
+      { providerId, attempt, cooldownMs, reason: reasonValue },
+      "Provider circuit breaker opened"
+    );
+
+    return { opened, attempt, cooldownMs, cooldownUntil, reason: reasonValue };
+  }
+
+  recordProviderSuccess(providerId: string): { recovered: boolean } {
+    const wasCoolingDown = this.cooldownUntil.has(providerId);
+    this.cooldownUntil.delete(providerId);
+    this.failureCounts.set(providerId, 0);
+    return { recovered: wasCoolingDown };
   }
 }
 
@@ -712,7 +796,7 @@ export class CLIProvider implements LLMProvider {
     this.logger = options.logger;
     this.command = options.command || options.cliType;
     this.args = options.args || [];
-    this.timeoutMs = options.timeoutMs || 120000;
+    this.timeoutMs = options.timeoutMs || 1200000;
   }
 
   async chat(messages: Message[], options?: ChatOptions): Promise<ChatResponse> {
@@ -734,19 +818,29 @@ export class CLIProvider implements LLMProvider {
     // Run CLI command
     const result = await this.runCLI(prompt);
 
-    // Log the result
-    this.logger.info({
+    // Log detailed result information
+    const logLevel = result.ok ? "info" : "error";
+    const logger = this.logger[logLevel as "info" | "error"].bind(this.logger);
+    
+    logger({
       providerId: this.id,
       cliType: this.cliType,
       success: result.ok,
       outputLength: result.output?.length || 0,
-      outputPreview: result.output?.slice(0, 200) + (result.output?.length > 200 ? "..." : ""),
+      outputPreview: result.output?.slice(0, 200) || "(empty)",
       error: result.error,
-    }, "CLI provider chat call completed");
+      ...(result.error && {
+        fullError: result.error.slice(0, 1000),
+      })
+    }, result.ok ? "CLI provider chat call completed" : "CLI provider chat call failed");
 
     if (!result.ok) {
       const detail = this.formatCliError(result.error);
-      this.logger.warn({ cliType: this.cliType, error: detail }, "CLI command failed");
+      this.logger.error({
+        cliType: this.cliType,
+        error: detail,
+        output: result.output?.slice(0, 500) || "(empty)",
+      }, "CLI command failed - will not attempt parsing");
       throw new Error(`CLI ${this.cliType} error: ${detail}`);
     }
 
@@ -802,6 +896,7 @@ export class CLIProvider implements LLMProvider {
   private async runCLI(prompt: string): Promise<{ ok: boolean; output: string; error?: string }> {
     return new Promise((resolve) => {
       const args = [...this.args];
+      let stdinPrompt: string | null = null;
 
       // Add prompt based on CLI type
       switch (this.cliType) {
@@ -812,12 +907,30 @@ export class CLIProvider implements LLMProvider {
           args.push("--prompt", prompt);
           break;
         case "codex":
-          args.push("-q", prompt);
+          if (args.includes("-")) {
+            stdinPrompt = prompt;
+          } else {
+            args.push(prompt);
+          }
           break;
         case "kimi":
           args.push("-p", prompt, "--print");
           break;
       }
+
+      this.logger.debug(
+        {
+          command: this.command,
+          args: args.map((a, i) => {
+            // Don't log the full prompt, just indicate it was passed
+            if (a === prompt) return "[PROMPT_CONTENT]";
+            if (i > 0 && args[i - 1] === "-p" || args[i - 1] === "--prompt") return "[PROMPT_CONTENT]";
+            return a;
+          }),
+          promptLength: prompt.length,
+        },
+        "runCLI: Spawning command"
+      );
 
       let stdout = "";
       let stderr = "";
@@ -826,6 +939,10 @@ export class CLIProvider implements LLMProvider {
       const child = spawn(this.command, args, {
         env: process.env,
       });
+      if (stdinPrompt && child.stdin) {
+        child.stdin.write(stdinPrompt);
+        child.stdin.end();
+      }
 
       const timer = setTimeout(() => {
         timedOut = true;
@@ -842,6 +959,13 @@ export class CLIProvider implements LLMProvider {
 
       child.on("error", (err) => {
         clearTimeout(timer);
+        this.logger.error(
+          {
+            command: this.command,
+            error: err.message,
+          },
+          "runCLI: Spawn error"
+        );
         resolve({
           ok: false,
           output: "",
@@ -849,8 +973,21 @@ export class CLIProvider implements LLMProvider {
         });
       });
 
-        child.on("close", (code) => {
+      child.on("close", (code) => {
         clearTimeout(timer);
+        
+        this.logger.debug(
+          {
+            exitCode: code,
+            stdoutLength: stdout.length,
+            stderrLength: stderr.length,
+            stdoutPreview: stdout.slice(0, 300),
+            stderrFull: stderr.length > 0 ? stderr : undefined,
+            timedOut,
+          },
+          "runCLI: Process closed"
+        );
+        
         if (timedOut) {
           resolve({
             ok: false,
@@ -859,6 +996,17 @@ export class CLIProvider implements LLMProvider {
           });
         } else {
           const error = code !== 0 ? (stderr || stdout || "Command failed") : undefined;
+          
+          if (error) {
+            this.logger.warn(
+              {
+                exitCode: code,
+                error: error.slice(0, 500),
+              },
+              "runCLI: Non-zero exit code"
+            );
+          }
+          
           resolve({
             ok: code === 0,
             output: stdout,
@@ -898,7 +1046,55 @@ export class CLIProvider implements LLMProvider {
    * Parse Kimi CLI output format (ACP protocol) to extract assistant's text
    */
   private parseKimiOutput(output: string): string {
-    if (!output) return "";
+    if (!output) {
+      this.logger.debug(
+        { outputLength: 0 },
+        "parseKimiOutput: Empty output received"
+      );
+      return "";
+    }
+
+    this.logger.debug(
+      {
+        rawOutputLength: output.length,
+        rawOutputFirst500: output.slice(0, 500),
+        fullOutput: output, // Log full output for debugging
+      },
+      "parseKimiOutput: Starting parse"
+    );
+    
+    // Check for error indicators in output
+    const hasError = output.toLowerCase().includes("error");
+    const hasRateLimit = output.toLowerCase().includes("rate") || 
+                         output.toLowerCase().includes("limit") ||
+                         output.toLowerCase().includes("429");
+    
+    if (hasError || hasRateLimit) {
+      this.logger.warn(
+        {
+          rawOutput: output,
+          contains: {
+            error: hasError,
+            rate: output.toLowerCase().includes("rate"),
+            limit: output.toLowerCase().includes("limit"),
+            _429: output.toLowerCase().includes("429"),
+          }
+        },
+        "parseKimiOutput: Detected potential error in output"
+      );
+
+      // If it's a rate limit error, throw so fallback/retry logic can kick in
+      if (hasRateLimit) {
+        const errorMsg = output.includes("429") 
+          ? "HTTP 429: Rate limit reached"
+          : "Rate limit (too many requests)";
+        this.logger.error(
+          { output: output.slice(0, 500) },
+          `parseKimiOutput: Throwing rate limit error for retry`
+        );
+        throw new Error(errorMsg);
+      }
+    }
     
     // Strip any echo of the input prompt that appears before the first TurnBegin
     const firstTurnBegin = output.indexOf("TurnBegin(");
@@ -924,12 +1120,21 @@ export class CLIProvider implements LLMProvider {
       turns.push(currentTurn.join("\n"));
     }
     
+    this.logger.debug(
+      { turnCount: turns.length, turnsPreview: turns.slice(0, 3) },
+      "parseKimiOutput: Split into turns"
+    );
+    
     const textParts: string[] = [];
     
     for (const turn of turns) {
       // Skip turns with loop control messages (these are Kimi's internal loop controls)
       if (turn.includes("You are running in an automated loop") ||
           turn.includes("Available branches:")) {
+        this.logger.debug(
+          { skippedTurnPreview: turn.slice(0, 100) },
+          "parseKimiOutput: Skipped loop control turn"
+        );
         continue;
       }
       
@@ -937,8 +1142,10 @@ export class CLIProvider implements LLMProvider {
       // TextPart can be multiline, so we need to match across lines
       const textPartRegex = /TextPart\([\s\S]*?type=['"]text['"][\s\S]*?text=['"]([\s\S]*?)['"]\s*\)/g;
       let match;
+      let foundTextParts = 0;
       
       while ((match = textPartRegex.exec(turn)) !== null) {
+        foundTextParts++;
         let text = match[1];
         
         // Unescape quotes
@@ -946,16 +1153,44 @@ export class CLIProvider implements LLMProvider {
         
         // Skip if it looks like system or user content
         if (text.startsWith("System:") || text.startsWith("User:")) {
+          this.logger.debug(
+            { skippedText: text.slice(0, 50) },
+            "parseKimiOutput: Skipped system/user content"
+          );
           continue;
         }
         
+        this.logger.debug(
+          { textLength: text.length, textPreview: text.slice(0, 100) },
+          "parseKimiOutput: Extracted TextPart"
+        );
         textParts.push(text);
       }
+      
+      if (foundTextParts === 0) {
+        this.logger.debug(
+          { turnPreview: turn.slice(0, 200) },
+          "parseKimiOutput: Turn had no TextPart blocks"
+        );
+      }
     }
+    
+    this.logger.debug(
+      { textPartCount: textParts.length },
+      "parseKimiOutput: Extracted text parts"
+    );
     
     // Join and clean up
     let result = textParts.join("\n").trim();
     result = result.replace(/<choice>.*?<\/choice>/gs, "").trim();
+    
+    this.logger.debug(
+      {
+        resultLength: result.length,
+        resultPreview: result.slice(0, 200),
+      },
+      "parseKimiOutput: Final result"
+    );
     
     return result;
   }

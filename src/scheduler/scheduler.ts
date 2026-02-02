@@ -10,6 +10,7 @@
  */
 
 import cron from "node-cron";
+import cronParser from "cron-parser";
 
 import { JobStore } from "./job-store.js";
 import { JobExecutor, type ExecutorDependencies } from "./job-executor.js";
@@ -104,6 +105,7 @@ export class Scheduler {
     maxRetries?: number;
     timeout?: number;
     enabled?: boolean;
+    emitEvent?: boolean;
   }): Promise<ScheduledJob> {
     // Validate cron expression
     if (!cron.validate(params.schedule)) {
@@ -127,7 +129,53 @@ export class Scheduler {
       this.scheduleJob(job);
     }
 
-    this.emit({ type: "job_added", timestamp: Date.now(), jobId: job.id });
+    if (params.emitEvent !== false) {
+      this.emit({ type: "job_added", timestamp: Date.now(), jobId: job.id });
+    }
+    return job;
+  }
+
+  /**
+   * Sync an existing job without emitting scheduler events
+   */
+  async syncJob(
+    id: string,
+    updates: Partial<Omit<ScheduledJob, "id" | "createdAt">>
+  ): Promise<ScheduledJob> {
+    const job = await this.store.update(id, updates);
+
+    const running = this.runningJobs.get(id);
+    if (running) {
+      running.task.stop();
+      this.runningJobs.delete(id);
+    }
+
+    if (this.started && job.enabled) {
+      this.scheduleJob(job);
+    }
+
+    return job;
+  }
+
+  /**
+   * Update an existing job
+   */
+  async updateJob(
+    id: string,
+    updates: Partial<Omit<ScheduledJob, "id" | "createdAt">>
+  ): Promise<ScheduledJob> {
+    const job = await this.store.update(id, updates);
+
+    const running = this.runningJobs.get(id);
+    if (running) {
+      running.task.stop();
+      this.runningJobs.delete(id);
+    }
+
+    if (this.started && job.enabled) {
+      this.scheduleJob(job);
+    }
+
     return job;
   }
 
@@ -349,6 +397,7 @@ export class Scheduler {
         );
       }
     }
+
   }
 
   /**
@@ -369,12 +418,12 @@ export class Scheduler {
    * Get next run time for a cron expression
    */
   static getNextRunTime(expression: string): Date | null {
-    // node-cron doesn't have a built-in method for this
-    // This is a simplified implementation
     try {
       if (!cron.validate(expression)) return null;
-      // For now, return null - in production, use a library like cron-parser
-      return null;
+      const interval = cronParser.parseExpression(expression, {
+        tz: process.env.TZ || "UTC",
+      });
+      return interval.next().toDate();
     } catch {
       return null;
     }
