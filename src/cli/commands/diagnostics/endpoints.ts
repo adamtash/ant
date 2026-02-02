@@ -18,7 +18,7 @@ export async function endpoints(cfg: AntConfig, options: EndpointsOptions): Prom
   const out = new OutputFormatter();
 
   const gatewayUrl = options.gateway || `http://${cfg.gateway?.host || cfg.ui?.host || "127.0.0.1"}:${cfg.gateway?.port || cfg.ui?.port || 18789}`;
-  const timeoutMs = parseInt(options.timeout || "30000", 10);
+  const timeoutMs = parseInt(options.timeout || "300000", 10);
 
   out.header("Endpoint Diagnostics");
   out.info(`Testing endpoints at: ${gatewayUrl}`);

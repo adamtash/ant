@@ -30,7 +30,7 @@ export async function testAll(cfg: AntConfig, options: TestAllOptions): Promise<
 
   // Determine gateway URL
   const gatewayUrl = options.gateway || `http://${cfg.gateway?.host || cfg.ui?.host || "127.0.0.1"}:${cfg.gateway?.port || cfg.ui?.port || 18789}`;
-  const timeoutMs = parseInt(options.timeout || "30000", 10);
+  const timeoutMs = parseInt(options.timeout || "300000", 10);
 
   out.header("ANT System Diagnostics");
   out.info(`Gateway: ${gatewayUrl}`);

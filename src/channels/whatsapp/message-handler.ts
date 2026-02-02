@@ -8,19 +8,24 @@
  * - Mention parsing
  */
 
-import type { WAMessage } from "@whiskeysockets/baileys";
+import { normalizeMessageContent } from "@whiskeysockets/baileys";
+import type { WAMessage, proto } from "@whiskeysockets/baileys";
 import type { NormalizedMessage, MessageMedia } from "../types.js";
 
 // ============================================================================
 // Message Extraction
 // ============================================================================
 
+function unwrapMessage(message: proto.IMessage | null | undefined): proto.IMessage | undefined {
+  return normalizeMessageContent(message ?? undefined);
+}
+
 /**
  * Extract text content from a WhatsApp message
  */
 export function extractTextFromMessage(msg: WAMessage | null | undefined): string | null {
   if (!msg) return null;
-  const message = msg.message;
+  const message = unwrapMessage(msg.message);
   if (!message) return null;
 
   // Direct conversation
@@ -78,7 +83,21 @@ export function extractTextFromMessage(msg: WAMessage | null | undefined): strin
  * Extract mentions from a message
  */
 export function extractMentions(msg: WAMessage): string[] {
-  const ctx = msg.message?.extendedTextMessage?.contextInfo;
+  const message = unwrapMessage(msg.message);
+  if (!message) return [];
+  const ctx =
+    message.extendedTextMessage?.contextInfo ??
+    message.imageMessage?.contextInfo ??
+    message.videoMessage?.contextInfo ??
+    message.documentMessage?.contextInfo ??
+    message.audioMessage?.contextInfo ??
+    message.stickerMessage?.contextInfo ??
+    message.buttonsResponseMessage?.contextInfo ??
+    message.listResponseMessage?.contextInfo ??
+    message.templateButtonReplyMessage?.contextInfo ??
+    message.interactiveResponseMessage?.contextInfo ??
+    message.buttonsMessage?.contextInfo ??
+    message.listMessage?.contextInfo;
   return ctx?.mentionedJid ?? [];
 }
 
@@ -111,7 +130,7 @@ export interface WhatsAppMediaInfo {
  * Extract media information from a WhatsApp message
  */
 export function extractMediaInfo(msg: WAMessage): WhatsAppMediaInfo | null {
-  const message = msg.message;
+  const message = unwrapMessage(msg.message);
   if (!message) return null;
 
   if (message.imageMessage) {

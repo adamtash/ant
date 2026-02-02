@@ -278,6 +278,8 @@ export type SessionMessage = {
   content: string;
   ts: number;
   toolCalls?: ToolCall[];
+  providerId?: string;
+  model?: string;
 };
 
 export type SessionsResponse = {
@@ -307,7 +309,18 @@ export type SystemEvent = {
     | 'error_occurred'
     | 'memory_indexed'
     | 'cron_triggered'
-    | 'tool_executed';
+    | 'tool_executed'
+    | 'job_created'
+    | 'job_started'
+    | 'job_completed'
+    | 'job_failed'
+    | 'job_enabled'
+    | 'job_disabled'
+    | 'job_removed'
+    | 'skill_created'
+    | 'skill_deleted'
+    | 'provider_cooldown'
+    | 'provider_recovery';
   data: Record<string, unknown>;
   severity: 'info' | 'warn' | 'error' | 'critical';
   source: 'agent' | 'system' | 'user';
@@ -348,6 +361,20 @@ export type StatusResponse = {
   queue: QueueLaneSnapshot[];
   running: MainTaskStatus[];
   subagents: SubagentRecord[];
+  mainAgent?: {
+    enabled: boolean;
+    running: boolean;
+    tasks?: Array<{
+      id: string;
+      description: string;
+      status: "pending" | "in_progress" | "completed" | "failed";
+      createdAt: number;
+      completedAt?: number;
+      result?: string;
+    }>;
+    lastCheckAt?: number | null;
+    lastError?: string | null;
+  };
   health?: SystemHealth;
 };
 

@@ -72,7 +72,14 @@ npm install
     "sqlitePath": "./.ant/memory.sqlite",
     "embeddingsModel": "text-embedding-nomic-embed-text-v1.5"
   },
-  "agent": { "systemPrompt": "" },
+  "agent": {
+    "systemPrompt": "",
+    "toolLoop": {
+      "timeoutPerIterationMs": 300000,
+      "timeoutPerToolMs": 300000,
+      "contextWindowThresholdPercent": 80
+    }
+  },
   "subagents": { "enabled": true },
   "logging": { "level": "debug", "fileLevel": "trace" },
   "runtime": {
@@ -258,7 +265,39 @@ If `startupRecipients` is empty, ant falls back to `ownerJids` or your own JID w
     }
   },
   "agent": {
-    "systemPrompt": ""
+    "systemPrompt": "",
+    "toolLoop": {
+      "timeoutPerIterationMs": 30000,
+      "timeoutPerToolMs": 30000,
+      "contextWindowThresholdPercent": 80
+    },
+    "compaction": {
+      "enabled": true,
+      "thresholdPercent": 75,
+      "maxSummaryTokens": 600,
+      "minRecentMessages": 8
+    },
+    "thinking": {
+      "level": "off"
+    },
+    "toolPolicy": "default",
+    "toolResultGuard": {
+      "enabled": true
+    }
+  },
+  "toolPolicies": {
+    "default": {
+      "allowedGroups": ["memory", "file", "system", "agent", "messaging"],
+      "deniedGroups": [],
+      "allowedTools": [],
+      "deniedTools": [],
+      "allowedChannels": ["whatsapp", "cli", "web"],
+      "deniedChannels": [],
+      "allowedModels": [],
+      "deniedModels": [],
+      "allowedAudiences": [],
+      "deniedAudiences": []
+    }
   },
   "subagents": {
     "enabled": true
@@ -284,6 +323,10 @@ If `startupRecipients` is empty, ant falls back to `ownerJids` or your own JID w
 - To allow ant to operate across your whole home directory, set `workspaceDir` to `~` (or `/` for full disk).
 - `providers.items.*.type` can be `openai` (LM Studio API) or `cli` (Codex/Copilot/Claude CLI).
 - `routing` controls which provider handles each action. Use `parentForCli` to select a parent LLM that runs tool calls when `routing.chat` is a CLI provider.
+- `agent.compaction` summarizes older messages when context usage crosses the threshold (defaults to 75%).
+- `agent.thinking.level` controls reasoning output; set to `off` to strip `<think>` tags (uses `reasoning.effort` when supported).
+- `toolPolicies` gates which tools are exposed per channel/model; `agent.toolPolicy` selects the policy name.
+- `providers.items.*.authProfiles` enables API key rotation with cooldowns; `healthCheckTimeoutMs` and `healthCheckCacheTtlMinutes` control provider health checks.
 - `respondToSelfOnly` limits WhatsApp replies to messages sent by the connected account.
 - When `respondToSelfOnly` is true, ant only replies in the self-chat (your own number), not other chats.
 - `ownerJids` can further restrict allowed senders or chats (example: `15551234567@s.whatsapp.net`).

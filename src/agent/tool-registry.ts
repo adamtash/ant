@@ -10,8 +10,18 @@
 
 import fs from "node:fs/promises";
 import path from "node:path";
-import type { Tool, ToolMeta, ToolResult, ToolContext, ToolDefinition, JSONSchema } from "./types.js";
+import type {
+  Tool,
+  ToolMeta,
+  ToolResult,
+  ToolContext,
+  ToolDefinition,
+  JSONSchema,
+  ToolPolicy,
+  ToolPolicyContext,
+} from "./types.js";
 import type { Logger } from "../log.js";
+import { filterToolsByPolicy } from "./tool-policy.js";
 
 /**
  * Tool Registry manages all available tools
@@ -70,7 +80,10 @@ export class ToolRegistry {
         }
       }
     } catch (err) {
-      this.logger.warn({ dir, error: err instanceof Error ? err.message : String(err) }, "Failed to load tools from directory");
+      this.logger.warn(
+        { dir, error: err instanceof Error ? err.message : String(err) },
+        "Failed to load tools from directory"
+      );
     }
   }
 
@@ -101,7 +114,10 @@ export class ToolRegistry {
         this.logger.debug({ tool: tool.meta.name, source }, "Loaded tool");
       }
     } catch (err) {
-      this.logger.warn({ filePath, error: err instanceof Error ? err.message : String(err) }, "Failed to load tool file");
+      this.logger.warn(
+        { filePath, error: err instanceof Error ? err.message : String(err) },
+        "Failed to load tool file"
+      );
     }
   }
 
@@ -163,6 +179,20 @@ export class ToolRegistry {
    */
   getDefinitions(): ToolDefinition[] {
     return this.getAll().map(tool => ({
+      type: "function" as const,
+      function: {
+        name: tool.meta.name,
+        description: tool.meta.description,
+        parameters: tool.parameters,
+      },
+    }));
+  }
+
+  /**
+   * Get tool definitions filtered by policy.
+   */
+  getDefinitionsForPolicy(policy: ToolPolicy | undefined, context: ToolPolicyContext): ToolDefinition[] {
+    return filterToolsByPolicy(this.getAll(), policy, context).map(tool => ({
       type: "function" as const,
       function: {
         name: tool.meta.name,
@@ -257,9 +287,5 @@ export function defineParams(
   properties: Record<string, { type: string; description?: string; enum?: string[]; default?: unknown }>,
   required: string[] = []
 ): JSONSchema {
-  return {
-    type: "object",
-    properties,
-    required,
-  };
+  return { type: "object", properties, required };
 }

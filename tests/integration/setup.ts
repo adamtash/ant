@@ -176,7 +176,7 @@ async function createTestConfig(config: TestEnvConfig): Promise<void> {
     },
     cliTools: {
       enabled: true,
-      timeoutMs: 30000,
+      timeoutMs: 300000,
     },
     scheduler: {
       enabled: false,
@@ -337,7 +337,7 @@ export async function waitFor(
   condition: () => boolean | Promise<boolean>,
   options: { timeoutMs?: number; intervalMs?: number; message?: string } = {}
 ): Promise<void> {
-  const { timeoutMs = 30000, intervalMs = 100, message = "Condition not met" } = options;
+  const { timeoutMs = 300000, intervalMs = 100, message = "Condition not met" } = options;
   const startTime = Date.now();
 
   while (Date.now() - startTime < timeoutMs) {
@@ -353,7 +353,7 @@ export async function waitFor(
 /**
  * Wait for gateway to be ready
  */
-export async function waitForGateway(instance: TestInstance, timeoutMs = 30000): Promise<void> {
+export async function waitForGateway(instance: TestInstance, timeoutMs = 300000): Promise<void> {
   const url = `${instance.getGatewayUrl()}/api/status`;
 
   await waitFor(

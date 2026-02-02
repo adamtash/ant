@@ -2,13 +2,16 @@
  * Embedding Generation
  * Phase 7: Memory System Redesign
  *
- * Supports multiple embedding providers:
+ * Multi-provider embedding support:
+ * - Local providers (LM Studio - primary)
  * - OpenAI-compatible APIs
- * - Local models via LM Studio or similar
+ * - Gemini (fallback)
  *
  * Features:
- * - Batch embedding for efficiency
- * - Embedding caching to avoid recomputation
+ * - Auto-detection with fallback
+ * - Embedding caching
+ * - Batch processing
+ * - Provider health checking
  */
 
 import crypto from "node:crypto";
@@ -17,6 +20,35 @@ import type { EmbeddingProvider, EmbeddingProviderConfig } from "./types.js";
 
 // Re-export interface from types for use in other modules
 export type { EmbeddingProvider } from "./types.js";
+
+/**
+ * OpenClaw-compatible provider configuration
+ */
+export type OpenClawEmbeddingConfig = {
+  provider: "auto" | "local" | "openai" | "gemini";
+  fallback: Array<"local" | "openai" | "gemini">;
+  local?: {
+    baseUrl?: string;
+    model?: string;
+  };
+  openai?: {
+    baseUrl?: string;
+    apiKey?: string;
+    model?: string;
+  };
+  gemini?: {
+    apiKey?: string;
+    model?: string;
+  };
+  batch?: {
+    enabled: boolean;
+    minChunks: number;
+    maxTokens: number;
+    concurrency: number;
+    pollIntervalMs: number;
+    timeoutMinutes: number;
+  };
+};
 
 /**
  * Default batch size for embedding requests
@@ -39,24 +71,122 @@ const MAX_CACHE_ENTRIES = 10000;
 const CACHE_TTL_MS = 60 * 60 * 1000;
 
 /**
- * Create an embedding provider from config
+ * Create an embedding provider with auto-selection and fallback
+ * 
+ * Tries providers in order:
+ * 1. Requested provider (if specific)
+ * 2. Fallback providers (in order)
+ * 
+ * This allows LM Studio as primary, with OpenAI/Gemini as fallbacks
  */
-export function createEmbeddingProvider(config: EmbeddingProviderConfig): EmbeddingProvider {
-  if (config.type === "local") {
-    return new LocalEmbeddingProvider(config);
+export async function createEmbeddingProvider(config: {
+  baseUrl?: string;
+  apiKey?: string;
+  model?: string;
+  type?: "openai" | "local";
+  openClawConfig?: OpenClawEmbeddingConfig;
+}): Promise<EmbeddingProvider> {
+  // Legacy support: simple openai/local config
+  if (config.type || (!config.openClawConfig && config.baseUrl)) {
+    if (config.type === "local") {
+      return new LocalEmbeddingProvider({
+        baseUrl: config.baseUrl ?? "http://localhost:1234/v1",
+        model: config.model ?? "text-embedding-model",
+      });
+    }
+    return new OpenAIEmbeddingProvider({
+      baseUrl: config.baseUrl ?? "http://localhost:1234/v1",
+      apiKey: config.apiKey,
+      model: config.model ?? "text-embedding-model",
+    });
   }
-  return new OpenAIEmbeddingProvider(config);
+
+  // OpenClaw-style multi-provider
+  const cfg = config.openClawConfig ?? {
+    provider: "auto",
+    fallback: ["openai"],
+    local: { baseUrl: "http://localhost:1234/v1" },
+  };
+
+  // Try primary provider
+  if (cfg.provider !== "auto") {
+    try {
+      return await tryProvider(cfg.provider, cfg);
+    } catch (err) {
+      // Fall through to fallback
+      console.warn(`Primary embeddings provider '${cfg.provider}' failed:`, err);
+    }
+  }
+
+  // Try fallback providers in order
+  for (const fallbackProvider of cfg.fallback) {
+    try {
+      return await tryProvider(fallbackProvider, cfg);
+    } catch (err) {
+      console.warn(`Fallback embeddings provider '${fallbackProvider}' failed:`, err);
+      // Continue to next fallback
+    }
+  }
+
+  // All providers failed, return a stub that throws
+  throw new Error(
+    `No embedding provider available. Tried: ${cfg.provider}, ${cfg.fallback.join(", ")}`
+  );
+}
+
+async function tryProvider(
+  providerName: "local" | "openai" | "gemini",
+  config: OpenClawEmbeddingConfig,
+): Promise<EmbeddingProvider> {
+  if (providerName === "local") {
+    const localConfig = config.local ?? { baseUrl: "http://localhost:1234/v1" };
+    return new LocalEmbeddingProvider({
+      baseUrl: localConfig.baseUrl ?? "http://localhost:1234/v1",
+      model: localConfig.model ?? "text-embedding-model",
+    });
+  }
+
+  if (providerName === "openai") {
+    const openaiConfig = config.openai ?? {};
+    const apiKey = openaiConfig.apiKey ?? process.env.OPENAI_API_KEY;
+    if (!apiKey) {
+      throw new Error("OpenAI API key not found");
+    }
+    return new OpenAIEmbeddingProvider({
+      baseUrl: openaiConfig.baseUrl ?? "https://api.openai.com/v1",
+      apiKey,
+      model: openaiConfig.model ?? "text-embedding-3-small",
+    });
+  }
+
+  if (providerName === "gemini") {
+    const geminiConfig = config.gemini ?? {};
+    const apiKey = geminiConfig.apiKey ?? process.env.GEMINI_API_KEY;
+    if (!apiKey) {
+      throw new Error("Gemini API key not found");
+    }
+    return new GeminiEmbeddingProvider({
+      apiKey,
+      model: geminiConfig.model ?? "models/embedding-001",
+    });
+  }
+
+  throw new Error(`Unknown provider: ${providerName}`);
 }
 
 /**
  * OpenAI-compatible embedding provider
  */
 export class OpenAIEmbeddingProvider implements EmbeddingProvider {
-  private readonly config: EmbeddingProviderConfig;
+  private readonly baseUrl: string;
+  private readonly apiKey?: string;
+  private readonly model: string;
   private detectedDimension?: number;
 
-  constructor(config: EmbeddingProviderConfig) {
-    this.config = config;
+  constructor(config: { baseUrl: string; apiKey?: string; model: string }) {
+    this.baseUrl = config.baseUrl;
+    this.apiKey = config.apiKey;
+    this.model = config.model;
   }
 
   async embed(texts: string[]): Promise<number[][]> {
@@ -82,7 +212,7 @@ export class OpenAIEmbeddingProvider implements EmbeddingProvider {
   private async embedBatch(texts: string[]): Promise<number[][]> {
     // Check cache first
     const results: (number[] | null)[] = texts.map((text) => {
-      const cached = getCachedEmbedding(text, this.config.model);
+      const cached = getCachedEmbedding(text, this.model);
       return cached;
     });
 
@@ -106,7 +236,7 @@ export class OpenAIEmbeddingProvider implements EmbeddingProvider {
         const idx = uncachedIndices[i]!;
         const embedding = freshEmbeddings[i] ?? [];
         results[idx] = embedding;
-        setCachedEmbedding(uncachedTexts[i] ?? "", this.config.model, embedding);
+        setCachedEmbedding(uncachedTexts[i] ?? "", this.model, embedding);
       }
     }
 
@@ -114,21 +244,25 @@ export class OpenAIEmbeddingProvider implements EmbeddingProvider {
   }
 
   private async fetchEmbeddings(texts: string[]): Promise<number[][]> {
-    const baseUrl = this.config.baseUrl.replace(/\/$/, "");
+    const url = new URL(this.baseUrl);
+    if (!url.pathname.endsWith("/")) {
+      url.pathname += "/";
+    }
+    url.pathname += "embeddings";
 
     const headers: Record<string, string> = {
       "content-type": "application/json",
     };
 
-    if (this.config.apiKey) {
-      headers.authorization = `Bearer ${this.config.apiKey}`;
+    if (this.apiKey) {
+      headers.authorization = `Bearer ${this.apiKey}`;
     }
 
-    const response = await fetch(`${baseUrl}/embeddings`, {
+    const response = await fetch(url.toString(), {
       method: "POST",
       headers,
       body: JSON.stringify({
-        model: this.config.model,
+        model: this.model,
         input: texts,
       }),
     });
@@ -148,44 +282,139 @@ export class OpenAIEmbeddingProvider implements EmbeddingProvider {
 
     // Sort by index to ensure correct order
     const sorted = [...data.data].sort((a, b) => a.index - b.index);
-    return sorted.map((item) => item.embedding);
+    return sorted.map((item) => normalizeEmbedding(item.embedding));
   }
 
   getModel(): string {
-    return this.config.model;
+    return this.model;
   }
 
   getDimension(): number | undefined {
-    return this.config.dimension ?? this.detectedDimension;
+    return this.detectedDimension;
   }
 }
 
 /**
  * Local embedding provider (e.g., LM Studio)
- * Same API as OpenAI but typically no auth required
  */
-export class LocalEmbeddingProvider implements EmbeddingProvider {
-  private readonly inner: OpenAIEmbeddingProvider;
-
-  constructor(config: EmbeddingProviderConfig) {
-    this.inner = new OpenAIEmbeddingProvider({
-      ...config,
-      // Local providers typically don't need API key
-      apiKey: config.apiKey ?? undefined,
+export class LocalEmbeddingProvider extends OpenAIEmbeddingProvider {
+  constructor(config: { baseUrl: string; model: string }) {
+    super({
+      baseUrl: config.baseUrl,
+      apiKey: undefined, // Local providers typically don't need auth
+      model: config.model,
     });
+  }
+}
+
+/**
+ * Gemini embedding provider (fallback)
+ */
+export class GeminiEmbeddingProvider implements EmbeddingProvider {
+  private readonly apiKey: string;
+  private readonly model: string;
+  private detectedDimension?: number;
+
+  constructor(config: { apiKey: string; model: string }) {
+    this.apiKey = config.apiKey;
+    this.model = config.model;
   }
 
   async embed(texts: string[]): Promise<number[][]> {
-    return this.inner.embed(texts);
+    if (texts.length === 0) return [];
+
+    const results: number[][] = [];
+
+    // Gemini has lower rate limits, so use smaller batches
+    for (let i = 0; i < texts.length; i += 8) {
+      const batch = texts.slice(i, i + 8);
+      const batchResults = await this.embedBatch(batch);
+      results.push(...batchResults);
+    }
+
+    if (results.length > 0 && results[0] && !this.detectedDimension) {
+      this.detectedDimension = results[0].length;
+    }
+
+    return results;
+  }
+
+  private async embedBatch(texts: string[]): Promise<number[][]> {
+    // Check cache
+    const results: (number[] | null)[] = texts.map((text) => {
+      return getCachedEmbedding(text, this.model);
+    });
+
+    const uncachedIndices: number[] = [];
+    const uncachedTexts: string[] = [];
+
+    for (let i = 0; i < results.length; i++) {
+      if (results[i] === null) {
+        uncachedIndices.push(i);
+        uncachedTexts.push(texts[i] ?? "");
+      }
+    }
+
+    if (uncachedTexts.length > 0) {
+      const freshEmbeddings = await this.fetchEmbeddings(uncachedTexts);
+      for (let i = 0; i < uncachedIndices.length; i++) {
+        const idx = uncachedIndices[i]!;
+        const embedding = freshEmbeddings[i] ?? [];
+        results[idx] = embedding;
+        setCachedEmbedding(uncachedTexts[i] ?? "", this.model, embedding);
+      }
+    }
+
+    return results as number[][];
+  }
+
+  private async fetchEmbeddings(texts: string[]): Promise<number[][]> {
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${this.model}:embedContent?key=${this.apiKey}`;
+
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        requests: texts.map((text) => ({
+          model: `models/${this.model}`,
+          content: { parts: [{ text }] },
+        })),
+      }),
+    });
+
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(`Gemini embedding failed: ${response.status} ${text}`);
+    }
+
+    const data = (await response.json()) as {
+      embeddings?: Array<{ values: number[] }>;
+    };
+
+    return (data.embeddings ?? []).map((e) =>
+      normalizeEmbedding(e.values)
+    );
   }
 
   getModel(): string {
-    return this.inner.getModel();
+    return this.model;
   }
 
   getDimension(): number | undefined {
-    return this.inner.getDimension();
+    return this.detectedDimension;
   }
+}
+
+/**
+ * Normalize embedding vector
+ */
+function normalizeEmbedding(vec: number[]): number[] {
+  const sanitized = vec.map((v) => (Number.isFinite(v) ? v : 0));
+  const magnitude = Math.sqrt(
+    sanitized.reduce((sum, v) => sum + v * v, 0)
+  );
+  if (magnitude < 1e-10) return sanitized;
+  return sanitized.map((v) => v / magnitude);
 }
 
 /**

@@ -52,13 +52,12 @@ export async function recall(cfg: AntConfig, query: string, options: RecallOptio
     }
 
     // Direct memory access - MemoryManager creates its own embedding provider from config
-    const manager = new MemoryManager({ cfg });
+    const manager = new MemoryManager(cfg);
 
-    const results = await manager.search(
-      query.trim(),
-      options.limit,
-      options.minScore,
-    );
+    const results = await manager.search(query.trim(), {
+      maxResults: options.limit,
+      minScore: options.minScore,
+    });
 
     stopProgress();
     displayResults(out, results, options);

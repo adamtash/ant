@@ -260,7 +260,7 @@ export class PheromoneMap {
 
     // Clean up old active points
     const now = Date.now();
-    const maxAge = 30000; // 30 seconds
+    const maxAge = 300000; // 30 seconds
     this.activePoints = this.activePoints.filter(
       (p) => now - p.timestamp < maxAge && p.concentration > 0.01
     );

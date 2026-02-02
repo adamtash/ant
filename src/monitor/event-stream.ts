@@ -292,13 +292,39 @@ export function setEventStream(stream: EventStream): void {
 export function createEventPublishers(stream: EventStream) {
   return {
     messageReceived: stream.createPublisher("message_received"),
-    toolExecuted: stream.createPublisher("tool_executed"),
+    messageQueued: stream.createPublisher("message_queued"),
+    messageProcessing: stream.createPublisher("message_processing"),
+    messageProcessed: stream.createPublisher("message_processed"),
+    messageDropped: stream.createPublisher("message_dropped"),
+    messageTimeout: stream.createPublisher("message_timeout"),
+    
     agentThinking: stream.createPublisher("agent_thinking"),
+    agentResponse: stream.createPublisher("agent_response"),
+    
+    toolExecuting: stream.createPublisher("tool_executing"),
+    toolExecuted: stream.createPublisher("tool_executed"),
+    toolPartUpdated: stream.createPublisher("tool_part_updated"),
+    
     subagentSpawned: stream.createPublisher("subagent_spawned"),
     cronTriggered: stream.createPublisher("cron_triggered"),
     errorOccurred: stream.createPublisher("error_occurred"),
     memoryIndexed: stream.createPublisher("memory_indexed"),
     sessionStarted: stream.createPublisher("session_started"),
     sessionEnded: stream.createPublisher("session_ended"),
+    mainAgentStatusChanged: stream.createPublisher("main_agent_status_changed"),
+    
+    jobCreated: stream.createPublisher("job_created"),
+    jobStarted: stream.createPublisher("job_started"),
+    jobCompleted: stream.createPublisher("job_completed"),
+    jobFailed: stream.createPublisher("job_failed"),
+    jobEnabled: stream.createPublisher("job_enabled"),
+    jobDisabled: stream.createPublisher("job_disabled"),
+    jobRemoved: stream.createPublisher("job_removed"),
+    
+    skillCreated: stream.createPublisher("skill_created"),
+    skillDeleted: stream.createPublisher("skill_deleted"),
+    
+    providerCooldown: stream.createPublisher("provider_cooldown"),
+    providerRecovery: stream.createPublisher("provider_recovery"),
   };
 }

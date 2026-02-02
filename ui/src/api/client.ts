@@ -7,8 +7,6 @@ import type {
   StatusResponse,
   TasksResponse,
   TaskDetailResponse,
-  AgentsResponse,
-  AgentDetailResponse,
   MemorySearchResponse,
   MemoryIndexResponse,
   MemoryStatsResponse,
@@ -80,6 +78,90 @@ export const getStatus = () => apiGet<StatusResponse>('/status');
 export const getHealth = () => apiGet<HealthResponse>('/health');
 
 // ============================================
+// Error Classification
+// ============================================
+
+export const classifyError = (error: string, context?: Record<string, unknown>) =>
+  apiPost<{
+    ok: boolean;
+    classification: {
+      category: 'auth' | 'rate_limit' | 'timeout' | 'billing' | 'internal' | 'network' | 'validation' | 'unknown';
+      severity: 'low' | 'medium' | 'high' | 'critical';
+      retryable: boolean;
+      provider?: string;
+      confidence: number;
+    };
+  }>('/errors/classify', { error, context });
+
+export const getErrorStats = () =>
+  apiGet<{
+    ok: boolean;
+    stats: {
+      totalErrors: number;
+      lastErrorAt: number;
+      errorRate: number;
+    };
+  }>('/errors/stats');
+
+// ============================================
+// Provider Health
+// ============================================
+
+export const getProviderHealth = () =>
+  apiGet<{
+    ok: boolean;
+    providers: Array<{
+      id: string;
+      name: string;
+      type: 'openai' | 'cli' | 'ollama';
+      model: string;
+      status: 'healthy' | 'degraded' | 'cooldown' | 'offline';
+      stats: {
+        requestCount: number;
+        errorCount: number;
+        successCount: number;
+        avgResponseTime: number;
+        errorRate: number;
+        lastRequestAt?: number;
+        lastErrorAt?: number;
+      };
+      cooldown?: {
+        until: number;
+        reason: string;
+        startedAt: number;
+      };
+      lastSeen: number;
+    }>;
+    summary: {
+      total: number;
+      healthy: number;
+      degraded: number;
+      cooldown: number;
+      offline: number;
+      overallErrorRate: number;
+    };
+  }>('/providers/health');
+
+export const getProviderHealthById = (id: string) =>
+  apiGet<{
+    ok: boolean;
+    provider: {
+      id: string;
+      name: string;
+      type: 'openai' | 'cli' | 'ollama';
+      model: string;
+      status: 'healthy' | 'degraded' | 'cooldown' | 'offline';
+      stats: {
+        requestCount: number;
+        errorCount: number;
+        successCount: number;
+        avgResponseTime: number;
+        errorRate: number;
+      };
+    };
+  }>(`/providers/health/${id}`);
+
+// ============================================
 // Tasks
 // ============================================
 
@@ -94,8 +176,37 @@ export const cancelTask = (id: string) =>
 // Agents
 // ============================================
 
-export const getAgents = () => apiGet<AgentsResponse>('/agents');
-export const getAgent = (id: string) => apiGet<AgentDetailResponse>(`/agents/${id}`);
+export interface AgentsApiResponse {
+  ok: true;
+  agents: Array<{
+    id: string;
+    caste: 'queen' | 'worker' | 'soldier' | 'nurse' | 'forager' | 'architect' | 'drone';
+    name: string;
+    status: 'spawning' | 'active' | 'thinking' | 'idle' | 'retired' | 'error';
+    currentTask?: string;
+    progress: number;
+    toolsUsed: string[];
+    taskCount: number;
+    averageDuration: number;
+    errorCount: number;
+    createdAt: number;
+    retiredAt?: number;
+    parentAgentId?: string;
+    metadata: {
+      age: number;
+      energy: number;
+      specialization: string[];
+    };
+  }>;
+}
+
+export interface AgentDetailApiResponse {
+  ok: true;
+  agent: AgentsApiResponse['agents'][0];
+}
+
+export const getAgents = () => apiGet<AgentsApiResponse>('/agents');
+export const getAgent = (id: string) => apiGet<AgentDetailApiResponse>(`/agents/${id}`);
 export const spawnAgent = (caste: string, taskId?: string) =>
   apiPost<ActionResponse>('/agents', { caste, taskId });
 export const terminateAgent = (id: string) =>
@@ -171,7 +282,27 @@ export const validateConfig = (config: Record<string, unknown>) =>
 // Channels
 // ============================================
 
-export const getChannels = () => apiGet<{ ok: boolean, channels: any[] }>('/channels');
+export interface ChannelResponse {
+  ok: true;
+  channels: Array<{
+    id: string;
+    status: {
+      connected: boolean;
+      selfJid?: string;
+      qr?: string;
+      message?: string;
+      connectedAt?: number;
+      messageCount?: number;
+      lastMessageAt?: number;
+      activeUsers?: number;
+      responseTime?: number;
+      errorRate?: number;
+      [key: string]: any;
+    };
+  }>;
+}
+
+export const getChannels = () => apiGet<ChannelResponse>('/channels');
 
 // ============================================
 // EventSource (SSE)
@@ -293,7 +424,7 @@ export class WebSocketClient {
   private startPing(): void {
     this.pingInterval = window.setInterval(() => {
       this.send('ping', {});
-    }, 30000);
+    }, 300000);
   }
 
   private stopPing(): void {

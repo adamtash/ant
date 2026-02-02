@@ -10,8 +10,108 @@ import { useSystemStore } from '../stores/systemStore';
 import { useUIStore } from '../stores/uiStore';
 import { Card, Badge, Button, Skeleton } from '../components/base';
 import { ColonyScene3D } from '../colony/renderer/ColonyScene3D';
-import { getStatus } from '../api/client';
+import { getStatus, getProviderHealth } from '../api/client';
 import type { StatusResponse, SubagentRecord } from '../api/types';
+
+// ============================================
+// Provider Health Component
+// ============================================
+
+interface ProviderHealthData {
+  id: string;
+  name: string;
+  type: 'openai' | 'cli' | 'ollama';
+  model: string;
+  status: 'healthy' | 'degraded' | 'cooldown' | 'offline';
+  stats: {
+    requestCount: number;
+    errorCount: number;
+    avgResponseTime: number;
+    errorRate: number;
+  };
+  cooldown?: {
+    until: number;
+    reason: string;
+  };
+}
+
+interface ProviderHealthPanelProps {
+  providers: ProviderHealthData[];
+}
+
+const ProviderHealthPanel: React.FC<ProviderHealthPanelProps> = ({ providers }) => {
+  const getStatusIcon = (status: string) => {
+    switch (status) {
+      case 'healthy': return '✅';
+      case 'degraded': return '⚠️';
+      case 'cooldown': return '⏸️';
+      case 'offline': return '❌';
+      default: return '❓';
+    }
+  };
+
+  const getStatusColor = (status: string) => {
+    switch (status) {
+      case 'healthy': return 'nurse';
+      case 'degraded': return 'queen';
+      case 'cooldown': return 'architect';
+      case 'offline': return 'soldier';
+      default: return 'default';
+    }
+  };
+
+  return (
+    <Card>
+      <div className="flex items-center justify-between mb-4">
+        <h3 className="text-lg font-semibold text-white">Provider Health</h3>
+        <Badge variant="default">{providers.length} providers</Badge>
+      </div>
+
+      {providers.length === 0 ? (
+        <div className="text-center py-4 text-gray-500">
+          <p>No providers configured</p>
+        </div>
+      ) : (
+        <div className="space-y-3">
+          {providers.map((provider) => (
+            <div
+              key={provider.id}
+              className="p-3 bg-chamber-dark rounded-lg border border-chamber-wall"
+            >
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <span className="text-lg">{getStatusIcon(provider.status)}</span>
+                  <div>
+                    <div className="font-medium text-white text-sm">{provider.name}</div>
+                    <div className="text-xs text-gray-500">{provider.model}</div>
+                  </div>
+                </div>
+                <Badge variant={getStatusColor(provider.status)} size="sm">
+                  {provider.status}
+                </Badge>
+              </div>
+              
+              <div className="flex items-center gap-4 mt-2 text-xs text-gray-400">
+                <span>Req: {provider.stats.requestCount}</span>
+                <span className={provider.stats.errorRate > 10 ? 'text-soldier-alert' : ''}>
+                  Errors: {provider.stats.errorRate}%
+                </span>
+                <span>Avg: {provider.stats.avgResponseTime}ms</span>
+              </div>
+              
+              {provider.cooldown && (
+                <div className="mt-2 text-xs text-architect-sky">
+                  ⏸️ Cooldown until {new Date(provider.cooldown.until).toLocaleTimeString()}
+                  <span className="ml-1 text-gray-500">({provider.cooldown.reason})</span>
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+    </Card>
+  );
+};
 
 // ============================================
 // Queen Heartbeat Component
@@ -412,17 +512,22 @@ const SceneControls: React.FC = () => {
 
 export const RoyalChamber: React.FC = () => {
   const [status, setStatus] = useState<StatusResponse | null>(null);
+  const [providers, setProviders] = useState<ProviderHealthData[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
   const { queen, isRunning } = useColonyStore();
   const { queenThinking, totalErrors } = useSystemStore();
 
-  // Fetch status periodically
+  // Fetch status and provider health periodically
   const fetchStatus = useCallback(async () => {
     try {
-      const data = await getStatus();
-      setStatus(data);
+      const [statusData, providerData] = await Promise.all([
+        getStatus(),
+        getProviderHealth().catch(() => ({ ok: true, providers: [] })),
+      ]);
+      setStatus(statusData);
+      setProviders(providerData.providers ?? []);
       setError(null);
     } catch (err) {
       setError('Failed to connect to colony');
@@ -436,6 +541,28 @@ export const RoyalChamber: React.FC = () => {
     const interval = setInterval(fetchStatus, 3000);
     return () => clearInterval(interval);
   }, [fetchStatus]);
+
+  // Sync Queen to Main Agent status
+  useEffect(() => {
+    const colonyStore = useColonyStore.getState();
+    const systemStore = useSystemStore.getState();
+    
+    if (status?.mainAgent) {
+      // Activate queen if main agent is enabled
+      if (status.mainAgent.running) {
+        colonyStore.activateQueen();
+      } else {
+        colonyStore.deactivateQueen();
+      }
+      
+      // Set thinking state based on active tasks
+      const hasActiveTask = status.mainAgent.tasks?.some(
+        t => t.status === 'in_progress'
+      );
+      colonyStore.setQueenThinking(hasActiveTask ?? false);
+      systemStore.queenThinking = hasActiveTask ?? false;
+    }
+  }, [status]);
 
   // Calculate metrics
   const workerCount = status?.subagents?.length ?? 0;
@@ -515,6 +642,8 @@ export const RoyalChamber: React.FC = () => {
           <ThreatMeter errorRate={errorRate} recentErrors={totalErrors} />
 
           <WorkerGrid workers={status?.subagents ?? []} />
+
+          <ProviderHealthPanel providers={providers} />
 
           <QuickActions />
         </aside>

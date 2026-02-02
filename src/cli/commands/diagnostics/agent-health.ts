@@ -18,7 +18,7 @@ export async function agentHealth(cfg: AntConfig, options: AgentHealthOptions): 
   const out = new OutputFormatter();
 
   const gatewayUrl = options.gateway || `http://${cfg.gateway?.host || cfg.ui?.host || "127.0.0.1"}:${cfg.gateway?.port || cfg.ui?.port || 18789}`;
-  const timeoutMs = parseInt(options.timeout || "30000", 10);
+  const timeoutMs = parseInt(options.timeout || "300000", 10);
 
   out.header("Agent Health Diagnostics");
   out.info(`Testing agent at: ${gatewayUrl}`);

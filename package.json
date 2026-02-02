@@ -11,6 +11,7 @@
     "start:all": "npm run ui:build && bash -lc 'if [ -f ~/.ant/ant.pid ]; then kill -9 \"$(cat ~/.ant/ant.pid)\"; fi; rm -f ~/.ant/ant.pid; npm run dev -- start -c ant.config.json'",
     "dev": "tsx src/cli.ts",
     "dev:all": "bash -lc 'pkill -f \"node.*ant-cli\" || true && rm -f ~/.ant/ant.pid' && npm run build && npm run ui:build && bash -lc 'npm run dev -- start -c ant.config.json & npm run ui:dev'",
+    "kill": "bash -lc 'if [ -f ~/.ant/ant.pid ]; then kill -9 \"$(cat ~/.ant/ant.pid)\"; rm -f ~/.ant/ant.pid; fi'",
     "build": "tsc -p tsconfig.json",
     "lint": "eslint src --ext .ts",
     "typecheck": "tsc --noEmit",
@@ -22,8 +23,10 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",
+    "@types/blessed": "^0.1.27",
     "@whiskeysockets/baileys": "^6.7.8",
     "better-sqlite3": "^11.0.0",
+    "blessed": "^0.1.81",
     "chalk": "^5.6.2",
     "commander": "^12.1.0",
     "dotenv": "^16.4.0",

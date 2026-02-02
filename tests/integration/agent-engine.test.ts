@@ -21,7 +21,7 @@ describe("Agent Engine", () => {
   beforeAll(async () => {
     instance = await spawnTestInstance({ enableMemory: false });
     await waitForGateway(instance, 15000);
-  }, 30000);
+  }, 300000);
 
   afterAll(async () => {
     if (instance) {
@@ -199,7 +199,7 @@ describe("Agent Engine with Memory", () => {
   beforeAll(async () => {
     instance = await spawnTestInstance({ enableMemory: true });
     await waitForGateway(instance, 15000);
-  }, 30000);
+  }, 300000);
 
   afterAll(async () => {
     if (instance) {

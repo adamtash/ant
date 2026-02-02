@@ -429,8 +429,8 @@ export const WarRoom: React.FC = () => {
                               {event.type.replace(/_/g, ' ').toUpperCase()}
                             </div>
                             <div className="text-xs text-gray-400 mt-0.5 truncate max-w-[300px]">
-                              {JSON.stringify(event.data).slice(0, 50)}
-                              {JSON.stringify(event.data).length > 50 && '...'}
+                              {String((event.data as { message?: string })?.message || JSON.stringify(event.data)).slice(0, 120)}
+                              {String((event.data as { message?: string })?.message || JSON.stringify(event.data)).length > 120 && '...'}
                             </div>
                           </div>
                         </div>

@@ -6,7 +6,7 @@ import { spawn } from "node:child_process";
 import type { AntConfig } from "../../../config.js";
 import { OutputFormatter } from "../../output-formatter.js";
 import { RuntimeError } from "../../error-handler.js";
-import { readPidFile, writePidFile, ensureRuntimePaths } from "../../../gateway/process-control.js";
+import { readPidFile, writePidFile, removePidFile, ensureRuntimePaths } from "../../../gateway/process-control.js";
 
 export interface StartOptions {
   config?: string;
@@ -74,6 +74,10 @@ export async function start(cfg: AntConfig, options: StartOptions = {}): Promise
     const { createLogger } = await import("../../../log.js");
     const { createAgentEngine } = await import("../../../agent/engine.js");
     const { MessageRouter, WhatsAppAdapter } = await import("../../../channels/index.js");
+    const { MemoryManager } = await import("../../../memory/manager.js");
+    const { Scheduler } = await import("../../../scheduler/scheduler.js");
+    const { createSkillRegistryManager } = await import("../../../agent/skill-registry.js");
+    const { SessionManager } = await import("../../../gateway/session-manager.js");
 
     const logLevel = cfg.logging?.level || "info";
     const logger = createLogger(
@@ -83,7 +87,14 @@ export async function start(cfg: AntConfig, options: StartOptions = {}): Promise
     );
 
     // Initialize Router
-    const router = new MessageRouter({ logger });
+    const router = new MessageRouter({
+      logger,
+      sessionOrdering: {
+        enabled: true,
+        maxConcurrentSessions: 3,
+        queueTimeoutMs: 300_000,
+      },
+    });
     router.start();
 
     // Initialize WhatsApp Adapter
@@ -101,12 +112,22 @@ export async function start(cfg: AntConfig, options: StartOptions = {}): Promise
         logger.error({ error: err instanceof Error ? err.message : String(err) }, "Failed to start WhatsApp adapter");
     }
 
+    const sessionManager = new SessionManager({
+      stateDir: cfg.resolved.stateDir,
+      logger,
+    });
+
     // Initialize Agent Engine
     const agentEngine = await createAgentEngine({
       config: {
         maxHistoryTokens: cfg.agent.maxHistoryTokens,
         temperature: cfg.agent.temperature,
         maxToolIterations: cfg.agent.maxToolIterations,
+        toolLoop: cfg.agent.toolLoop,
+        compaction: cfg.agent.compaction,
+        thinking: cfg.agent.thinking,
+        toolPolicy: cfg.agent.toolPolicy,
+        toolResultGuard: cfg.agent.toolResultGuard,
       },
       providerConfig: {
         providers: cfg.resolved.providers.items as any,
@@ -117,6 +138,8 @@ export async function start(cfg: AntConfig, options: StartOptions = {}): Promise
       logger,
       workspaceDir: cfg.resolved.workspaceDir,
       stateDir: cfg.resolved.stateDir,
+      toolPolicies: cfg.toolPolicies,
+      sessionManager,
     });
 
     // Set up message routing from router to agent engine
@@ -130,6 +153,15 @@ export async function start(cfg: AntConfig, options: StartOptions = {}): Promise
         });
 
         // Send response back through the router
+        logger.info({
+          sessionKey: message.context.sessionKey,
+          responseLength: result.response?.length || 0,
+          responsePreview: result.response?.slice(0, 200) || "(empty)",
+          providerId: result.providerId,
+          model: result.model,
+          iterations: result.iterations,
+          toolsUsed: result.toolsUsed,
+        }, "Sending response to session");
         await router.sendToSession(message.context.sessionKey, result.response);
 
         return {
@@ -140,6 +172,10 @@ export async function start(cfg: AntConfig, options: StartOptions = {}): Promise
           context: message.context,
           timestamp: Date.now(),
           priority: message.priority,
+          metadata: {
+            providerId: result.providerId,
+            model: result.model,
+          },
         };
       } catch (error) {
         logger.error(
@@ -152,20 +188,39 @@ export async function start(cfg: AntConfig, options: StartOptions = {}): Promise
 
     logger.info("Agent handler registered with message router");
 
-    // Initialize Gateway Server first (so UI is available immediately)
-    const { MainAgent } = await import("../../../agent/main-agent.js");
-    const mainAgent = new MainAgent({
-      config: cfg,
-      agentEngine,
+    // Initialize Memory Manager
+    const memoryManager = new MemoryManager(cfg);
+    await memoryManager.start();
+    logger.info("Memory manager started");
+
+    // Initialize Scheduler
+    const scheduler = new Scheduler({
+      stateDir: cfg.resolved.stateDir,
       logger,
-      sendMessage: async (jid: string, message: string) => {
-        // Send message via WhatsApp adapter
-        if (whatsapp.isConnected()) {
-          await whatsapp.sendText(jid, message);
-        }
+      agentExecutor: async (params) => {
+        const result = await agentEngine.execute({
+          sessionKey: params.sessionKey,
+          query: params.cronContext.jobName,
+          channel: "web",
+          cronContext: params.cronContext,
+        });
+        return { response: result.response, error: result.error };
       },
     });
+    await scheduler.start();
+    logger.info("Scheduler started");
 
+    // Initialize Skill Registry
+    const skillRegistry = createSkillRegistryManager({
+      logger,
+      workspaceDir: cfg.resolved.workspaceDir,
+    });
+    await skillRegistry.initialize();
+    logger.info("Skill registry initialized");
+
+    // Initialize Gateway Server first (so UI is available immediately)
+    const { MainAgent } = await import("../../../agent/main-agent.js");
+    
     const server = new GatewayServer({
       config: {
         port: cfg.ui.port,
@@ -178,13 +233,37 @@ export async function start(cfg: AntConfig, options: StartOptions = {}): Promise
       logger,
       agentEngine,
       router,
-      mainAgent,
+      memoryManager,
+      scheduler,
+      skillRegistry,
+      toolRegistry: agentEngine.getToolRegistry(),
     });
+
+    const mainAgent = new MainAgent({
+      config: cfg,
+      agentEngine,
+      logger,
+      sendMessage: async (jid: string, message: string) => {
+        // Send message via WhatsApp adapter
+        if (whatsapp.isConnected()) {
+          await whatsapp.sendText(jid, message);
+        }
+      },
+      sessionManager: server.getSessionManager(),
+    });
+
+    // Set mainAgent on server after creation
+    server.setMainAgent(mainAgent);
 
     await server.start();
 
     const mainAgentEnabled = cfg.mainAgent?.enabled ?? true;
     server.setMainAgentRunning(mainAgentEnabled);
+
+    // Start the Main Agent autonomous loop
+    if (mainAgentEnabled) {
+      await mainAgent.start();
+    }
 
     out.success("Agent runtime started");
     if (cfg.ui.enabled) {
@@ -196,10 +275,28 @@ export async function start(cfg: AntConfig, options: StartOptions = {}): Promise
     await new Promise<void>((resolve) => {
       const shutdown = async () => {
         out.info("\nShutting down...");
-        mainAgent.stop();
-        server.setMainAgentRunning(false);
-        await router.stop();
-        server.stop().then(() => resolve());
+        
+        // Safety timeout - force exit after 5s if cleanup hangs
+        const timeout = setTimeout(() => {
+          console.error("Shutdown timed out, forcing exit...");
+          process.exit(1);
+        }, 5000);
+        timeout.unref();
+
+        try {
+          mainAgent.stop();
+          server.setMainAgentRunning(false);
+          await router.stop();
+          await server.stop();
+          scheduler.stop();
+          memoryManager.stop();
+        } catch (err) {
+          out.error(`Error during shutdown: ${err}`);
+        } finally {
+          await removePidFile(cfg);
+          clearTimeout(timeout);
+          process.exit(0);
+        }
       };
 
       process.on("SIGINT", shutdown);

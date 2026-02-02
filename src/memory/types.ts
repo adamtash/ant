@@ -111,14 +111,20 @@ export type MemoryConfig = {
   embeddingsModel: string;
   /** Sync configuration */
   sync: MemorySyncConfig;
-  /** Chunk size in characters */
-  chunkChars: number;
-  /** Overlap between chunks in characters */
-  chunkOverlap: number;
-  /** Maximum search results */
-  maxResults: number;
-  /** Minimum similarity score threshold */
-  minScore: number;
+  /** Chunking configuration */
+  chunking: {
+    /** Chunk size in tokens */
+    tokens: number;
+    /** Overlap between chunks in tokens */
+    overlap: number;
+  };
+  /** Query configuration */
+  query: {
+    /** Maximum search results */
+    maxResults: number;
+    /** Minimum similarity score threshold */
+    minScore: number;
+  };
   /** Short-term memory settings */
   shortTerm?: ShortTermConfig;
   /** Medium-term retention in days */
@@ -139,10 +145,13 @@ export type MemorySyncConfig = {
   watchDebounceMs: number;
   /** Interval for periodic sync (0 = disabled) */
   intervalMinutes: number;
-  /** Bytes delta to trigger session re-index */
-  sessionsDeltaBytes: number;
-  /** Messages delta to trigger session re-index */
-  sessionsDeltaMessages: number;
+  /** Sessions sync configuration */
+  sessions: {
+    /** Bytes delta to trigger session re-index */
+    deltaBytes: number;
+    /** Messages delta to trigger session re-index */
+    deltaMessages: number;
+  };
 };
 
 /**

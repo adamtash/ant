@@ -181,6 +181,11 @@ export const PheromonTrails: React.FC = () => {
                       <span className="text-xs text-gray-500">
                         {formatDate(msg.ts)}
                       </span>
+                      {msg.model && (
+                        <Badge variant="default" size="sm" className="ml-auto bg-blue-600/50">
+                          {msg.providerId ? `${msg.providerId}: ` : ''}{msg.model}
+                        </Badge>
+                      )}
                     </div>
                     <p className="whitespace-pre-wrap">{msg.content}</p>
                   </div>

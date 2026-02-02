@@ -5,7 +5,7 @@
  * and alerting in the ANT agent monitoring system.
  */
 
-import type { Channel } from "../agent/types.js";
+import type { Channel, ToolPart } from "../agent/types.js";
 
 // ============================================================================
 // Event Types
@@ -16,19 +16,52 @@ import type { Channel } from "../agent/types.js";
  */
 export type EventType =
   | "message_received"
+  | "message_queued"
+  | "message_processing"
+  | "message_processed"
+  | "message_dropped"
+  | "message_timeout"
+  | "tool_executing"
   | "tool_executed"
+  | "tool_part_updated"
   | "agent_thinking"
+  | "agent_response"
   | "subagent_spawned"
   | "cron_triggered"
   | "error_occurred"
   | "memory_indexed"
   | "session_started"
-  | "session_ended";
+  | "session_ended"
+  | "main_agent_status_changed"
+  | "job_created"
+  | "job_started"
+  | "job_completed"
+  | "job_failed"
+  | "job_enabled"
+  | "job_disabled"
+  | "job_removed"
+  | "skill_created"
+  | "skill_deleted"
+  | "provider_cooldown"
+  | "provider_recovery";
 
 /**
  * Error severity levels
  */
 export type ErrorSeverity = "low" | "medium" | "high" | "critical";
+
+/**
+ * Error categories for classification
+ */
+export type ErrorCategory =
+  | "auth"
+  | "rate_limit"
+  | "timeout"
+  | "billing"
+  | "internal"
+  | "network"
+  | "validation"
+  | "unknown";
 
 /**
  * Base event structure stored in the event store
@@ -50,6 +83,36 @@ export interface MessageReceivedData {
   messageLength: number;
 }
 
+export interface MessageQueuedData {
+  queueLength: number;
+  position: number;
+  priority?: string;
+}
+
+export interface MessageProcessingData {
+  handler?: string;
+}
+
+export interface MessageProcessedData {
+  duration: number;
+  success: boolean;
+  responsePreview?: string;
+}
+
+export interface MessageDroppedData {
+  reason: string;
+}
+
+export interface MessageTimeoutData {
+  duration: number;
+  stage: string;
+}
+
+export interface ToolExecutingData {
+  name: string;
+  args?: Record<string, unknown>;
+}
+
 export interface ToolExecutedData {
   name: string;
   duration: number;
@@ -58,10 +121,23 @@ export interface ToolExecutedData {
   args?: Record<string, unknown>;
 }
 
+export interface ToolPartUpdatedData {
+  toolPart: ToolPart;
+}
+
 export interface AgentThinkingData {
-  iterationCount: number;
+  query?: string;
+  inferredTopic?: string;
+  iterationCount?: number;
+  toolsUsed?: string[];
+  elapsed?: number;
+}
+
+export interface AgentResponseData {
+  iterations: number;
   toolsUsed: string[];
-  elapsed: number;
+  duration: number;
+  success: boolean;
 }
 
 export interface SubagentSpawnedData {
@@ -82,6 +158,9 @@ export interface ErrorOccurredData {
   message: string;
   stack?: string;
   context?: Record<string, unknown>;
+  category?: ErrorCategory;
+  retryable?: boolean;
+  provider?: string;
 }
 
 export interface MemoryIndexedData {
@@ -101,19 +180,114 @@ export interface SessionEndedData {
   toolsUsed: string[];
 }
 
+export interface MainAgentStatusData {
+  healthStatus: "healthy" | "degraded" | "unhealthy";
+  successRate: string | null;
+  failureCount: number;
+  consecutiveFailures: number;
+  lastTaskAt: number | null;
+}
+
+export interface JobCreatedData {
+  jobId: string;
+  name: string;
+  schedule: string;
+  triggerType: string;
+}
+
+export interface JobStartedData {
+  jobId: string;
+  name: string;
+  schedule: string;
+  triggeredAt: number;
+}
+
+export interface JobCompletedData {
+  jobId: string;
+  name: string;
+  duration: number;
+  retryCount: number;
+}
+
+export interface JobFailedData {
+  jobId: string;
+  name: string;
+  duration: number;
+  error: string;
+  retryCount: number;
+}
+
+export interface JobEnabledData {
+  jobId: string;
+  name: string;
+}
+
+export interface JobDisabledData {
+  jobId: string;
+  name: string;
+}
+
+export interface JobRemovedData {
+  jobId: string;
+  name: string;
+}
+
+export interface SkillCreatedData {
+  name: string;
+  description: string;
+  author: string;
+}
+
+export interface SkillDeletedData {
+  name: string;
+}
+
+export interface ProviderCooldownData {
+  providerId: string;
+  providerName: string;
+  reason: "rate_limit" | "quota" | "auth" | "maintenance" | "error";
+  until: number;
+}
+
+export interface ProviderRecoveryData {
+  providerId: string;
+  providerName: string;
+  recoveredAt: number;
+}
+
 /**
  * Union of all event data types
  */
 export type EventData =
   | MessageReceivedData
+  | MessageQueuedData
+  | MessageProcessingData
+  | MessageProcessedData
+  | MessageDroppedData
+  | MessageTimeoutData
+  | ToolExecutingData
   | ToolExecutedData
+  | ToolPartUpdatedData
   | AgentThinkingData
+  | AgentResponseData
   | SubagentSpawnedData
   | CronTriggeredData
   | ErrorOccurredData
   | MemoryIndexedData
   | SessionStartedData
   | SessionEndedData
+  | MainAgentStatusData
+  | JobCreatedData
+  | JobStartedData
+  | JobCompletedData
+  | JobFailedData
+  | JobEnabledData
+  | JobDisabledData
+  | JobRemovedData
+  | SkillCreatedData
+  | SkillDeletedData
+  | ProviderCooldownData
+  | ProviderRecoveryData
   | Record<string, unknown>;
 
 /**

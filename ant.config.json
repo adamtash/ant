@@ -30,7 +30,10 @@
         "model": "gpt-4.1",
          "args": [
           "--yolo",
-          "--no-ask-user"
+          "--no-ask-user",
+          "--silent",
+          "--no-color",
+          "--allow-all-tools"
         ]
       },
       "kimi": {
@@ -38,7 +41,8 @@
         "cliProvider": "kimi",
         "model": "kimi-k2",
         "command": "kimi",
-        "args": ["--yolo"]
+        "args": ["--yolo"],
+        "timeoutMs": 120000
       }
     }
   },
@@ -78,7 +82,10 @@
     "embeddingsModel": "text-embedding-nomic-embed-text-v1.5"
   },
   "agent": {
-    "systemPrompt": ""
+    "systemPrompt": "",
+    "toolLoop": {
+      "timeoutPerIterationMs": 120000
+    }
   },
   "subagents": {
     "enabled": true
@@ -123,7 +130,8 @@
   },
   "logging": {
     "level": "debug",
-    "fileLevel": "trace"
+    "fileLevel": "trace",
+    "filePath": "./.ant/ant.log"
   },
   "mainAgent": {
     "enabled": true,

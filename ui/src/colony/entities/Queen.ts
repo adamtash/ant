@@ -25,6 +25,7 @@ export interface QueenRenderData {
 export class Queen extends Ant {
   // Queen-specific properties
   isActive: boolean;
+  isThinking: boolean;
   isLayingEggs: boolean;
   pulsePhase: number;
   auraIntensity: number;
@@ -43,6 +44,7 @@ export class Queen extends Ant {
     });
 
     this.isActive = config.isActive ?? false;
+    this.isThinking = false;
     this.isLayingEggs = false;
     this.pulsePhase = 0;
     this.auraIntensity = 0.5;
@@ -120,6 +122,17 @@ export class Queen extends Ant {
    */
   deactivate(): void {
     this.isActive = false;
+  }
+  
+  /**
+   * Set thinking state (main agent processing)
+   */
+  setThinking(thinking: boolean): void {
+    this.isThinking = thinking;
+    if (thinking) {
+      this.auraIntensity = 1.0;
+      this.pulsePhase += 0.5; // Speed up pulse when thinking
+    }
   }
 
   /**

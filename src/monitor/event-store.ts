@@ -6,6 +6,7 @@
 
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
+import { statSync } from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
@@ -422,7 +423,6 @@ export class EventStore {
     // Get file size
     let dbSizeBytes = 0;
     try {
-      const { statSync } = require("node:fs");
       const stats = statSync(this.config.dbPath);
       dbSizeBytes = stats.size;
     } catch {

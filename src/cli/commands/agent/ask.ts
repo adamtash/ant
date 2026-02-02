@@ -113,6 +113,7 @@ async function askDirect(cfg: AntConfig, prompt: string, options: AskOptions): P
     // Create an agent engine directly
     const { createAgentEngine } = await import("../../../agent/engine.js");
     const { createLogger } = await import("../../../log.js");
+    const { SessionManager } = await import("../../../gateway/session-manager.js");
 
     const logger = createLogger("info");
 
@@ -124,20 +125,35 @@ async function askDirect(cfg: AntConfig, prompt: string, options: AskOptions): P
         baseUrl?: string;
         apiKey?: string;
         model: string;
+        authProfiles?: Array<{ apiKey: string; label?: string; cooldownMinutes?: number }>;
+        healthCheckTimeoutMs?: number;
+        healthCheckCacheTtlMinutes?: number;
       }>,
       defaultProvider: cfg.resolved.providers.default,
     };
+
+    const sessionManager = new SessionManager({
+      stateDir: cfg.resolved.stateDir,
+      logger,
+    });
 
     const engine = await createAgentEngine({
       config: {
         temperature: 0.7,
         maxToolIterations: 6,
         maxHistoryTokens: 8192,
+        toolLoop: cfg.agent.toolLoop,
+        compaction: cfg.agent.compaction,
+        thinking: cfg.agent.thinking,
+        toolPolicy: cfg.agent.toolPolicy,
+        toolResultGuard: cfg.agent.toolResultGuard,
       },
       providerConfig,
       logger,
       workspaceDir: cfg.resolved.workspaceDir,
       stateDir: cfg.resolved.stateDir,
+      toolPolicies: cfg.toolPolicies,
+      sessionManager,
     });
 
     const result = await engine.execute({

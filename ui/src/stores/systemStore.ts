@@ -119,7 +119,18 @@ export interface SystemEvent {
     | 'error_occurred'
     | 'memory_indexed'
     | 'cron_triggered'
-    | 'tool_executed';
+    | 'tool_executed'
+    | 'job_created'
+    | 'job_started'
+    | 'job_completed'
+    | 'job_failed'
+    | 'job_enabled'
+    | 'job_disabled'
+    | 'job_removed'
+    | 'skill_created'
+    | 'skill_deleted'
+    | 'provider_cooldown'
+    | 'provider_recovery';
   data: Record<string, unknown>;
   severity: 'info' | 'warn' | 'error' | 'critical';
   source: 'agent' | 'system' | 'user';
@@ -196,6 +207,11 @@ export interface SystemState {
   updateJob: (id: string, updates: Partial<CronJob>) => void;
   removeJob: (id: string) => void;
   toggleJob: (id: string) => void;
+
+  // Skill management
+  addSkill: (skill: Skill) => void;
+  updateSkill: (name: string, updates: Partial<Skill>) => void;
+  removeSkill: (name: string) => void;
 
   // Events
   addEvent: (event: SystemEvent) => void;
@@ -368,6 +384,28 @@ export const useSystemStore = create<SystemState>((set, get) => ({
       jobs.set(id, { ...job, enabled: !job.enabled });
       set({ jobs });
     }
+  },
+
+  // Skill management
+  addSkill: (skill: Skill) => {
+    const skills = new Map(get().skills);
+    skills.set(skill.name, skill);
+    set({ skills });
+  },
+
+  updateSkill: (name: string, updates: Partial<Skill>) => {
+    const skills = new Map(get().skills);
+    const skill = skills.get(name);
+    if (skill) {
+      skills.set(name, { ...skill, ...updates, updatedAt: Date.now() });
+      set({ skills });
+    }
+  },
+
+  removeSkill: (name: string) => {
+    const skills = new Map(get().skills);
+    skills.delete(name);
+    set({ skills });
   },
 
   // Events

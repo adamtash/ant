@@ -2,14 +2,14 @@
  * Text Chunking for Embeddings
  * Phase 7: Memory System Redesign
  *
- * Splits documents into overlapping chunks suitable for embedding.
- * Preserves markdown structure when possible.
+ * Chunks text using token-based sizing with overlap for context preservation.
+ * Adapted from OpenClaw: maintains precise line numbers and overlap windows.
  */
 
 import type { ChunkOptions, MemoryChunk } from "./types.js";
 
 /**
- * Default chunking options
+ * Default chunking options - now token-based
  */
 export const DEFAULT_CHUNK_OPTIONS: ChunkOptions = {
   chunkSize: 1600,
@@ -17,8 +17,18 @@ export const DEFAULT_CHUNK_OPTIONS: ChunkOptions = {
   preserveMarkdown: true,
 };
 
+/** Approximate characters per token (heuristic) */
+const CHARS_PER_TOKEN = 4;
+
 /**
  * Chunk text into overlapping segments
+ * 
+ * Strategy (OpenClaw-inspired):
+ * 1. Split by lines to preserve structure
+ * 2. Calculate chunk size in characters (~tokens * 4)
+ * 3. Accumulate lines until reaching chunk size
+ * 4. Flush chunk and carry forward overlap
+ * 5. Track exact start/end line numbers
  */
 export function chunkText(
   text: string,
@@ -34,48 +44,100 @@ export function chunkText(
 }
 
 /**
- * Chunk plain text by character count with line tracking
+ * Chunk plain text with token-based sizing and overlap
+ * 
+ * OpenClaw pattern: maintains line-by-line accumulation with overlap window
  */
 function chunkPlain(
   text: string,
-  chunkSize: number,
-  overlap: number,
+  chunkSizeChars: number,
+  overlapChars: number,
 ): Array<{ text: string; startLine: number; endLine: number }> {
   const lines = text.split("\n");
   const chunks: Array<{ text: string; startLine: number; endLine: number }> = [];
 
-  let buffer: string[] = [];
-  let startLine = 1;
-  let charCount = 0;
+  if (lines.length === 0) return [];
 
-  const flush = (endLine: number) => {
-    if (buffer.length === 0) return;
-    const chunkText = buffer.join("\n");
-    if (chunkText.trim()) {
-      chunks.push({ text: chunkText, startLine, endLine });
-    }
+  // Convert to actual character limits
+  const maxChars = Math.max(32, chunkSizeChars);
+  const overlapLimit = Math.max(0, overlapChars);
+
+  let current: Array<{ line: string; lineNo: number }> = [];
+  let currentChars = 0;
+
+  const flush = () => {
+    if (current.length === 0) return;
+    
+    const firstEntry = current[0];
+    const lastEntry = current[current.length - 1];
+    if (!firstEntry || !lastEntry) return;
+
+    const text = current.map((entry) => entry.line).join("\n");
+    const startLine = firstEntry.lineNo;
+    const endLine = lastEntry.lineNo;
+    
+    chunks.push({
+      text,
+      startLine,
+      endLine,
+    });
   };
 
+  const carryOverlap = () => {
+    if (overlapLimit <= 0 || current.length === 0) {
+      current = [];
+      currentChars = 0;
+      return;
+    }
+
+    // Keep the last lines that fit in overlap window
+    let acc = 0;
+    const kept: Array<{ line: string; lineNo: number }> = [];
+    
+    for (let i = current.length - 1; i >= 0; i -= 1) {
+      const entry = current[i];
+      if (!entry) continue;
+      
+      acc += entry.line.length + 1; // +1 for newline
+      kept.unshift(entry);
+      
+      if (acc >= overlapLimit) break;
+    }
+
+    current = kept;
+    currentChars = kept.reduce((sum, entry) => sum + entry.line.length + 1, 0);
+  };
+
+  // Process each line
   for (let i = 0; i < lines.length; i += 1) {
     const line = lines[i] ?? "";
-    buffer.push(line);
-    charCount += line.length + 1;
+    const lineNo = i + 1;
 
-    if (charCount >= chunkSize) {
-      flush(i + 1);
+    // Handle very long lines by splitting
+    const segments: string[] = [];
+    if (line.length === 0) {
+      segments.push("");
+    } else {
+      for (let start = 0; start < line.length; start += maxChars) {
+        segments.push(line.slice(start, start + maxChars));
+      }
+    }
 
-      // Calculate overlap in lines
-      const overlapLines =
-        overlap > 0 ? Math.ceil((overlap / chunkSize) * buffer.length) : 0;
-      const keepLines = buffer.slice(Math.max(0, buffer.length - overlapLines));
+    for (const segment of segments) {
+      const lineSize = segment.length + 1; // +1 for newline
 
-      buffer = keepLines;
-      startLine = Math.max(1, i + 2 - keepLines.length);
-      charCount = keepLines.join("\n").length;
+      // Flush if chunk is full
+      if (currentChars + lineSize > maxChars && current.length > 0) {
+        flush();
+        carryOverlap();
+      }
+
+      current.push({ line: segment, lineNo });
+      currentChars += lineSize;
     }
   }
 
-  flush(lines.length);
+  flush();
   return chunks;
 }
 

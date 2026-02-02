@@ -66,7 +66,8 @@
 - **Execution**: `src/runtime/cli-tools.ts` → `runCliProvider()`
 - **Default args** (when `args: []` in config):
   - `codex`: `exec --output-last-message {output} --color never -`
-  - `copilot`: `-p {prompt} --silent --no-color --allow-all-tools`
+  - `kimi`: `--yolo -`
+  - `copilot`: `-p {prompt} --silent --no-color --allow-all-tools --yolo --model gpt-4.1`
   - `claude`: `--print --output-format text --permission-mode dontAsk {prompt}`
 
 ### Memory System
@@ -145,7 +146,7 @@
 - **Implementation**: `src/runtime/main-agent.ts` (to be created)
 - **Log**: All actions logged to `AGENT_LOG.md`
 
-## Current Status (as of 2026-02-01)
+## Current Status (as of 2026-02-02)
 
 ### Implemented Features
 - WhatsApp listener (Baileys) with typing indicator
@@ -153,19 +154,25 @@
 - Subagent orchestration + persistence (registry-based)
 - Memory indexing: SQLite + embeddings (MEMORY.md + memory/*.md + sessions)
 - Media reply pipeline: `MEDIA:` token parsing and sending
-- CLI provider support: Codex/Copilot/Claude with parent tool runner
+- CLI provider support: Codex/Copilot/Claude/Kimi with parent tool runner
 - Live TUI: queue/subagent dashboard with blessed
 - Web UI: Express API + Vite React frontend
 - Direct tool fast-paths: `open_app`, `restart_ant` (skip LLM)
 - MCP support: Copilot/Claude CLIs can call `memory_search` and `memory_get`
+- **Main Agent System**: Autonomous supervisor with duty cycles
+  - Runs diagnostics, monitors health, manages subagents
+  - Task assignment API via `/api/main-agent/tasks`
+  - Startup health checks with WhatsApp reporting
+- Supervisor: Process supervisor for graceful restarts (exit code 42)
 
-### In Development
+### Recently Completed ✅
 - **Main Agent System**: Ralph-inspired continuous loop for system supervision
   - Auto-start on boot
   - Persistent duties: subagent management, maintenance, monitoring, improvements
   - Self-referential feedback loop
   - Safety mechanisms: iteration limits, failure thresholds, owner alerts
-  - Implementation tracked in: `src/runtime/main-agent.ts` (TODO)
+  - Implementation: `src/agent/main-agent.ts`
+  - API endpoints: `/api/main-agent/tasks`
 
 ### Known Issues
 - **TSX restart failure**: `restart_ant` can fail with "pipe permission denied"
@@ -242,16 +249,21 @@ npm run dev -- debug simulate "message"      # Full inbound flow (no WhatsApp)
 - **Startup message**: `whatsapp.startupMessage` sends a message when runtime boots
 - **Memory sync**: Tune `memory.sync.sessionsDeltaMessages` and `sessionsDeltaBytes` to control reindex frequency
 - **CLI tool timeout**: `cliTools.timeoutMs` (default: 120000 ms)
+- **Tool policies**: Configure `toolPolicies` and select with `agent.toolPolicy`
+- **Compaction**: `agent.compaction` summarizes older context when near the token threshold
+- **Thinking level**: `agent.thinking.level` toggles reasoning output
 
 ## Tasks & Plan
 
 ### Short-term
 - [x] Document Main Agent system and Ralph integration
-- [ ] Implement `src/runtime/main-agent.ts`
-- [ ] Add Main Agent config schema to `src/config.ts`
-- [ ] Create default `AGENT_DUTIES.md` template
-- [ ] Integrate Main Agent with runtime (`src/runtime/run.ts`)
-- [ ] Add Main Agent status to TUI and Web UI
+- [x] Implement `src/agent/main-agent.ts`
+- [x] Add Main Agent config schema to `src/config.ts`
+- [x] Create default `AGENT_DUTIES.md` template
+- [x] Integrate Main Agent with gateway server
+- [x] Add Main Agent status to Web UI
+- [x] Fix Main Agent auto-start on runtime boot
+- [ ] Add Main Agent status to TUI
 - [ ] Decide on restart strategy: keep TSX or switch to `node dist/cli.js`
 - [ ] Add more fast-path intents (screenshot, open browser, list files)
 - [ ] Improve retry/backoff for WhatsApp disconnects

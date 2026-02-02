@@ -17,6 +17,9 @@ export {
   OpenAIProvider,
   CLIProvider,
   OllamaProvider,
+  FailoverError,
+  coerceToFailoverError,
+  classifyFailoverReason,
   withRetry,
   type ProviderManagerConfig,
   type RetryOptions,
@@ -33,6 +36,13 @@ export {
   type PromptBuilderOptions,
   type BootstrapFile,
 } from "./prompt-builder.js";
+
+// Main Agent System
+export {
+  MainAgent,
+  type MainAgentTask,
+  type MainAgentSendMessage,
+} from "./main-agent.js";
 
 // Self-Improvement System
 export {
@@ -78,6 +88,8 @@ export type {
   // Tool Types
   JSONSchema,
   ToolResult,
+  ToolPart,
+  ToolPartState,
   ToolMeta,
   ToolContext,
   Tool,

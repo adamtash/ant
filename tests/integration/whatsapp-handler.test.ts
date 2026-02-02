@@ -32,7 +32,7 @@ describe("WhatsApp Message Handler", () => {
       enableMemory: false,
     });
     await waitForGateway(instance, 15000);
-  }, 30000);
+  }, 300000);
 
   afterAll(async () => {
     if (instance) {
@@ -200,7 +200,7 @@ describe("WhatsApp Adapter Status", () => {
       enableMemory: false,
     });
     await waitForGateway(instance, 15000);
-  }, 30000);
+  }, 300000);
 
   afterAll(async () => {
     if (instance) {

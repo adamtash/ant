@@ -3,9 +3,11 @@
  */
 
 import fs from "node:fs/promises";
+import nodeFs from "node:fs";
 import path from "node:path";
-import type { Channel } from "../agent/types.js";
+import type { Channel, ToolPart } from "../agent/types.js";
 import type { Logger } from "../log.js";
+import { FileStorageBackend, type StorageBackend } from "./storage.js";
 
 /**
  * Session context
@@ -29,6 +31,9 @@ export interface SessionMessage {
   timestamp: number;
   toolCallId?: string;
   name?: string;
+  providerId?: string;
+  model?: string;
+  metadata?: Record<string, unknown>;
 }
 
 /**
@@ -38,10 +43,20 @@ export class SessionManager {
   private sessions: Map<string, SessionContext> = new Map();
   private readonly stateDir: string;
   private readonly logger: Logger;
+  private readonly storage: StorageBackend;
 
-  constructor(params: { stateDir: string; logger: Logger }) {
+  constructor(params: { stateDir: string; logger: Logger; storage?: StorageBackend }) {
     this.stateDir = params.stateDir;
     this.logger = params.logger.child({ component: "session-manager" });
+    this.storage = params.storage ?? new FileStorageBackend(this.stateDir);
+    
+    // Pre-create sessions directory to avoid race conditions
+    try {
+      const sessionsDir = path.join(this.stateDir, "sessions");
+      nodeFs.mkdirSync(sessionsDir, { recursive: true });
+    } catch (err) {
+      this.logger.warn({ error: err instanceof Error ? err.message : String(err) }, "Failed to pre-create sessions directory");
+    }
   }
 
   /**
@@ -116,43 +131,40 @@ export class SessionManager {
       session.lastActivityAt = Date.now();
     }
 
-    // Append to session file
-    const sessionFile = this.getSessionFilePath(sessionKey);
-    await fs.mkdir(path.dirname(sessionFile), { recursive: true });
+    const safeKey = this.getSafeSessionKey(sessionKey);
 
-    const line = JSON.stringify({
-      ...message,
-      sessionKey,
-    }) + "\n";
-
-    await fs.appendFile(sessionFile, line, "utf-8");
+    try {
+      await this.storage.appendJsonLine(["sessions", safeKey], {
+        ...message,
+        sessionKey,
+      });
+    } catch (err) {
+      this.logger.error(
+        { error: err instanceof Error ? err.message : String(err), sessionKey },
+        "Failed to append message to session"
+      );
+      throw err;
+    }
   }
 
   /**
    * Read session messages
    */
   async readMessages(sessionKey: string, limit?: number): Promise<SessionMessage[]> {
-    const sessionFile = this.getSessionFilePath(sessionKey);
-
     try {
-      const content = await fs.readFile(sessionFile, "utf-8");
-      const lines = content.trim().split("\n").filter(Boolean);
+      const safeKey = this.getSafeSessionKey(sessionKey);
+      const lines = await this.storage.readJsonLines<Record<string, unknown>>(["sessions", safeKey]);
 
-      const messages: SessionMessage[] = [];
-      for (const line of lines) {
-        try {
-          const parsed = JSON.parse(line);
-          messages.push({
-            role: parsed.role,
-            content: parsed.content,
-            timestamp: parsed.timestamp || parsed.ts,
-            toolCallId: parsed.toolCallId,
-            name: parsed.name,
-          });
-        } catch {
-          // Skip invalid lines
-        }
-      }
+      const messages: SessionMessage[] = lines.map((parsed) => ({
+        role: (parsed.role as SessionMessage["role"]) ?? "user",
+        content: String(parsed.content ?? ""),
+        timestamp: (parsed.timestamp as number) || (parsed.ts as number) || Date.now(),
+        toolCallId: parsed.toolCallId as string | undefined,
+        name: parsed.name as string | undefined,
+        providerId: parsed.providerId as string | undefined,
+        model: parsed.model as string | undefined,
+        metadata: parsed.metadata as Record<string, unknown> | undefined,
+      }));
 
       if (limit && messages.length > limit) {
         return messages.slice(-limit);
@@ -175,6 +187,49 @@ export class SessionManager {
       await fs.unlink(sessionFile);
     } catch {
       // File doesn't exist
+    }
+
+    try {
+      const safeKey = this.getSafeSessionKey(sessionKey);
+      const keys = await this.storage.listKeys(["tool-parts", safeKey]);
+      for (const key of keys) {
+        await this.storage.remove(key);
+      }
+    } catch {
+      // Ignore cleanup errors
+    }
+  }
+
+  /**
+   * Upsert a tool part for a session
+   */
+  async upsertToolPart(sessionKey: string, part: ToolPart): Promise<void> {
+    const safeKey = this.getSafeSessionKey(sessionKey);
+    try {
+      await this.storage.writeJson(["tool-parts", safeKey, part.id], part);
+    } catch (err) {
+      this.logger.warn(
+        { error: err instanceof Error ? err.message : String(err), sessionKey, tool: part.tool },
+        "Failed to persist tool part"
+      );
+    }
+  }
+
+  /**
+   * List tool parts for a session
+   */
+  async listToolParts(sessionKey: string): Promise<ToolPart[]> {
+    const safeKey = this.getSafeSessionKey(sessionKey);
+    try {
+      const keys = await this.storage.listKeys(["tool-parts", safeKey]);
+      const parts: ToolPart[] = [];
+      for (const key of keys) {
+        const part = await this.storage.readJson<ToolPart>(key);
+        if (part) parts.push(part);
+      }
+      return parts;
+    } catch {
+      return [];
     }
   }
 
@@ -212,8 +267,15 @@ export class SessionManager {
    * Get session file path
    */
   private getSessionFilePath(sessionKey: string): string {
-    const safeKey = sessionKey.replace(/[^a-zA-Z0-9_-]/g, "_");
+    const safeKey = this.getSafeSessionKey(sessionKey);
     return path.join(this.stateDir, "sessions", `${safeKey}.jsonl`);
+  }
+
+  private getSafeSessionKey(sessionKey: string): string {
+    return sessionKey
+      .split(":")
+      .map(part => part.replace(/[^a-zA-Z0-9_-]/g, "_"))
+      .join("_");
   }
 
   /**

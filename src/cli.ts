@@ -3,6 +3,9 @@
  *
  * This is the new unified CLI entry point that brings together all components.
  * It provides a discoverable, user-friendly interface to the ANT agent system.
+ *
+ * PROOF OF ACCESS: Modified by ANT agent at 2026-02-02T13:59:56.793Z
+ * This comment demonstrates the agent has full read/write access to its own source code.
  */
 
 import { Command } from "commander";
@@ -437,7 +440,7 @@ diagnostics
   .command("test-all")
   .description("Run all diagnostic tests")
   .option("-g, --gateway <url>", "Gateway URL")
-  .option("-t, --timeout <ms>", "Timeout in milliseconds", "30000")
+  .option("-t, --timeout <ms>", "Timeout in milliseconds", "300000")
   .option("--json", "Output as JSON")
   .option("-s, --suite <name>", "Run specific test suite (endpoints, agent, whatsapp)")
   .action(async (options, cmd) => {
@@ -449,7 +452,7 @@ diagnostics
   .command("endpoints")
   .description("Test HTTP endpoints")
   .option("-g, --gateway <url>", "Gateway URL")
-  .option("-t, --timeout <ms>", "Timeout in milliseconds", "30000")
+  .option("-t, --timeout <ms>", "Timeout in milliseconds", "300000")
   .option("--json", "Output as JSON")
   .action(async (options, cmd) => {
     const cfg = await loadConfig(cmd.optsWithGlobals().config);
@@ -460,7 +463,7 @@ diagnostics
   .command("agent-health")
   .description("Test agent startup and health")
   .option("-g, --gateway <url>", "Gateway URL")
-  .option("-t, --timeout <ms>", "Timeout in milliseconds", "30000")
+  .option("-t, --timeout <ms>", "Timeout in milliseconds", "300000")
   .option("--json", "Output as JSON")
   .action(async (options, cmd) => {
     const cfg = await loadConfig(cmd.optsWithGlobals().config);
@@ -471,7 +474,7 @@ diagnostics
   .command("whatsapp")
   .description("Test WhatsApp integration")
   .option("-g, --gateway <url>", "Gateway URL")
-  .option("-t, --timeout <ms>", "Timeout in milliseconds", "30000")
+  .option("-t, --timeout <ms>", "Timeout in milliseconds", "300000")
   .option("--json", "Output as JSON")
   .action(async (options, cmd) => {
     const cfg = await loadConfig(cmd.optsWithGlobals().config);

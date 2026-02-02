@@ -16,10 +16,17 @@ import type { MemoryChunk, MemorySource, StoredEmbedding } from "./types.js";
 
 /**
  * SQLite storage backend for memory system
+ * 
+ * Supports:
+ * - Vector similarity search (cosine distance)
+ * - FTS5 keyword search (full-text search)
+ * - Session transcript delta tracking
+ * - Incremental indexing
  */
 export class SqliteStore {
   private readonly db: DatabaseSync;
   private readonly retentionDays: number;
+  private ftsAvailable = false;
 
   constructor(dbPath: string, retentionDays = 30) {
     this.db = new DatabaseSync(dbPath);
@@ -29,6 +36,8 @@ export class SqliteStore {
 
   /**
    * Create database schema if not exists
+   * 
+   * Includes FTS5 virtual table for hybrid search
    */
   private ensureSchema(): void {
     this.db.exec(`
@@ -65,12 +74,53 @@ export class SqliteStore {
         FOREIGN KEY (chunk_id) REFERENCES chunks(id) ON DELETE CASCADE
       );
 
+      -- Session file delta tracking (for incremental indexing)
+      CREATE TABLE IF NOT EXISTS session_deltas (
+        session_path TEXT PRIMARY KEY,
+        last_size INTEGER NOT NULL,
+        last_indexed_at INTEGER NOT NULL,
+        pending_bytes INTEGER NOT NULL DEFAULT 0,
+        pending_messages INTEGER NOT NULL DEFAULT 0
+      );
+
       -- Indexes for efficient queries
       CREATE INDEX IF NOT EXISTS idx_chunks_path ON chunks(path);
       CREATE INDEX IF NOT EXISTS idx_chunks_source ON chunks(source);
       CREATE INDEX IF NOT EXISTS idx_files_source ON files(source);
       CREATE INDEX IF NOT EXISTS idx_files_updated ON files(updated_at);
     `);
+
+    // Create FTS5 virtual table for keyword search
+    this.ensureFtsTable();
+  }
+
+  /**
+   * Ensure FTS5 table exists (optional - may fail on older SQLite)
+   */
+  private ensureFtsTable(): void {
+    try {
+      this.db.exec(`
+        CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
+          text,
+          id UNINDEXED,
+          path UNINDEXED,
+          source UNINDEXED,
+          start_line UNINDEXED,
+          end_line UNINDEXED
+        );
+      `);
+      this.ftsAvailable = true;
+    } catch {
+      // FTS5 not available in this SQLite build
+      this.ftsAvailable = false;
+    }
+  }
+
+  /**
+   * Check if FTS5 is available for hybrid search
+   */
+  isFtsAvailable(): boolean {
+    return this.ftsAvailable;
   }
 
   /**
@@ -392,6 +442,179 @@ export class SqliteStore {
       embeddingCount,
       dbSizeBytes: pageCount * pageSize,
     };
+  }
+
+  /**
+   * Search using FTS5 (keyword search)
+   * 
+   * Uses full-text search for exact phrase matching and relevance
+   */
+  searchKeyword(
+    ftsQuery: string,
+    maxResults: number,
+  ): Array<{
+    id: string;
+    path: string;
+    source: MemorySource;
+    startLine: number;
+    endLine: number;
+    snippet: string;
+    textScore: number;
+  }> {
+    if (!this.ftsAvailable) return [];
+
+    try {
+      const rows = this.db
+        .prepare(
+          `SELECT 
+             id, path, source, start_line, end_line, text,
+             rank as bm25Rank
+           FROM chunks_fts
+           WHERE chunks_fts MATCH ?
+           ORDER BY rank
+           LIMIT ?`,
+        )
+        .all(ftsQuery, maxResults) as Array<{
+        id: string;
+        path: string;
+        source: MemorySource;
+        start_line: number;
+        end_line: number;
+        text: string;
+        bm25Rank: number;
+      }>;
+
+      return rows.map((row) => {
+        // BM25 rank to score: 1/(1+rank) gives us 0-1 range
+        const textScore = 1 / (1 + Math.max(0, row.bm25Rank));
+
+        // Truncate snippet to ~700 chars
+        const snippet = row.text.slice(0, 700);
+
+        return {
+          id: row.id,
+          path: row.path,
+          source: row.source,
+          startLine: row.start_line,
+          endLine: row.end_line,
+          snippet,
+          textScore,
+        };
+      });
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Index chunk in FTS5 table for keyword search
+   */
+  indexChunkFts(chunk: {
+    id: string;
+    path: string;
+    source: MemorySource;
+    startLine: number;
+    endLine: number;
+    text: string;
+  }): void {
+    if (!this.ftsAvailable) return;
+
+    try {
+      this.db
+        .prepare(
+          `INSERT INTO chunks_fts (text, id, path, source, start_line, end_line)
+           VALUES (?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          chunk.text,
+          chunk.id,
+          chunk.path,
+          chunk.source,
+          chunk.startLine,
+          chunk.endLine,
+        );
+    } catch {
+      // Ignore FTS indexing errors
+    }
+  }
+
+  /**
+   * Remove chunk from FTS5 index
+   */
+  removeChunkFts(chunkId: string): void {
+    if (!this.ftsAvailable) return;
+
+    try {
+      this.db
+        .prepare("DELETE FROM chunks_fts WHERE id = ?")
+        .run(chunkId);
+    } catch {
+      // Ignore errors
+    }
+  }
+
+  /**
+   * Get session delta tracking info
+   */
+  getSessionDelta(sessionPath: string): {
+    lastSize: number;
+    lastIndexedAt: number;
+    pendingBytes: number;
+    pendingMessages: number;
+  } | null {
+    const row = this.db
+      .prepare(
+        `SELECT last_size, last_indexed_at, pending_bytes, pending_messages
+         FROM session_deltas WHERE session_path = ?`,
+      )
+      .get(sessionPath) as
+      | {
+          last_size: number;
+          last_indexed_at: number;
+          pending_bytes: number;
+          pending_messages: number;
+        }
+      | undefined;
+
+    if (!row) return null;
+
+    return {
+      lastSize: row.last_size,
+      lastIndexedAt: row.last_indexed_at,
+      pendingBytes: row.pending_bytes,
+      pendingMessages: row.pending_messages,
+    };
+  }
+
+  /**
+   * Update session delta tracking
+   */
+  updateSessionDelta(sessionPath: string, updates: {
+    lastSize?: number;
+    pendingBytes?: number;
+    pendingMessages?: number;
+  }): void {
+    const now = Date.now();
+    const current = this.getSessionDelta(sessionPath) ?? {
+      lastSize: 0,
+      lastIndexedAt: now,
+      pendingBytes: 0,
+      pendingMessages: 0,
+    };
+
+    this.db
+      .prepare(
+        `INSERT OR REPLACE INTO session_deltas
+         (session_path, last_size, last_indexed_at, pending_bytes, pending_messages)
+         VALUES (?, ?, ?, ?, ?)`,
+      )
+      .run(
+        sessionPath,
+        updates.lastSize ?? current.lastSize,
+        now,
+        updates.pendingBytes ?? current.pendingBytes,
+        updates.pendingMessages ?? current.pendingMessages,
+      );
   }
 
   /**

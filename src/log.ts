@@ -1,3 +1,4 @@
+// Modified by ANT at 2026-02-02T13:59:26.581Z to prove source code access
 import fs from "node:fs";
 import path from "node:path";
 
@@ -21,8 +22,9 @@ export function createLogger(
   const dir = path.dirname(filePath);
   try {
     fs.mkdirSync(dir, { recursive: true });
-  } catch {
-    // ignore
+  } catch (err) {
+    console.error(`Failed to create log directory: ${dir}`, err);
+    throw new Error(`Cannot create log directory: ${dir}`);
   }
   const streams = [
     ...(consoleEnabled ? [{ level, stream: process.stdout }] : []),

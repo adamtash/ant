@@ -11,6 +11,7 @@
 
 import { EventEmitter } from "node:events";
 import { randomUUID } from "node:crypto";
+import { getEventStream, createEventPublishers } from "../monitor/event-stream.js";
 
 import type {
   Channel,
@@ -37,6 +38,13 @@ export interface RouterConfig {
 
   /** Queue processing concurrency */
   concurrency?: number;
+
+  /** Session ordering configuration */
+  sessionOrdering?: {
+    enabled?: boolean;
+    maxConcurrentSessions?: number;
+    queueTimeoutMs?: number;
+  };
 
   /** Default handler for unrouted messages */
   defaultHandler?: MessageHandler;
@@ -76,6 +84,9 @@ export class MessageRouter extends EventEmitter {
   private readonly maxQueueSize: number;
   private readonly concurrency: number;
   private readonly sessionTimeoutMs: number;
+  private readonly sessionOrderingEnabled: boolean;
+  private readonly maxConcurrentSessions: number;
+  private readonly sessionQueueTimeoutMs: number;
 
   /** Registered channel adapters */
   private readonly adapters: Map<Channel, BaseChannelAdapter> = new Map();
@@ -98,8 +109,15 @@ export class MessageRouter extends EventEmitter {
   /** Cross-channel sessions */
   private readonly sessions: Map<string, ChannelSession> = new Map();
 
+  /** Session lane queues */
+  private readonly sessionQueues: Map<string, QueuedMessage[]> = new Map();
+  private readonly sessionProcessing: Map<string, number> = new Map();
+
   /** Cleanup interval */
   private cleanupInterval: NodeJS.Timeout | null = null;
+  
+  /** Event publishers */
+  private events = createEventPublishers(getEventStream());
 
   constructor(config: RouterConfig) {
     super();
@@ -108,6 +126,9 @@ export class MessageRouter extends EventEmitter {
     this.concurrency = config.concurrency ?? 1;
     this.sessionTimeoutMs = config.sessionTimeoutMs ?? 30 * 60 * 1000;
     this.defaultHandler = config.defaultHandler;
+    this.sessionOrderingEnabled = config.sessionOrdering?.enabled ?? true;
+    this.maxConcurrentSessions = config.sessionOrdering?.maxConcurrentSessions ?? 3;
+    this.sessionQueueTimeoutMs = config.sessionOrdering?.queueTimeoutMs ?? 300_000;
   }
 
   // ==========================================================================
@@ -118,10 +139,10 @@ export class MessageRouter extends EventEmitter {
    * Start the router
    */
   start(): void {
-    // Start cleanup interval
+    // Start cleanup interval - 10s for faster GC of expired sessions
     this.cleanupInterval = setInterval(() => {
       this.pruneExpiredSessions();
-    }, 60_000);
+    }, 10_000);
 
     this.logger.info("Message router started");
   }
@@ -252,14 +273,22 @@ export class MessageRouter extends EventEmitter {
   /**
    * Handle an incoming message
    */
-  private handleIncomingMessage(message: NormalizedMessage): void {
+  private async handleIncomingMessage(message: NormalizedMessage): Promise<void> {
     this.emit("event", { type: "message_received", message });
+    
+    await this.events.messageReceived({
+      sender: message.sender.name || message.sender.id,
+      contentPreview: message.content ? message.content.slice(0, 50) : "[Media]",
+      messageLength: message.content?.length || 0
+    }, { sessionKey: message.context.sessionKey, channel: message.channel });
 
     // Update session
     this.updateSession(message);
 
     // Add to queue
-    const queue = this.queues.get(message.channel);
+    const queue = this.sessionOrderingEnabled
+      ? this.ensureSessionQueue(message.context.sessionKey)
+      : this.queues.get(message.channel);
     if (!queue) {
       this.logger.warn({ channel: message.channel }, "No queue for channel");
       return;
@@ -272,7 +301,17 @@ export class MessageRouter extends EventEmitter {
         message,
         reason: "queue_full",
       });
+      await this.events.messageDropped({ reason: "queue_full" }, { sessionKey: message.context.sessionKey, channel: message.channel });
       this.logger.warn({ channel: message.channel }, "Queue full, dropping message");
+      
+      // Notify user
+      await this.sendMessage({
+          ...message,
+          id: randomUUID(),
+          content: "⚠️ System Check: Message queue is full. Please try again in a moment.",
+          timestamp: Date.now(),
+          priority: "high"
+      });
       return;
     }
 
@@ -285,9 +324,19 @@ export class MessageRouter extends EventEmitter {
 
     this.insertByPriority(queue, queuedMessage);
     this.emit("event", { type: "message_queued", message, queueSize: queue.length });
+    
+    await this.events.messageQueued({ 
+        queueLength: queue.length, 
+        position: queue.indexOf(queuedMessage),
+        priority: message.priority 
+    }, { sessionKey: message.context.sessionKey, channel: message.channel });
 
     // Process queue
-    this.processQueue(message.channel);
+    if (this.sessionOrderingEnabled) {
+      this.processSessionQueues();
+    } else {
+      this.processQueue(message.channel);
+    }
   }
 
   /**
@@ -320,6 +369,105 @@ export class MessageRouter extends EventEmitter {
     }
   }
 
+  private ensureSessionQueue(sessionKey: string): QueuedMessage[] {
+    let queue = this.sessionQueues.get(sessionKey);
+    if (!queue) {
+      queue = [];
+      this.sessionQueues.set(sessionKey, queue);
+      this.sessionProcessing.set(sessionKey, 0);
+    }
+    return queue;
+  }
+
+  private processSessionQueues(): void {
+    let activeSessions = 0;
+    for (const count of this.sessionProcessing.values()) {
+      activeSessions += count;
+    }
+    if (activeSessions >= this.maxConcurrentSessions) {
+      return;
+    }
+    for (const [sessionKey, queue] of this.sessionQueues.entries()) {
+      if (activeSessions >= this.maxConcurrentSessions) {
+        break;
+      }
+      if (queue.length === 0) continue;
+      const processing = this.sessionProcessing.get(sessionKey) ?? 0;
+      if (processing > 0) continue;
+
+      const item = queue.shift();
+      if (!item) continue;
+      if (Date.now() - item.enqueuedAt > this.sessionQueueTimeoutMs) {
+        this.logger.warn({ sessionKey }, "Session queue timeout exceeded, dropping message");
+        continue;
+      }
+      this.sessionProcessing.set(sessionKey, processing + 1);
+      activeSessions += 1;
+      this.executeQueuedMessage(item, sessionKey);
+    }
+  }
+
+  private executeQueuedMessage(item: QueuedMessage, sessionKeyOverride?: string): void {
+    const channel = item.message.channel;
+    const sessionKey = sessionKeyOverride ?? item.message.context.sessionKey;
+
+    this.events.messageProcessing({ handler: "agent" }, { sessionKey, channel }).catch(() => {});
+
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      setTimeout(
+        () =>
+          reject(
+            new Error(
+              `Timeout: Message processing took longer than ${this.sessionQueueTimeoutMs / 1000}s`
+            )
+          ),
+        this.sessionQueueTimeoutMs
+      );
+    });
+
+    Promise.race([this.processMessage(item.message), timeoutPromise])
+      .then((response) => {
+        const success = !!response;
+        this.emit("event", { type: "message_processed", message: item.message, response: response ?? undefined });
+        this.events
+          .messageProcessed(
+            { duration: Date.now() - item.enqueuedAt, success },
+            { sessionKey, channel }
+          )
+          .catch(() => {});
+      })
+      .catch((err) => {
+        this.logger.error({ error: String(err) }, "Message processing failed");
+        this.emit("event", {
+          type: "error",
+          error: err instanceof Error ? err : new Error(String(err)),
+          message: item.message,
+        });
+        this.events
+          .errorOccurred(
+            {
+              errorType: "processing_failed",
+              severity: "high",
+              message: String(err),
+              context: { sessionKey },
+            },
+            { sessionKey, channel }
+          )
+          .catch(() => {});
+      })
+      .finally(() => {
+        if (this.sessionOrderingEnabled) {
+          const current = this.sessionProcessing.get(sessionKey) ?? 1;
+          this.sessionProcessing.set(sessionKey, Math.max(0, current - 1));
+          this.processSessionQueues();
+        } else {
+          const current = this.processing.get(channel) ?? 1;
+          this.processing.set(channel, current - 1);
+          this.processQueue(channel);
+        }
+      });
+  }
+
   /**
    * Process the queue for a channel
    */
@@ -335,24 +483,7 @@ export class MessageRouter extends EventEmitter {
     if (!item) return;
 
     this.processing.set(channel, processing + 1);
-
-    this.processMessage(item.message)
-      .then((response) => {
-        this.emit("event", { type: "message_processed", message: item.message, response: response ?? undefined });
-      })
-      .catch((err) => {
-        this.logger.error({ error: String(err) }, "Message processing failed");
-        this.emit("event", {
-          type: "error",
-          error: err instanceof Error ? err : new Error(String(err)),
-          message: item.message,
-        });
-      })
-      .finally(() => {
-        const current = this.processing.get(channel) ?? 1;
-        this.processing.set(channel, current - 1);
-        this.processQueue(channel);
-      });
+    this.executeQueuedMessage(item);
   }
 
   /**
@@ -369,11 +500,31 @@ export class MessageRouter extends EventEmitter {
     const handler = this.findHandler(processedMessage);
     if (!handler) {
       this.logger.debug({ sessionKey: processedMessage.context.sessionKey }, "No handler found");
+      
+      // Notify user
+      await this.sendToSession(
+           processedMessage.context.sessionKey, 
+           "⚠️ Configuration Error: No handler found for this message."
+      );
+      
+      await this.events.messageDropped({ reason: "no_handler" }, { sessionKey: message.context.sessionKey, channel: message.channel });
       return null;
     }
 
-    // Execute handler
-    return handler(processedMessage);
+    try {
+        return await handler(processedMessage);
+    } catch (err) {
+        const errorMsg = err instanceof Error ? err.message : String(err);
+        
+        // Notify user about error
+        await this.sendToSession(
+            processedMessage.context.sessionKey,
+            `❌ I encountered an error: ${errorMsg}`
+        );
+        
+        // Rethrow for queue management
+        throw err;
+    }
   }
 
   /**
@@ -495,14 +646,18 @@ export class MessageRouter extends EventEmitter {
     return Array.from(this.sessions.values()).filter((s) => s.channel === channel);
   }
 
+  /** Maximum number of sessions to prevent unbounded memory growth */
+  private readonly maxSessions = 1000;
+
   /**
-   * Remove expired sessions
+   * Remove expired sessions with LRU eviction
    */
   private pruneExpiredSessions(): void {
     const now = Date.now();
     const cutoff = now - this.sessionTimeoutMs;
     let pruned = 0;
 
+    // Remove expired sessions
     for (const [key, session] of this.sessions.entries()) {
       if (session.lastActivity < cutoff) {
         this.sessions.delete(key);
@@ -510,8 +665,33 @@ export class MessageRouter extends EventEmitter {
       }
     }
 
+    // LRU eviction if still over limit
+    if (this.sessions.size > this.maxSessions) {
+      const sorted = Array.from(this.sessions.entries())
+        .sort((a, b) => a[1].lastActivity - b[1].lastActivity);
+      
+      const toDelete = sorted.slice(0, this.sessions.size - this.maxSessions);
+      for (const [key] of toDelete) {
+        this.sessions.delete(key);
+        pruned += 1;
+      }
+    }
+
     if (pruned > 0) {
-      this.logger.debug({ pruned }, "Pruned expired sessions");
+      this.logger.debug({ pruned, total: this.sessions.size }, "Pruned expired sessions");
+    }
+
+    if (this.sessionOrderingEnabled) {
+      for (const [sessionKey, queue] of this.sessionQueues.entries()) {
+        if (
+          queue.length === 0 &&
+          (this.sessionProcessing.get(sessionKey) ?? 0) === 0 &&
+          !this.sessions.has(sessionKey)
+        ) {
+          this.sessionQueues.delete(sessionKey);
+          this.sessionProcessing.delete(sessionKey);
+        }
+      }
     }
   }
 
@@ -529,7 +709,24 @@ export class MessageRouter extends EventEmitter {
       return false;
     }
 
+    this.logger.info({
+      channel: message.channel,
+      sessionKey: message.context.sessionKey,
+      chatId: message.context.chatId,
+      contentLength: message.content?.length || 0,
+      contentPreview: message.content?.slice(0, 200) || "(empty)",
+      hasMedia: !!message.media,
+    }, "Router sending message to adapter");
+
     const result = await adapter.sendMessage(message);
+    
+    this.logger.info({
+      channel: message.channel,
+      success: result.ok,
+      error: result.error,
+      messageId: result.messageId,
+    }, "Router sendMessage result");
+    
     return result.ok;
   }
 
@@ -541,9 +738,42 @@ export class MessageRouter extends EventEmitter {
     content: string,
     options?: { media?: NormalizedMessage["media"] }
   ): Promise<boolean> {
-    const session = this.sessions.get(sessionKey);
+    let session = this.sessions.get(sessionKey);
+    
+    // Attempt to recover session from key if missing
     if (!session) {
-      this.logger.warn({ sessionKey }, "Session not found");
+      const parts = sessionKey.split(":");
+      if (parts.length >= 3) {
+        const [channel, type, ...rest] = parts;
+        const chatId = rest.join(":");
+        
+        if (channel && chatId && this.adapters.has(channel as Channel)) {
+           this.logger.info({ sessionKey }, "Recovering missing session from key");
+           session = {
+             sessionKey,
+             channel: channel as Channel,
+             chatId,
+             createdAt: Date.now(),
+             lastActivity: Date.now(),
+             messageCount: 0
+           };
+           // Re-add to sessions map
+           this.sessions.set(sessionKey, session);
+        }
+      }
+    }
+
+    if (!session) {
+      this.logger.warn({ sessionKey }, "Session not found and could not be recovered");
+      
+      // Emit error event
+      await this.events.errorOccurred({
+        errorType: "session_not_found",
+        severity: "medium",
+        message: `Could not send message to session ${sessionKey}`,
+        context: { sessionKey }
+      }, { sessionKey });
+      
       return false;
     }
 
@@ -575,6 +805,11 @@ export class MessageRouter extends EventEmitter {
   getQueueStats(): Map<Channel, { queued: number; processing: number }> {
     const stats = new Map<Channel, { queued: number; processing: number }>();
 
+    if (this.sessionOrderingEnabled) {
+      stats.set("cli", this.getSessionQueueStats());
+      return stats;
+    }
+
     for (const [channel, queue] of this.queues.entries()) {
       stats.set(channel, {
         queued: queue.length,
@@ -583,6 +818,21 @@ export class MessageRouter extends EventEmitter {
     }
 
     return stats;
+  }
+
+  getSessionQueueStats(): { queued: number; processing: number } {
+    if (!this.sessionOrderingEnabled) {
+      return { queued: 0, processing: 0 };
+    }
+    let queued = 0;
+    let processing = 0;
+    for (const queue of this.sessionQueues.values()) {
+      queued += queue.length;
+    }
+    for (const count of this.sessionProcessing.values()) {
+      processing += count;
+    }
+    return { queued, processing };
   }
 
   /**
@@ -595,6 +845,14 @@ export class MessageRouter extends EventEmitter {
       }
       for (const count of this.processing.values()) {
         if (count > 0) return false;
+      }
+      if (this.sessionOrderingEnabled) {
+        for (const queue of this.sessionQueues.values()) {
+          if (queue.length > 0) return false;
+        }
+        for (const count of this.sessionProcessing.values()) {
+          if (count > 0) return false;
+        }
       }
       return true;
     };

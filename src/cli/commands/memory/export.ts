@@ -115,7 +115,7 @@ async function exportAsJson(cfg: AntConfig): Promise<unknown[]> {
     try {
       const base = `http://${cfg.ui.host}:${cfg.ui.port}`;
       const ctrl = new AbortController();
-      const timeout = setTimeout(() => ctrl.abort(), 30000);
+      const timeout = setTimeout(() => ctrl.abort(), 300000);
 
       const res = await fetch(`${base}/api/memory/export?format=json`, {
         signal: ctrl.signal,

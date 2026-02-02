@@ -26,6 +26,7 @@ export type GatewayEventType =
   | "response"
   | "tool_call"
   | "tool_result"
+  | "tool_part_updated"
   | "error"
   | "status"
   | "task_started"

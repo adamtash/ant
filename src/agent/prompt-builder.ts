@@ -329,15 +329,37 @@ export function trimMessagesForContext(
   let total = 0;
   const reversed = [...messages].reverse();
   const kept: Message[] = [];
+  const compactPlaceholder = "[Old tool result content cleared]";
 
   for (const msg of reversed) {
-    const tokenEstimate = estimateTokens(msg.content ?? "");
+    let candidate = msg;
+    let tokenEstimate = estimateTokens(candidate.content ?? "");
+
     if (kept.length === 0 || total + tokenEstimate <= tokenBudget) {
-      kept.push(msg);
+      kept.push(candidate);
       total += tokenEstimate;
-    } else {
-      break;
+      continue;
     }
+
+    if (msg.role === "tool" && msg.content && msg.content.length > 4000 && !msg.metadata?.compacted) {
+      candidate = {
+        ...msg,
+        content: compactPlaceholder,
+        metadata: {
+          ...(msg.metadata ?? {}),
+          compacted: Date.now(),
+          originalLength: msg.content.length,
+        },
+      };
+      tokenEstimate = estimateTokens(candidate.content ?? "");
+      if (total + tokenEstimate <= tokenBudget) {
+        kept.push(candidate);
+        total += tokenEstimate;
+        continue;
+      }
+    }
+
+    break;
   }
 
   const trimmed = kept.reverse();

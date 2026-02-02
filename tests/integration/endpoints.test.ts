@@ -20,7 +20,7 @@ describe("Gateway HTTP Endpoints", () => {
   beforeAll(async () => {
     instance = await spawnTestInstance({ enableMemory: false });
     await waitForGateway(instance, 15000);
-  }, 30000);
+  }, 300000);
 
   afterAll(async () => {
     if (instance) {

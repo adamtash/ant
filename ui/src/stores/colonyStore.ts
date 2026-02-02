@@ -65,7 +65,6 @@ export interface ColonyState {
   start: () => void;
   stop: () => void;
   reset: () => void;
-  spawnAmbientAnts: (count: number) => void;
 
   // Entity management
   spawnAnt: (caste: AntCaste, position: Vector2D, taskId?: string) => string;
@@ -73,11 +72,17 @@ export interface ColonyState {
   getAnt: (id: string) => Ant | undefined;
   getAllAnts: () => Ant[];
   getAntRenderData: () => AntRenderData[];
+  
+  // Backend entity tracking (NEW)
+  spawnEntityAnt: (entityId: string, entityType: 'task' | 'subagent' | 'error' | 'cron' | 'memory', caste: AntCaste, chamberType: ChamberType) => string | null;
+  findAntByEntityId: (entityId: string) => Ant | undefined;
+  removeAntByEntityId: (entityId: string) => boolean;
 
   // Queen management
   createQueen: (position: Vector2D) => void;
   activateQueen: () => void;
   deactivateQueen: () => void;
+  setQueenThinking: (thinking: boolean) => void;
 
   // Chamber management
   addChamber: (chamber: Chamber) => void;
@@ -239,38 +244,71 @@ export const useColonyStore = create<ColonyState>((set, get) => ({
 
     // Create queen in royal chamber
     get().createQueen({ x: centerX, y: centerY - 50 });
-
-    // Spawn ambient ants for atmosphere
-    get().spawnAmbientAnts(15);
   },
 
-  // Spawn ambient ants for visual richness
-  spawnAmbientAnts: (count: number) => {
+  // Spawn ant for a specific backend entity (task, subagent, etc.)
+  spawnEntityAnt: (entityId: string, entityType: 'task' | 'subagent' | 'error' | 'cron' | 'memory', caste: AntCaste, chamberType: ChamberType) => {
     const state = get();
-    const chambers = Array.from(state.chambers.values());
-
-    for (let i = 0; i < count; i++) {
-      // Pick a random chamber
-      const chamber = chambers[Math.floor(Math.random() * chambers.length)];
-
-      // Random position within chamber
-      const angle = Math.random() * Math.PI * 2;
-      const distance = Math.random() * chamber.radius * 0.7;
-      const position = {
-        x: chamber.position.x + Math.cos(angle) * distance,
-        y: chamber.position.y + Math.sin(angle) * distance,
-      };
-
-      // Determine caste based on chamber type
-      let caste: AntCaste = 'worker';
-      if (chamber.type === 'war') caste = 'soldier';
-      else if (chamber.type === 'nursery') caste = 'nurse';
-      else if (chamber.type === 'foraging') caste = 'forager';
-      else if (chamber.type === 'builders') caste = 'architect';
-
-      // Spawn as ambient (no task)
-      state.spawnAnt(caste, position, undefined);
+    
+    // Find the appropriate chamber
+    let chamber: Chamber | undefined;
+    for (const [, c] of state.chambers) {
+      if (c.type === chamberType) {
+        chamber = c;
+        break;
+      }
     }
+    
+    // Fallback to foraging chamber if not found
+    if (!chamber) {
+      chamber = state.chambers.get('foraging');
+    }
+    
+    if (!chamber) {
+      return null;
+    }
+    
+    // Position within chamber
+    const angle = Math.random() * Math.PI * 2;
+    const distance = Math.random() * chamber.radius * 0.6;
+    const position = {
+      x: chamber.position.x + Math.cos(angle) * distance,
+      y: chamber.position.y + Math.sin(angle) * distance,
+    };
+    
+    // Spawn the ant with entity tracking
+    const antId = state.spawnAnt(caste, position, entityId);
+    
+    // Store entity mapping
+    const ant = state.ants.get(antId);
+    if (ant) {
+      ant.entityType = entityType;
+      ant.entityId = entityId;
+    }
+    
+    return antId;
+  },
+  
+  // Find ant by entity ID
+  findAntByEntityId: (entityId: string) => {
+    const state = get();
+    for (const [, ant] of state.ants) {
+      if (ant.entityId === entityId) {
+        return ant;
+      }
+    }
+    return undefined;
+  },
+  
+  // Remove ant by entity ID (when task/subagent completes)
+  removeAntByEntityId: (entityId: string) => {
+    const state = get();
+    const ant = state.findAntByEntityId(entityId);
+    if (ant) {
+      state.removeAnt(ant.id);
+      return true;
+    }
+    return false;
   },
 
   // Simulation tick
@@ -458,6 +496,14 @@ export const useColonyStore = create<ColonyState>((set, get) => ({
     const queen = get().queen;
     if (queen) {
       queen.deactivate();
+      set({ queen });
+    }
+  },
+  
+  setQueenThinking: (thinking: boolean) => {
+    const queen = get().queen;
+    if (queen) {
+      queen.setThinking(thinking);
       set({ queen });
     }
   },

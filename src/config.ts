@@ -12,6 +12,15 @@ const ProviderItemSchema = z
     cliProvider: z.enum(["codex", "copilot", "claude", "kimi"]).default("codex"),
     baseUrl: z.string().optional(),
     apiKey: z.string().optional(),
+    authProfiles: z
+      .array(
+        z.object({
+          apiKey: z.string().min(1),
+          label: z.string().optional(),
+          cooldownMinutes: z.number().int().positive().optional(),
+        })
+      )
+      .default([]),
     model: z.string().min(1),
     models: z
       .object({
@@ -26,6 +35,8 @@ const ProviderItemSchema = z
     embeddingsModel: z.string().min(1).optional(),
     command: z.string().optional(),
     args: z.array(z.string()).optional(),
+    healthCheckTimeoutMs: z.number().int().positive().optional(),
+    healthCheckCacheTtlMinutes: z.number().int().positive().optional(),
   })
   .refine(
     (value) => (value.type === "openai" ? Boolean(value.baseUrl?.trim()) : true),
@@ -72,21 +83,83 @@ const MemorySchema = z.object({
   indexSessions: z.boolean().default(true),
   sqlitePath: z.string().min(1),
   embeddingsModel: z.string().min(1),
+  provider: z
+    .object({
+      embeddings: z.enum(["auto", "local", "openai", "gemini"]).default("auto"),
+      fallback: z.array(z.enum(["local", "openai", "gemini"])).default(["openai"]),
+      local: z
+        .object({
+          baseUrl: z.string().default("http://localhost:1234/v1"),
+          model: z.string().optional(),
+        })
+        .default({}),
+      openai: z
+        .object({
+          baseUrl: z.string().optional(),
+          apiKey: z.string().optional(),
+          model: z.string().optional(),
+        })
+        .default({}),
+      gemini: z
+        .object({
+          apiKey: z.string().optional(),
+          model: z.string().optional(),
+        })
+        .default({}),
+      batch: z
+        .object({
+          enabled: z.boolean().default(true),
+          minChunks: z.number().int().positive().default(50),
+          maxTokens: z.number().int().positive().default(8000),
+          concurrency: z.number().int().positive().default(4),
+          pollIntervalMs: z.number().int().positive().default(2000),
+          timeoutMinutes: z.number().int().positive().default(60),
+        })
+        .default({}),
+    })
+    .default({}),
+  chunking: z
+    .object({
+      tokens: z.number().int().positive().default(400),
+      overlap: z.number().int().min(0).default(80),
+    })
+    .default({}),
+  sources: z.array(z.enum(["memory", "sessions"])).default(["memory", "sessions"]),
   sync: z
     .object({
       onSessionStart: z.boolean().default(true),
       onSearch: z.boolean().default(true),
       watch: z.boolean().default(true),
       watchDebounceMs: z.number().int().positive().default(1500),
-      intervalMinutes: z.number().int().min(0).default(0),
-      sessionsDeltaBytes: z.number().int().positive().default(100_000),
-      sessionsDeltaMessages: z.number().int().positive().default(50),
+      intervalMinutes: z.number().int().min(0).default(60),
+      sessions: z
+        .object({
+          deltaBytes: z.number().int().positive().default(100_000),
+          deltaMessages: z.number().int().positive().default(50),
+        })
+        .default({}),
     })
     .default({}),
-  chunkChars: z.number().int().positive().default(1600),
-  chunkOverlap: z.number().int().min(0).default(200),
-  maxResults: z.number().int().positive().default(6),
-  minScore: z.number().min(0).max(1).default(0.35),
+  query: z
+    .object({
+      maxResults: z.number().int().positive().default(6),
+      minScore: z.number().min(0).max(1).default(0.35),
+      hybrid: z
+        .object({
+          enabled: z.boolean().default(true),
+          vectorWeight: z.number().min(0).max(1).default(0.7),
+          textWeight: z.number().min(0).max(1).default(0.3),
+          candidateMultiplier: z.number().min(1).default(4),
+        })
+        .default({}),
+    })
+    .default({}),
+  cache: z
+    .object({
+      enabled: z.boolean().default(true),
+      maxEntries: z.number().int().positive().default(1000),
+    })
+    .default({}),
 });
 
 const AgentSchema = z.object({
@@ -94,6 +167,32 @@ const AgentSchema = z.object({
   maxHistoryTokens: z.number().int().positive().default(40_000),
   temperature: z.number().min(0).max(2).default(0.2),
   maxToolIterations: z.number().int().positive().default(6),
+  toolLoop: z
+    .object({
+      timeoutPerIterationMs: z.number().int().positive().default(30_000),
+      timeoutPerToolMs: z.number().int().positive().default(30_000),
+      contextWindowThresholdPercent: z.number().int().min(1).max(100).default(80),
+    })
+    .default({}),
+  compaction: z
+    .object({
+      enabled: z.boolean().default(true),
+      thresholdPercent: z.number().int().min(1).max(100).default(75),
+      maxSummaryTokens: z.number().int().positive().default(600),
+      minRecentMessages: z.number().int().positive().default(8),
+    })
+    .default({}),
+  thinking: z
+    .object({
+      level: z.enum(["off", "minimal", "low", "medium", "high", "xhigh"]).default("off"),
+    })
+    .default({}),
+  toolPolicy: z.string().optional(),
+  toolResultGuard: z
+    .object({
+      enabled: z.boolean().default(true),
+    })
+    .default({}),
 });
 
 const MainAgentSchema = z.object({
@@ -118,6 +217,7 @@ const GatewaySchema = z.object({
 const CliToolProviderSchema = z.object({
   command: z.string().min(1),
   args: z.array(z.string()).default([]),
+  timeoutMs: z.number().int().positive().optional(),
 });
 
 const KimiProviderSchema = z.object({
@@ -126,6 +226,7 @@ const KimiProviderSchema = z.object({
   model: z.string().default("kimi-k2"),
   command: z.string().default("kimi"),
   args: z.array(z.string()).default(["--yolo"]),
+  timeoutMs: z.number().int().positive().optional(),
 });
 
 const CliToolsSchema = z.object({
@@ -206,6 +307,23 @@ const BrowserSchema = z
   })
   .default({});
 
+const ToolPolicySchema = z
+  .object({
+    allowedGroups: z.array(z.string()).default([]),
+    deniedGroups: z.array(z.string()).default([]),
+    allowedTools: z.array(z.string()).default([]),
+    deniedTools: z.array(z.string()).default([]),
+    allowedChannels: z.array(z.enum(["whatsapp", "cli", "web", "telegram", "discord"])).default([]),
+    deniedChannels: z.array(z.enum(["whatsapp", "cli", "web", "telegram", "discord"])).default([]),
+    allowedModels: z.array(z.string()).default([]),
+    deniedModels: z.array(z.string()).default([]),
+    allowedAudiences: z.array(z.string()).default([]),
+    deniedAudiences: z.array(z.string()).default([]),
+  })
+  .default({});
+
+const ToolPoliciesSchema = z.record(ToolPolicySchema).default({});
+
 const ConfigSchema = z.object({
   workspaceDir: z.string().default("."),
   stateDir: z.string().optional(),
@@ -217,6 +335,7 @@ const ConfigSchema = z.object({
   whatsapp: WhatsAppSchema,
   memory: MemorySchema,
   agent: AgentSchema.default({}),
+  toolPolicies: ToolPoliciesSchema,
   mainAgent: MainAgentSchema.default({}),
   subagents: SubagentsSchema.default({}),
   gateway: GatewaySchema.default({}),
@@ -321,6 +440,7 @@ function normalizeProviders(base: z.infer<typeof ConfigSchema>): ProvidersOutput
         baseUrl: "http://localhost:1234/v1",
         model: "unknown",
         models: {},
+        authProfiles: [],
       },
     },
   };

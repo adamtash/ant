@@ -23,6 +23,197 @@ import type {
 import type { Logger } from "../log.js";
 
 // ============================================================================
+// Failover Error Handling
+// ============================================================================
+
+export type FailoverReason =
+  | "auth"
+  | "rate_limit"
+  | "timeout"
+  | "billing"
+  | "format"
+  | "compaction"
+  | "unknown";
+
+export class FailoverError extends Error {
+  readonly reason: FailoverReason;
+  readonly providerId?: string;
+  readonly model?: string;
+  readonly status?: number;
+  readonly code?: string;
+
+  constructor(
+    message: string,
+    params: {
+      reason: FailoverReason;
+      providerId?: string;
+      model?: string;
+      status?: number;
+      code?: string;
+      cause?: unknown;
+    }
+  ) {
+    super(message, { cause: params.cause });
+    this.name = "FailoverError";
+    this.reason = params.reason;
+    this.providerId = params.providerId;
+    this.model = params.model;
+    this.status = params.status;
+    this.code = params.code;
+  }
+}
+
+export function isFailoverError(err: unknown): err is FailoverError {
+  return err instanceof FailoverError;
+}
+
+function getStatusCode(err: unknown): number | undefined {
+  if (!err || typeof err !== "object") return undefined;
+  const candidate =
+    (err as { status?: unknown; statusCode?: unknown }).status ??
+    (err as { statusCode?: unknown }).statusCode;
+  if (typeof candidate === "number") return candidate;
+  if (typeof candidate === "string" && /^\d+$/.test(candidate)) {
+    return Number(candidate);
+  }
+  return undefined;
+}
+
+function getErrorCode(err: unknown): string | undefined {
+  if (!err || typeof err !== "object") return undefined;
+  const candidate = (err as { code?: unknown }).code;
+  if (typeof candidate !== "string") return undefined;
+  const trimmed = candidate.trim();
+  return trimmed ? trimmed : undefined;
+}
+
+function getErrorMessage(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  if (typeof err === "string") return err;
+  if (typeof err === "number" || typeof err === "boolean" || typeof err === "bigint") {
+    return String(err);
+  }
+  if (typeof err === "symbol") return err.description ?? "";
+  if (err && typeof err === "object") {
+    const message = (err as { message?: unknown }).message;
+    if (typeof message === "string") return message;
+  }
+  return "";
+}
+
+const TIMEOUT_HINT_RE = /timeout|timed out|deadline exceeded|context deadline exceeded/i;
+const ABORT_TIMEOUT_RE = /request was aborted|request aborted/i;
+
+function hasTimeoutHint(err: unknown): boolean {
+  if (!err) return false;
+  if (err && typeof err === "object" && "name" in err && err.name === "TimeoutError") {
+    return true;
+  }
+  const message = getErrorMessage(err);
+  return Boolean(message && TIMEOUT_HINT_RE.test(message));
+}
+
+function isTimeoutError(err: unknown): boolean {
+  if (hasTimeoutHint(err)) return true;
+  if (!err || typeof err !== "object") return false;
+  if ("name" in err && err.name !== "AbortError") return false;
+  const message = getErrorMessage(err);
+  if (message && ABORT_TIMEOUT_RE.test(message)) return true;
+  const cause = "cause" in err ? (err as { cause?: unknown }).cause : undefined;
+  const reason = "reason" in err ? (err as { reason?: unknown }).reason : undefined;
+  return hasTimeoutHint(cause) || hasTimeoutHint(reason);
+}
+
+type ErrorPattern = RegExp | string;
+const ERROR_PATTERNS = {
+  rateLimit: [
+    /rate[_ ]limit|too many requests|429/,
+    "quota exceeded",
+    "resource has been exhausted",
+    "overloaded",
+  ],
+  timeout: ["timeout", "timed out", "deadline exceeded", "context deadline exceeded"],
+  billing: ["payment required", "insufficient credits", "billing", /\b402\b/],
+  auth: [
+    /invalid[_ ]?api[_ ]?key/,
+    "unauthorized",
+    "forbidden",
+    "invalid token",
+    "no api key",
+    "authentication",
+    "expired",
+    /\b401\b/,
+    /\b403\b/,
+  ],
+  format: ["invalid request", "invalid_request_error", "tool_use.id", "tool_use_id"],
+  compaction: ["compaction failed", "summarization failed", "auto-compaction"],
+} as const;
+
+function matchesErrorPatterns(raw: string, patterns: readonly ErrorPattern[]): boolean {
+  if (!raw) return false;
+  const value = raw.toLowerCase();
+  return patterns.some((pattern) =>
+    pattern instanceof RegExp ? pattern.test(value) : value.includes(pattern)
+  );
+}
+
+export function classifyFailoverReason(raw: string): FailoverReason | null {
+  if (matchesErrorPatterns(raw, ERROR_PATTERNS.rateLimit)) return "rate_limit";
+  if (matchesErrorPatterns(raw, ERROR_PATTERNS.timeout)) return "timeout";
+  if (matchesErrorPatterns(raw, ERROR_PATTERNS.billing)) return "billing";
+  if (matchesErrorPatterns(raw, ERROR_PATTERNS.auth)) return "auth";
+  if (matchesErrorPatterns(raw, ERROR_PATTERNS.format)) return "format";
+  if (matchesErrorPatterns(raw, ERROR_PATTERNS.compaction)) return "compaction";
+  return null;
+}
+
+function resolveFailoverReasonFromStatus(status?: number, message?: string): FailoverReason | null {
+  if (status === 402) return "billing";
+  if (status === 429) return "rate_limit";
+  if (status === 401 || status === 403) return "auth";
+  if (status === 408) return "timeout";
+  const classified = message ? classifyFailoverReason(message) : null;
+  return classified;
+}
+
+export function resolveFailoverReasonFromError(err: unknown): FailoverReason | null {
+  if (isFailoverError(err)) return err.reason;
+  const status = getStatusCode(err);
+  const message = getErrorMessage(err);
+  if (status) {
+    const fromStatus = resolveFailoverReasonFromStatus(status, message);
+    if (fromStatus) return fromStatus;
+  }
+  const code = (getErrorCode(err) ?? "").toUpperCase();
+  if (["ETIMEDOUT", "ESOCKETTIMEDOUT", "ECONNRESET", "ECONNABORTED"].includes(code)) {
+    return "timeout";
+  }
+  if (isTimeoutError(err)) return "timeout";
+  if (message) return classifyFailoverReason(message);
+  return null;
+}
+
+export function coerceToFailoverError(
+  err: unknown,
+  context?: { providerId?: string; model?: string }
+): FailoverError | null {
+  if (isFailoverError(err)) return err;
+  const reason = resolveFailoverReasonFromError(err);
+  if (!reason) return null;
+  const message = getErrorMessage(err) || String(err);
+  const status = getStatusCode(err);
+  const code = getErrorCode(err);
+  return new FailoverError(message, {
+    reason,
+    providerId: context?.providerId,
+    model: context?.model,
+    status,
+    code,
+    cause: err instanceof Error ? err : undefined,
+  });
+}
+
+// ============================================================================
 // Provider Manager
 // ============================================================================
 
@@ -39,6 +230,10 @@ export interface ProviderManagerConfig {
     embeddings?: string;
     subagent?: string;
   };
+  healthCheck?: {
+    timeoutMs?: number;
+    cacheTtlMs?: number;
+  };
 }
 
 /**
@@ -48,6 +243,7 @@ export class ProviderManager {
   private readonly providers: Map<string, LLMProvider> = new Map();
   private readonly config: ProviderManagerConfig;
   private readonly logger: Logger;
+  private readonly healthCache: Map<string, { ok: boolean; checkedAt: number }> = new Map();
 
   constructor(config: ProviderManagerConfig, logger: Logger) {
     this.config = config;
@@ -88,6 +284,7 @@ export class ProviderManager {
           apiKey: config.apiKey || "not-needed",
           model: config.model,
           logger: this.logger,
+          authProfiles: config.authProfiles,
         });
 
       case "cli":
@@ -98,6 +295,7 @@ export class ProviderManager {
           logger: this.logger,
           command: config.command,
           args: config.args,
+          timeoutMs: config.timeoutMs,
         });
 
       case "ollama":
@@ -160,7 +358,7 @@ export class ProviderManager {
       if (provider) {
         this.logger.debug({ id, type: provider.type }, "Checking provider health");
         try {
-          const isHealthy = await provider.health();
+          const isHealthy = await this.checkProviderHealth(id, provider);
           this.logger.debug({ id, isHealthy }, "Provider health check result");
           if (isHealthy) {
             return provider;
@@ -184,6 +382,34 @@ export class ProviderManager {
   getProviderIds(): string[] {
     return Array.from(this.providers.keys());
   }
+
+  private async checkProviderHealth(id: string, provider: LLMProvider): Promise<boolean> {
+    const cacheTtlMs = this.config.healthCheck?.cacheTtlMs ?? 5 * 60 * 1000;
+    const timeoutMs = this.config.healthCheck?.timeoutMs ?? 5000;
+    const cached = this.healthCache.get(id);
+    if (cached && Date.now() - cached.checkedAt < cacheTtlMs) {
+      return cached.ok;
+    }
+
+    const check = this.withTimeout(provider.health(), timeoutMs, "Provider health check timed out");
+    const ok = await check.catch((err) => {
+      this.logger.warn(
+        { id, error: err instanceof Error ? err.message : String(err) },
+        "Provider health check failed with error"
+      );
+      return false;
+    });
+
+    this.healthCache.set(id, { ok, checkedAt: Date.now() });
+    return ok;
+  }
+
+  private async withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+    const timeout = new Promise<never>((_, reject) => {
+      setTimeout(() => reject(new Error(message)), timeoutMs);
+    });
+    return Promise.race([promise, timeout]);
+  }
 }
 
 // ============================================================================
@@ -196,6 +422,7 @@ interface OpenAIProviderOptions {
   apiKey: string;
   model: string;
   logger: Logger;
+  authProfiles?: Array<{ apiKey: string; label?: string; cooldownMinutes?: number }>;
 }
 
 /**
@@ -205,9 +432,17 @@ export class OpenAIProvider implements LLMProvider {
   readonly type: ProviderType = "openai";
   readonly id: string;
   readonly name: string;
+  readonly model: string;
   private readonly baseUrl: string;
   private readonly apiKey: string;
-  private readonly model: string;
+  private readonly authProfiles: Array<{
+    apiKey: string;
+    label?: string;
+    cooldownMinutes?: number;
+    cooldownUntil?: number;
+    lastUsedAt?: number;
+  }>;
+  private authProfileIndex = 0;
   private readonly logger: Logger;
 
   constructor(options: OpenAIProviderOptions) {
@@ -217,6 +452,11 @@ export class OpenAIProvider implements LLMProvider {
     this.apiKey = options.apiKey;
     this.model = options.model;
     this.logger = options.logger;
+    this.authProfiles = (options.authProfiles ?? []).map((profile) => ({
+      apiKey: profile.apiKey,
+      label: profile.label,
+      cooldownMinutes: profile.cooldownMinutes,
+    }));
   }
 
   async chat(messages: Message[], options?: ChatOptions): Promise<ChatResponse> {
@@ -228,7 +468,16 @@ export class OpenAIProvider implements LLMProvider {
         role: m.role,
         content: m.content,
         ...(m.toolCallId && { tool_call_id: m.toolCallId }),
-        ...(m.toolCalls && { tool_calls: m.toolCalls }),
+        ...(m.toolCalls && {
+          tool_calls: m.toolCalls.map(tc => ({
+            id: tc.id,
+            type: "function" as const,
+            function: {
+              name: tc.name,
+              arguments: JSON.stringify(tc.arguments),
+            },
+          })),
+        }),
         ...(m.name && { name: m.name }),
       })),
       temperature: options?.temperature ?? 0.2,
@@ -243,13 +492,28 @@ export class OpenAIProvider implements LLMProvider {
       body.tool_choice = options.toolChoice ?? "auto";
     }
 
-    this.logger.debug({ url, model: this.model }, "OpenAI request");
+    if (options?.thinking?.level && options.thinking.level !== "off") {
+      body.reasoning = { effort: options.thinking.level };
+    }
+
+    // Log the OpenAI provider call details
+    this.logger.info({
+      providerId: this.id,
+      providerType: "openai",
+      model: this.model,
+      baseUrl: this.baseUrl,
+      messageCount: messages.length,
+      hasTools: !!options?.tools && options.tools.length > 0,
+      toolCount: options?.tools?.length || 0,
+      temperature: options?.temperature ?? 0.2,
+      thinkingLevel: options?.thinking?.level,
+    }, "OpenAI provider chat call started");
 
     const response = await fetch(url, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "Authorization": `Bearer ${this.apiKey}`,
+        "Authorization": `Bearer ${this.resolveApiKey()}`,
       },
       body: JSON.stringify(body),
     });
@@ -283,6 +547,19 @@ export class OpenAIProvider implements LLMProvider {
       name: tc.function.name,
       arguments: this.parseArguments(tc.function.arguments),
     }));
+
+    // Log the OpenAI provider call completion
+    this.logger.info({
+      providerId: this.id,
+      providerType: "openai",
+      model: this.model,
+      success: true,
+      finishReason: choice.finish_reason,
+      hasToolCalls: !!toolCalls && toolCalls.length > 0,
+      toolCallCount: toolCalls?.length || 0,
+      contentPreview: (choice.message.content || "").slice(0, 200) + ((choice.message.content || "").length > 200 ? "..." : ""),
+      usage: data.usage,
+    }, "OpenAI provider chat call completed");
 
     return {
       content: choice.message.content || "",
@@ -325,7 +602,7 @@ export class OpenAIProvider implements LLMProvider {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "Authorization": `Bearer ${this.apiKey}`,
+        "Authorization": `Bearer ${this.resolveApiKey()}`,
       },
       body: JSON.stringify({
         model: this.model,
@@ -350,13 +627,44 @@ export class OpenAIProvider implements LLMProvider {
       const response = await fetch(`${this.baseUrl}/models`, {
         method: "GET",
         headers: {
-          "Authorization": `Bearer ${this.apiKey}`,
+          "Authorization": `Bearer ${this.resolveApiKey()}`,
         },
       });
       return response.ok;
     } catch {
       return false;
     }
+  }
+
+  markAuthFailure(): void {
+    const active = this.getActiveProfile();
+    if (!active) return;
+    const cooldownMinutes = active.cooldownMinutes ?? 5;
+    active.cooldownUntil = Date.now() + cooldownMinutes * 60 * 1000;
+    active.lastUsedAt = Date.now();
+    this.authProfileIndex = (this.authProfileIndex + 1) % this.authProfiles.length;
+  }
+
+  private resolveApiKey(): string {
+    const profile = this.getActiveProfile();
+    if (!profile) return this.apiKey;
+    profile.lastUsedAt = Date.now();
+    return profile.apiKey;
+  }
+
+  private getActiveProfile() {
+    if (this.authProfiles.length === 0) return undefined;
+    const startIndex = this.authProfileIndex;
+    for (let offset = 0; offset < this.authProfiles.length; offset++) {
+      const idx = (startIndex + offset) % this.authProfiles.length;
+      const profile = this.authProfiles[idx];
+      if (!profile) continue;
+      if (!profile.cooldownUntil || profile.cooldownUntil <= Date.now()) {
+        this.authProfileIndex = idx;
+        return profile;
+      }
+    }
+    return this.authProfiles[startIndex];
   }
 
   estimateCost(messages: Message[]): number {
@@ -387,8 +695,8 @@ export class CLIProvider implements LLMProvider {
   readonly type: ProviderType = "cli";
   readonly id: string;
   readonly name: string;
+  readonly model: string;
 
-  private readonly model: string;
   private readonly logger: Logger;
   private readonly command: string;
   private readonly args: string[];
@@ -409,16 +717,37 @@ export class CLIProvider implements LLMProvider {
 
   async chat(messages: Message[], options?: ChatOptions): Promise<ChatResponse> {
     // Build prompt from messages
-    const prompt = this.buildPromptFromMessages(messages);
+    const prompt = this.buildPromptFromMessages(messages, options?.thinking?.level);
+
+    // Log the CLI call details
+    this.logger.info({
+      providerId: this.id,
+      cliType: this.cliType,
+      model: this.model,
+      command: this.command,
+      args: this.args,
+      promptPreview: prompt.slice(0, 200) + (prompt.length > 200 ? "..." : ""),
+      promptLength: prompt.length,
+      timeoutMs: this.timeoutMs,
+    }, "CLI provider chat call started");
 
     // Run CLI command
     const result = await this.runCLI(prompt);
 
+    // Log the result
+    this.logger.info({
+      providerId: this.id,
+      cliType: this.cliType,
+      success: result.ok,
+      outputLength: result.output?.length || 0,
+      outputPreview: result.output?.slice(0, 200) + (result.output?.length > 200 ? "..." : ""),
+      error: result.error,
+    }, "CLI provider chat call completed");
+
     if (!result.ok) {
-      return {
-        content: `CLI error: ${result.error}`,
-        finishReason: "error",
-      };
+      const detail = this.formatCliError(result.error);
+      this.logger.warn({ cliType: this.cliType, error: detail }, "CLI command failed");
+      throw new Error(`CLI ${this.cliType} error: ${detail}`);
     }
 
     // Parse output based on CLI type
@@ -426,6 +755,12 @@ export class CLIProvider implements LLMProvider {
     if (this.cliType === "kimi") {
       // Kimi outputs ACP protocol format - parse it
       content = this.parseKimiOutput(result.output);
+      this.logger.info({
+        rawOutputLength: result.output?.length || 0,
+        rawOutputPreview: result.output?.slice(0, 300) || "(empty)",
+        parsedContentLength: content?.length || 0,
+        parsedContentPreview: content?.slice(0, 200) || "(empty)",
+      }, "Kimi output parsed");
     } else {
       // Other CLIs return plain text
       content = this.stripReasoning(result.output);
@@ -437,8 +772,12 @@ export class CLIProvider implements LLMProvider {
     };
   }
 
-  private buildPromptFromMessages(messages: Message[]): string {
+  private buildPromptFromMessages(messages: Message[], thinkingLevel?: string): string {
     const parts: string[] = [];
+
+    if (thinkingLevel && thinkingLevel !== "off") {
+      parts.push(`System: Thinking level: ${thinkingLevel}`);
+    }
 
     for (const msg of messages) {
       switch (msg.role) {
@@ -510,19 +849,20 @@ export class CLIProvider implements LLMProvider {
         });
       });
 
-      child.on("close", (code) => {
+        child.on("close", (code) => {
         clearTimeout(timer);
         if (timedOut) {
           resolve({
             ok: false,
             output: stdout,
-            error: "Command timed out",
+            error: `Command timed out after ${this.timeoutMs}ms`,
           });
         } else {
+          const error = code !== 0 ? (stderr || stdout || "Command failed") : undefined;
           resolve({
             ok: code === 0,
             output: stdout,
-            error: code !== 0 ? stderr || "Command failed" : undefined,
+            error,
           });
         }
       });
@@ -544,6 +884,14 @@ export class CLIProvider implements LLMProvider {
     text = text.replace(/<choice>.*?<\/choice>/gs, "").trim();
     
     return text;
+  }
+
+  private formatCliError(error?: string): string {
+    const detail = (error || "Unknown error").trim();
+    if (detail.length > 500) {
+      return `${detail.slice(0, 500)}...`;
+    }
+    return detail;
   }
 
   /**
@@ -667,8 +1015,8 @@ export class OllamaProvider implements LLMProvider {
   readonly type: ProviderType = "ollama";
   readonly id: string;
   readonly name: string;
+  readonly model: string;
   private readonly baseUrl: string;
-  private readonly model: string;
   private readonly logger: Logger;
 
   constructor(options: OllamaProviderOptions) {
@@ -772,12 +1120,13 @@ export interface RetryOptions {
   initialDelayMs: number;
   maxDelayMs: number;
   backoffMultiplier: number;
+  onRetry?: (info: { attempt: number; delayMs: number; error: Error; reason?: FailoverReason }) => void;
 }
 
 const DEFAULT_RETRY_OPTIONS: RetryOptions = {
   maxRetries: 3,
   initialDelayMs: 1000,
-  maxDelayMs: 30000,
+  maxDelayMs: 300000,
   backoffMultiplier: 2,
 };
 
@@ -797,13 +1146,15 @@ export async function withRetry<T>(
       return await fn();
     } catch (err) {
       lastError = err instanceof Error ? err : new Error(String(err));
+      const reason = resolveFailoverReasonFromError(lastError);
 
       // Check if error is retryable
-      if (!isRetryableError(lastError) || attempt === opts.maxRetries) {
+      if (!isRetryableError(lastError, reason) || attempt === opts.maxRetries) {
         throw lastError;
       }
 
       // Wait before retrying
+      opts.onRetry?.({ attempt: attempt + 1, delayMs: delay, error: lastError, reason: reason || undefined });
       await sleep(delay);
       delay = Math.min(delay * opts.backoffMultiplier, opts.maxDelayMs);
     }
@@ -815,7 +1166,13 @@ export async function withRetry<T>(
 /**
  * Check if an error is retryable
  */
-function isRetryableError(error: Error): boolean {
+function isRetryableError(error: Error, reason?: FailoverReason | null): boolean {
+  if (reason === "billing" || reason === "format" || reason === "compaction" || reason === "auth") {
+    return false;
+  }
+  if (reason === "rate_limit" || reason === "timeout") {
+    return true;
+  }
   const message = error.message.toLowerCase();
   const retryablePatterns = [
     "timeout",

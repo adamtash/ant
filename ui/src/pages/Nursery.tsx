@@ -7,17 +7,17 @@ import React, { useEffect, useState, useCallback, useMemo } from 'react';
 import { motion } from 'framer-motion';
 import { Card, Badge, Skeleton } from '../components/base';
 import { AgentGenealogy } from '../components/complex';
-import { getStatus } from '../api/client';
-import type { SubagentRecord } from '../api/types';
+import { getAgents } from '../api/client';
+import type { AgentsApiResponse } from '../api/client';
 
 export const Nursery: React.FC = () => {
-  const [agents, setAgents] = useState<SubagentRecord[]>([]);
+  const [agents, setAgents] = useState<AgentsApiResponse['agents']>([]);
   const [loading, setLoading] = useState(true);
 
   const fetchAgents = useCallback(async () => {
     try {
-      const data = await getStatus();
-      setAgents(data.subagents ?? []);
+      const data = await getAgents();
+      setAgents(data.agents ?? []);
     } catch (err) {
       console.error('Failed to fetch agents:', err);
     } finally {
@@ -33,59 +33,60 @@ export const Nursery: React.FC = () => {
 
   // Transform agents for genealogy component
   const genealogyAgents = useMemo(() => {
-    // Always include queen as root
-    const result: Array<{
-      id: string;
-      name: string;
-      caste: string;
-      status: string;
-      parentId?: string;
-    }> = [
-      {
-        id: 'queen',
-        name: 'Queen',
-        caste: 'queen',
-        status: 'active',
-      },
-    ];
-
-    // Add other agents as children of queen
-    agents.forEach((agent, i) => {
-      result.push({
-        id: agent.id ?? `agent-${i}`,
-        name: agent.label ?? `Worker-${i + 1}`,
-        caste: agent.label?.includes('forager') ? 'forager' :
-               agent.label?.includes('nurse') ? 'nurse' :
-               agent.label?.includes('soldier') ? 'soldier' : 'worker',
-        status: agent.status,
-        parentId: 'queen',
-      });
-    });
-
-    return result;
+    return agents.map((agent) => ({
+      id: agent.id,
+      name: agent.name,
+      caste: agent.caste,
+      status: agent.status,
+      parentId: agent.parentAgentId,
+    }));
   }, [agents]);
-
-  useEffect(() => {
-    fetchAgents();
-    const interval = setInterval(fetchAgents, 3000);
-    return () => clearInterval(interval);
-  }, [fetchAgents]);
 
   const getStatusColor = (status: string) => {
     switch (status) {
+      case 'active':
       case 'running': return 'queen';
-      case 'completed': return 'nurse';
+      case 'completed':
+      case 'retired': return 'nurse';
       case 'error': return 'soldier';
+      case 'spawning': return 'architect';
+      case 'thinking': return 'drone';
       default: return 'default';
     }
   };
 
-  const formatDuration = (start: number, end?: number) => {
-    const duration = (end ?? Date.now()) - start;
-    const seconds = Math.floor(duration / 1000);
+  const getCasteIcon = (caste: string) => {
+    switch (caste) {
+      case 'queen': return '👑';
+      case 'worker': return '🐜';
+      case 'soldier': return '🛡️';
+      case 'nurse': return '🍼';
+      case 'forager': return '🌾';
+      case 'architect': return '🔧';
+      case 'drone': return '🚁';
+      default: return '🐜';
+    }
+  };
+
+  const getCasteBadgeVariant = (caste: string): 'queen' | 'worker' | 'soldier' | 'nurse' | 'architect' | 'drone' | 'default' => {
+    switch (caste) {
+      case 'queen': return 'queen';
+      case 'worker': return 'worker';
+      case 'soldier': return 'soldier';
+      case 'nurse': return 'nurse';
+      case 'architect': return 'architect';
+      case 'drone': return 'drone';
+      default: return 'default';
+    }
+  };
+
+  const formatDuration = (ms: number) => {
+    const seconds = Math.floor(ms / 1000);
     if (seconds < 60) return `${seconds}s`;
     const minutes = Math.floor(seconds / 60);
-    return `${minutes}m ${seconds % 60}s`;
+    if (minutes < 60) return `${minutes}m`;
+    const hours = Math.floor(minutes / 60);
+    return `${hours}h ${minutes % 60}m`;
   };
 
   if (loading) {
@@ -145,7 +146,7 @@ export const Nursery: React.FC = () => {
               <h3 className="text-lg font-semibold text-white">Active Agents</h3>
               {agents.map((agent, i) => (
                 <motion.div
-                  key={agent.id ?? i}
+                  key={agent.id}
                   initial={{ opacity: 0, x: -20 }}
                   animate={{ opacity: 1, x: 0 }}
                   transition={{ delay: i * 0.05 }}
@@ -153,25 +154,37 @@ export const Nursery: React.FC = () => {
                   <Card hoverable>
                     <div className="flex items-center justify-between">
                       <div className="flex items-center gap-3">
-                        <span className="text-2xl">🐜</span>
+                        <span className="text-2xl">{getCasteIcon(agent.caste)}</span>
                         <div>
-                          <div className="font-medium text-white">
-                            {agent.label ?? `Agent ${agent.id ?? i + 1}`}
+                          <div className="flex items-center gap-2">
+                            <span className="font-medium text-white">{agent.name}</span>
+                            <Badge variant={getCasteBadgeVariant(agent.caste)} size="sm">{agent.caste}</Badge>
+                            {agent.metadata.specialization.map((spec) => (
+                              <span key={spec} className="text-xs text-gray-500">{spec}</span>
+                            ))}
                           </div>
                           <div className="text-sm text-gray-400">
-                            {agent.task?.slice(0, 50)}
-                            {(agent.task?.length ?? 0) > 50 && '...'}
+                            {agent.currentTask?.slice(0, 60) || 'Idle'}
+                            {(agent.currentTask?.length ?? 0) > 60 && '...'}
+                          </div>
+                          <div className="flex items-center gap-4 mt-1 text-xs text-gray-500">
+                            <span>⚡ Energy: {agent.metadata.energy}%</span>
+                            <span>📊 Tasks: {agent.taskCount}</span>
+                            <span>⏱️ Avg: {formatDuration(agent.averageDuration)}</span>
+                            {agent.errorCount > 0 && (
+                              <span className="text-soldier-alert">⚠️ Errors: {agent.errorCount}</span>
+                            )}
                           </div>
                         </div>
                       </div>
                       <div className="flex items-center gap-3">
                         <span className="text-sm text-gray-400">
-                          {formatDuration(agent.createdAt, agent.endedAt)}
+                          {formatDuration(Date.now() - agent.createdAt)}
                         </span>
                         <Badge
                           variant={getStatusColor(agent.status)}
                           dot
-                          pulse={agent.status === 'running'}
+                          pulse={agent.status === 'active' || agent.status === 'thinking'}
                         >
                           {agent.status}
                         </Badge>

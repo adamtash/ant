@@ -32,6 +32,7 @@ import {
   toNormalizedMedia,
 } from "./message-handler.js";
 
+import { getEventStream, createEventPublishers } from "../../monitor/event-stream.js";
 import { startWhatsApp, type WhatsAppClient } from "./client.js";
 import type { AntConfig } from "../../config.js";
 
@@ -67,6 +68,11 @@ export class WhatsAppAdapter extends BaseChannelAdapter {
 
   /** Track sent message IDs to avoid echo */
   private readonly sentMessageIds: Map<string, number> = new Map();
+  /** Track sent message text to avoid echo loops */
+  private readonly sentMessageTexts: Map<string, number> = new Map();
+  private readonly maxEchoItems = 100;
+  
+  private events = createEventPublishers(getEventStream());
 
   constructor(config: WhatsAppAdapterConfig) {
     super(config);
@@ -78,36 +84,123 @@ export class WhatsAppAdapter extends BaseChannelAdapter {
   // Lifecycle
   // ==========================================================================
 
+  /** Track consecutive connection errors for auto-reconnect decisions */
+  private consecutiveErrors = 0;
+  private lastErrorAt?: number;
+
   async start(): Promise<void> {
     this.logger.info("Starting WhatsApp adapter...");
 
-    this.client = await startWhatsApp({
-      cfg: this.cfg,
-      logger: this.logger,
-      onMessage: async (inbound) => {
-        // Process incoming messages through the adapter's normalization pipeline
+    try {
+      this.client = await startWhatsApp({
+        cfg: this.cfg,
+        logger: this.logger,
+        onMessage: async (inbound) => {
+          // Process incoming messages through the adapter's normalization pipeline
+          this.handleIncomingMessage(inbound.message);
+        },
+        onStatus: (status) => {
+          this.onStatusUpdate?.(status);
+
+          if (status.connection === "open") {
+            this.setConnected(true);
+            this.selfJid = this.client?.getSelfJid();
+            // Reset error counter on successful connection
+            this.consecutiveErrors = 0;
+            this.lastErrorAt = undefined;
+          } else if (status.connection === "close") {
+            const reason = status.loggedOut ? "logged_out" : "disconnected";
+            this.setConnected(false, reason);
+            
+            // Emit adapter error for unexpected disconnections (not manual logout)
+            if (!status.loggedOut) {
+              this.consecutiveErrors++;
+              this.lastErrorAt = Date.now();
+              this.emit("adapter-error", {
+                type: "error",
+                error: "connection_closed",
+                message: "WhatsApp connection closed unexpectedly",
+                context: { 
+                  statusCode: status.statusCode,
+                  consecutiveErrors: this.consecutiveErrors,
+                  shouldReconnect: this.consecutiveErrors < 5,
+                },
+              });
+            }
+          }
+        },
+        onError: (error) => {
+          this.consecutiveErrors++;
+          this.lastErrorAt = Date.now();
+          
+          this.logger.warn({ 
+            error: error.message, 
+            consecutiveErrors: this.consecutiveErrors 
+          }, "WhatsApp socket error");
+
+          // Emit adapter error event for socket errors
+          this.emit("adapter-error", {
+            type: "error",
+            error: "socket_error",
+            message: error.message,
+            context: {
+              consecutiveErrors: this.consecutiveErrors,
+              lastErrorAt: this.lastErrorAt,
+              shouldReconnect: this.consecutiveErrors < 5,
+            },
+          });
+        },
+      });
+
+      // Listen for messages from the client (backup path)
+      this.client.on("message", (inbound) => {
         this.handleIncomingMessage(inbound.message);
-      },
-      onStatus: (status) => {
-        this.onStatusUpdate?.(status);
+      });
 
-        if (status.connection === "open") {
-          this.setConnected(true);
-          this.selfJid = this.client?.getSelfJid();
-        } else if (status.connection === "close") {
-          this.setConnected(false, status.loggedOut ? "logged_out" : "disconnected");
-        }
-      },
-    });
+      // Listen for socket-level errors
+      this.client.on("error", (error: Error) => {
+        this.consecutiveErrors++;
+        this.lastErrorAt = Date.now();
+        
+        this.logger.warn({ 
+          error: error.message, 
+          consecutiveErrors: this.consecutiveErrors 
+        }, "WhatsApp client error");
 
-    // Listen for messages from the client (backup path)
-    this.client.on("message", (inbound) => {
-      this.handleIncomingMessage(inbound.message);
-    });
+        this.emit("adapter-error", {
+          type: "error",
+          error: "client_error",
+          message: error.message,
+          context: {
+            consecutiveErrors: this.consecutiveErrors,
+            shouldReconnect: this.consecutiveErrors < 5,
+          },
+        });
+      });
 
-    // Set initial connection state
-    this.setConnected(true);
-    this.selfJid = this.client.getSelfJid();
+      // Set initial connection state
+      this.setConnected(true);
+      this.selfJid = this.client.getSelfJid();
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      this.consecutiveErrors++;
+      this.lastErrorAt = Date.now();
+      
+      this.logger.error({ error: errorMessage }, "Failed to start WhatsApp adapter");
+
+      // Emit adapter error for initialization failures
+      this.emit("adapter-error", {
+        type: "error",
+        error: "initialization_failed",
+        message: `Failed to start WhatsApp adapter: ${errorMessage}`,
+        context: {
+          consecutiveErrors: this.consecutiveErrors,
+          shouldReconnect: this.consecutiveErrors < 3,
+        },
+      });
+
+      throw error;
+    }
   }
 
   async stop(): Promise<void> {
@@ -142,31 +235,49 @@ export class WhatsAppAdapter extends BaseChannelAdapter {
   // ==========================================================================
   // Message Sending
   // ==========================================================================
-
   async sendMessage(
     message: NormalizedMessage,
-    options?: SendMessageOptions
+    _options?: SendMessageOptions
   ): Promise<SendResult> {
+    this.logger.info({
+      sessionKey: message.context.sessionKey,
+      chatId: message.context.chatId,
+      contentLength: message.content?.length || 0,
+      contentPreview: message.content?.slice(0, 200) || "(empty)",
+      hasMedia: !!message.media,
+      clientConnected: !!this.client,
+    }, "WhatsApp adapter sendMessage called");
+    
     if (!this.client) {
+      this.logger.warn("WhatsApp client not connected");
       return { ok: false, error: "WhatsApp client not connected" };
     }
 
     const chatId = message.context.chatId;
     if (!chatId) {
+      this.logger.warn("No chat ID specified");
       return { ok: false, error: "No chat ID specified" };
     }
 
     try {
-      // Handle media if present
-      if (message.media) {
-        await this.sendMediaMessage(chatId, message);
-      } else if (message.content) {
-        await this.client.sendText(chatId, message.content);
+      if (this.cfg.whatsapp.typingIndicator) {
+        await this.sendTyping(chatId, true);
       }
 
+      // Handle media if present
+      this.logger.info({ hasContent: !!message.content, hasMedia: !!message.media }, "WhatsApp adapter: about to send");
+      const result = message.media
+        ? await this.sendMediaMessage(chatId, message)
+        : message.content
+          ? await this.client.sendText(chatId, message.content)
+          : undefined;
+      
+      this.logger.info({ result: result ? "success" : "undefined", messageId: result?.key?.id }, "WhatsApp adapter: send result");
+
       // Track sent message
-      const messageId = this.generateMessageId();
+      const messageId = result?.key?.id ?? this.generateMessageId();
       this.sentMessageIds.set(messageId, Date.now());
+      this.rememberSentText(message.content);
       this.pruneSentMessageIds();
 
       return {
@@ -177,7 +288,20 @@ export class WhatsAppAdapter extends BaseChannelAdapter {
     } catch (err) {
       const error = err instanceof Error ? err.message : String(err);
       this.logger.warn({ error, chatId }, "Failed to send WhatsApp message");
+
+      // Publish error event
+      await this.events.errorOccurred({
+          errorType: "send_message_failed",
+          severity: "high",
+          message: `Failed to send to ${chatId}: ${error}`,
+          context: { chatId }
+      }, { sessionKey: message.context.sessionKey, channel: this.channel });
+
       return { ok: false, error };
+    } finally {
+      if (this.cfg.whatsapp.typingIndicator) {
+        await this.sendTyping(chatId, false);
+      }
     }
   }
 
@@ -206,10 +330,28 @@ export class WhatsAppAdapter extends BaseChannelAdapter {
   protected normalizeIncoming(rawMessage: unknown): NormalizedMessage | null {
     const msg = rawMessage as WAMessage;
 
+    // Log ALL incoming messages for debugging
+    this.logger.info({
+      chatId: msg.key?.remoteJid,
+      msgId: msg.key?.id,
+      fromMe: Boolean(msg.key?.fromMe),
+      selfJid: this.selfJid,
+      hasContent: !!msg.message,
+    }, "WhatsApp: Raw message received");
+
     // Extract basic info
     const text = extractTextFromMessage(msg);
+    if (text) {
+      this.logger.info({ chatId: msg.key?.remoteJid, msgId: msg.key?.id, preview: text.slice(0, 80), fromMe: Boolean(msg.key?.fromMe) }, "WhatsApp message received");
+    }
     if (!text) {
-      this.logger.debug("Message filtered: no text content");
+      this.logger.info("Message filtered: no text content");
+      return null;
+    }
+
+    if (this.isEchoText(text)) {
+     // this.logger.debug({ preview: text.slice(0, 80) }, "Message filtered: echo");
+      this.forgetEchoText(text);
       return null;
     }
 
@@ -239,10 +381,12 @@ export class WhatsAppAdapter extends BaseChannelAdapter {
       const isSelf =
         (this.selfJid && areJidsSameUser(chatId, this.selfJid)) ||
         (this.selfLid && areJidsSameUser(chatId, this.selfLid));
+      this.logger.info({ chatId, selfJid: this.selfJid, selfLid: this.selfLid, isSelf, respondToSelfOnly: this.cfg.whatsapp.respondToSelfOnly }, "WhatsApp: Checking self-chat mode");
       if (!isSelf) {
-        this.logger.debug({ chatId, selfJid: this.selfJid }, "Message filtered: not self-chat");
+        this.logger.info({ chatId, selfJid: this.selfJid }, "Message filtered: not self-chat");
         return null;
       }
+      this.logger.info({ chatId }, "Message accepted: self-chat");
     }
 
     // Check fromMe filtering
@@ -289,6 +433,10 @@ export class WhatsAppAdapter extends BaseChannelAdapter {
     const mediaInfo = extractMediaInfo(msg);
     const media = mediaInfo ? toNormalizedMedia(mediaInfo) : undefined;
 
+    const timestamp = msg.messageTimestamp 
+      ? (typeof msg.messageTimestamp === "number" ? msg.messageTimestamp : Number(msg.messageTimestamp)) * 1000 
+      : Date.now();
+
     return this.createNormalizedMessage({
       id: msg.key.id ?? this.generateMessageId(),
       content: text,
@@ -302,7 +450,7 @@ export class WhatsAppAdapter extends BaseChannelAdapter {
         chatId,
       },
       media,
-      timestamp: Number(msg.messageTimestamp ?? Date.now()),
+      timestamp,
       priority: this.defaultPriority,
       rawMessage: msg,
     });
@@ -348,7 +496,7 @@ export class WhatsAppAdapter extends BaseChannelAdapter {
   private async sendMediaMessage(
     chatId: string,
     message: NormalizedMessage
-  ): Promise<void> {
+  ): Promise<WAMessage | undefined> {
     if (!this.client || !message.media) return;
 
     const media = message.media;
@@ -369,7 +517,7 @@ export class WhatsAppAdapter extends BaseChannelAdapter {
     }
 
     const type = inferMediaType(filePath);
-    await this.client.sendMedia(chatId, {
+    return this.client.sendMedia(chatId, {
       filePath,
       type,
       caption: message.content || undefined,
@@ -406,6 +554,38 @@ export class WhatsAppAdapter extends BaseChannelAdapter {
     const cutoff = Date.now() - 5 * 60_000; // 5 minutes
     for (const [id, ts] of this.sentMessageIds.entries()) {
       if (ts < cutoff) this.sentMessageIds.delete(id);
+    }
+  }
+
+  private rememberSentText(text?: string): void {
+    if (!text) return;
+    this.sentMessageTexts.set(this.normalizeEchoText(text), Date.now());
+    this.pruneSentMessageTexts();
+  }
+
+  private isEchoText(text: string): boolean {
+    return this.sentMessageTexts.has(this.normalizeEchoText(text));
+  }
+
+  private forgetEchoText(text: string): void {
+    this.sentMessageTexts.delete(this.normalizeEchoText(text));
+  }
+
+  private normalizeEchoText(text: string): string {
+    return text.trim();
+  }
+
+  private pruneSentMessageTexts(): void {
+    if (this.sentMessageTexts.size <= this.maxEchoItems) {
+      return;
+    }
+    const sortedEntries = Array.from(this.sentMessageTexts.entries()).sort((a, b) => a[1] - b[1]);
+    const toRemove = sortedEntries.length - this.maxEchoItems;
+    for (let i = 0; i < toRemove; i += 1) {
+      const key = sortedEntries[i]?.[0];
+      if (key) {
+        this.sentMessageTexts.delete(key);
+      }
     }
   }
 

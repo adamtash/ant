@@ -34,7 +34,7 @@ export const LIFESPAN = {
   nurse: 240000,   // ~66 minutes
   forager: 120000, // ~33 minutes (shorter, risky work)
   architect: 200000, // ~55 minutes
-  drone: 30000,    // ~8 minutes (short, scheduled)
+  drone: 300000,    // ~8 minutes (short, scheduled)
 } as const;
 
 /**

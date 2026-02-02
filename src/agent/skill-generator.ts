@@ -299,7 +299,7 @@ ${this.indentCode(definition.implementation, 6)}
 
       const { stdout, stderr } = await execAsync(cmd, {
         cwd: this.workspaceDir,
-        timeout: 30000,
+        timeout: 300000,
       });
 
       const output = stdout + stderr;

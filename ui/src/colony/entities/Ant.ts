@@ -71,6 +71,10 @@ export class Ant {
   taskId?: string;
   isCarrying: boolean;
   carryingData?: unknown;
+  
+  // Entity tracking (link to backend entity)
+  entityType?: 'task' | 'subagent' | 'error' | 'cron' | 'memory' | 'tool';
+  entityId?: string;
 
   // Lifecycle
   age: number; // ticks since spawn

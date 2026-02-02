@@ -43,6 +43,9 @@ export interface WhatsAppClientConfig {
 
   /** Callback for connection status updates */
   onStatus?: (status: ConnectionStatus) => void;
+
+  /** Callback for socket errors */
+  onError?: (error: Error) => void;
 }
 
 export interface InboundMessage {
@@ -101,12 +104,15 @@ export class WhatsAppClient extends EventEmitter {
   private lastQr: string | undefined;
   private lastConnectionStatus: ConnectionStatus = { connection: "close" };
 
+  private readonly onError?: (error: Error) => void;
+
   constructor(config: WhatsAppClientConfig) {
     super();
     this.cfg = config.cfg;
     this.logger = config.logger.child({ module: "whatsapp-client" });
     this.onMessage = config.onMessage;
     this.onStatus = config.onStatus;
+    this.onError = config.onError;
   }
 
   // ==========================================================================
@@ -306,6 +312,12 @@ export class WhatsAppClient extends EventEmitter {
           "WhatsApp connection closed"
         );
 
+        // Propagate socket errors via onError callback
+        if (error && !loggedOut && this.onError) {
+          const errorMessage = error.message || `Connection closed with status ${statusCode}`;
+          this.onError(new Error(errorMessage));
+        }
+
         if (loggedOut && this.cfg.whatsapp.resetOnLogout) {
           this.handleLogout();
         } else if (!this.isClosing) {
@@ -360,7 +372,7 @@ export class WhatsAppClient extends EventEmitter {
     }
 
     this.reconnectAttempts++;
-    const delay = Math.min(1000 * Math.pow(2, this.reconnectAttempts), 30000);
+    const delay = Math.min(1000 * Math.pow(2, this.reconnectAttempts), 300000);
 
     this.logger.info(
       { attempt: this.reconnectAttempts, delay },

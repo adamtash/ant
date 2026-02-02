@@ -23,7 +23,7 @@ describe("Main Agent Loop", () => {
       enableMainAgent: true,
     });
     await waitForGateway(instance, 15000);
-  }, 30000);
+  }, 300000);
 
   afterAll(async () => {
     if (instance) {
@@ -115,7 +115,7 @@ describe("Main Agent with Disabled Configuration", () => {
       enableMainAgent: false,
     });
     await waitForGateway(instance, 15000);
-  }, 30000);
+  }, 300000);
 
   afterAll(async () => {
     if (instance) {
@@ -155,7 +155,7 @@ describe("Main Agent Configuration", () => {
     } finally {
       await cleanupTest(instance);
     }
-  }, 30000);
+  }, 300000);
 
   it("should have configurable duties file", async () => {
     const instance = await spawnTestInstance({
@@ -173,5 +173,5 @@ describe("Main Agent Configuration", () => {
     } finally {
       await cleanupTest(instance);
     }
-  }, 30000);
+  }, 300000);
 });

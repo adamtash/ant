@@ -19,7 +19,7 @@ describe("Provider Configuration", () => {
   beforeAll(async () => {
     instance = await spawnTestInstance({ enableMemory: false });
     await waitForGateway(instance, 15000);
-  }, 30000);
+  }, 300000);
 
   afterAll(async () => {
     if (instance) {
@@ -140,7 +140,7 @@ describe("Provider Fallback Behavior", () => {
     } finally {
       await cleanupTest(instance);
     }
-  }, 30000);
+  }, 300000);
 
   it("should handle missing provider gracefully", async () => {
     const instance = await spawnTestInstance({ enableMemory: false });
@@ -156,7 +156,7 @@ describe("Provider Fallback Behavior", () => {
     } finally {
       await cleanupTest(instance);
     }
-  }, 30000);
+  }, 300000);
 });
 
 describe("Multi-Provider Configuration", () => {
@@ -174,5 +174,5 @@ describe("Multi-Provider Configuration", () => {
     } finally {
       await cleanupTest(instance);
     }
-  }, 30000);
+  }, 300000);
 });

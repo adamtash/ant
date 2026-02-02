@@ -37,6 +37,7 @@ export interface NormalizedMessage {
     chatId?: string;
     threadId?: string;
   };
+  metadata?: Record<string, unknown>;
   timestamp: number;
   isReply?: boolean;
   priority: "high" | "normal" | "low";
@@ -73,6 +74,43 @@ export interface ToolResult {
   };
 }
 
+export type ToolPartState =
+  | {
+      status: "pending";
+      input: Record<string, unknown>;
+      raw: string;
+    }
+  | {
+      status: "running";
+      input: Record<string, unknown>;
+      title?: string;
+      metadata?: Record<string, unknown>;
+      time: { start: number };
+    }
+  | {
+      status: "completed";
+      input: Record<string, unknown>;
+      output: string;
+      title: string;
+      metadata?: Record<string, unknown>;
+      time: { start: number; end: number; compacted?: number };
+    }
+  | {
+      status: "error";
+      input: Record<string, unknown>;
+      error: string;
+      metadata?: Record<string, unknown>;
+      time: { start: number; end: number };
+    };
+
+export interface ToolPart {
+  id: string;
+  callId: string;
+  tool: string;
+  state: ToolPartState;
+  metadata?: Record<string, unknown>;
+}
+
 /**
  * Tool metadata
  */
@@ -82,7 +120,10 @@ export interface ToolMeta {
   category: string;
   version: string;
   author?: string;
+  timeoutMs?: number;
 }
+
+export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
 
 /**
  * Tool context passed to every tool execution
@@ -143,6 +184,8 @@ export interface AgentOutput {
     type: "image" | "video" | "audio" | "file";
   }[];
   error?: string;
+  providerId?: string;
+  model?: string;
 }
 
 /**
@@ -155,6 +198,7 @@ export interface Message {
   toolCalls?: ToolCall[];
   name?: string;
   timestamp?: number;
+  metadata?: Record<string, unknown>;
 }
 
 /**
@@ -189,6 +233,9 @@ export interface ChatOptions {
   maxTokens?: number;
   tools?: ToolDefinition[];
   toolChoice?: "auto" | "none" | { type: "function"; function: { name: string } };
+  thinking?: {
+    level: ThinkingLevel;
+  };
 }
 
 /**
@@ -224,6 +271,7 @@ export interface LLMProvider {
   type: ProviderType;
   id: string;
   name: string;
+  model: string;
 
   /** Main completion endpoint */
   chat(messages: Message[], options?: ChatOptions): Promise<ChatResponse>;
@@ -250,6 +298,45 @@ export interface AgentConfig {
   maxHistoryTokens: number;
   temperature: number;
   maxToolIterations: number;
+  toolLoop?: {
+    timeoutPerIterationMs?: number;
+    timeoutPerToolMs?: number;
+    contextWindowThresholdPercent?: number;
+  };
+  compaction?: {
+    enabled?: boolean;
+    thresholdPercent?: number;
+    maxSummaryTokens?: number;
+    minRecentMessages?: number;
+  };
+  thinking?: {
+    level?: ThinkingLevel;
+  };
+  toolPolicy?: string;
+  toolResultGuard?: {
+    enabled?: boolean;
+  };
+}
+
+export interface ToolPolicy {
+  allowedGroups?: string[];
+  deniedGroups?: string[];
+  allowedTools?: string[];
+  deniedTools?: string[];
+  allowedChannels?: Channel[];
+  deniedChannels?: Channel[];
+  allowedModels?: string[];
+  deniedModels?: string[];
+  allowedAudiences?: string[];
+  deniedAudiences?: string[];
+}
+
+export interface ToolPolicyContext {
+  channel: Channel;
+  sessionKey: string;
+  chatId?: string;
+  model?: string;
+  isSubagent?: boolean;
 }
 
 /**
@@ -260,11 +347,19 @@ export interface ProviderConfig {
   cliProvider?: CLIProviderType;
   baseUrl?: string;
   apiKey?: string;
+  authProfiles?: Array<{
+    apiKey: string;
+    label?: string;
+    cooldownMinutes?: number;
+  }>;
   model: string;
   contextWindow?: number;
   embeddingsModel?: string;
   command?: string;
   args?: string[];
+  timeoutMs?: number;
+  healthCheckTimeoutMs?: number;
+  healthCheckCacheTtlMinutes?: number;
 }
 
 

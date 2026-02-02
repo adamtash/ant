@@ -16,6 +16,8 @@ const mockLogger = {
 // Mock tool registry
 const mockToolRegistry = {
   getDefinitions: vi.fn(() => []),
+  getDefinitionsForPolicy: vi.fn(() => []),
+  get: vi.fn(() => ({ meta: { timeoutMs: 5000 } })),
   execute: vi.fn(),
   initialize: vi.fn(),
 } as unknown as ToolRegistry;
@@ -111,6 +113,11 @@ describe("AgentEngine", () => {
           toolCalls: [],
         });
 
+      // Set up the mock to return a tool definition so the tool is allowed
+      mockToolRegistry.getDefinitionsForPolicy = vi.fn(() => [
+        { type: "function", function: { name: "test-tool", description: "Test tool" } },
+      ]);
+
       mockToolRegistry.execute = vi.fn().mockResolvedValue({
         ok: true,
         data: { result: "tool output" },
@@ -156,11 +163,16 @@ describe("AgentEngine", () => {
         toolCalls: [
           {
             id: "call-loop",
-            name: "endless-tool",
+            name: "looping-tool",
             arguments: {},
           },
         ],
       });
+
+      // Set up the mock to return a tool definition so the tool is allowed
+      mockToolRegistry.getDefinitionsForPolicy = vi.fn(() => [
+        { type: "function", function: { name: "looping-tool", description: "Looping tool" } },
+      ]);
 
       mockToolRegistry.execute = vi.fn().mockResolvedValue({
         ok: true,

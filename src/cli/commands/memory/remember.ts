@@ -60,11 +60,11 @@ export async function remember(cfg: AntConfig, note: string, options: RememberOp
     }
 
     // Direct memory access - MemoryManager creates its own embedding provider from config
-    const manager = new MemoryManager({ cfg });
+    const manager = new MemoryManager(cfg);
 
     // Format the note content and use the update method
     const content = formatNoteContent(note.trim(), options);
-    await manager.update(content, options.category || "user-note");
+    await manager.update(content);
 
     stopProgress();
 

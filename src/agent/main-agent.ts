@@ -14,6 +14,7 @@ import path from "node:path";
 import { type AntConfig } from "../config.js";
 import { type AgentEngine } from "./engine.js";
 import { type Logger } from "../log.js";
+import { type SessionManager } from "../gateway/session-manager.js";
 
 export interface MainAgentTask {
   id: string;
@@ -33,6 +34,7 @@ export class MainAgent {
   private agentEngine: AgentEngine;
   private logger: Logger;
   private sendMessage?: MainAgentSendMessage;
+  private sessionManager?: SessionManager;
   private running = false;
   private timer: NodeJS.Timeout | null = null;
   private tasks: Map<string, MainAgentTask> = new Map();
@@ -44,10 +46,12 @@ export class MainAgent {
     agentEngine: AgentEngine;
     logger: Logger;
     sendMessage?: MainAgentSendMessage;
+    sessionManager?: SessionManager;
   }) {
     this.config = params.config;
     this.agentEngine = params.agentEngine;
     this.sendMessage = params.sendMessage;
+    this.sessionManager = params.sessionManager;
     this.logger = params.logger.child({ component: "main-agent" });
   }
 
@@ -59,6 +63,9 @@ export class MainAgent {
 
     this.running = true;
     this.logger.info("Main Agent loop started - Autonomous mode enabled");
+    
+    // Send startup message to WhatsApp
+    await this.sendStartupMessage();
     
     // Run startup health check first, then start the regular cycle
     await this.runStartupHealthCheck();
@@ -74,8 +81,29 @@ export class MainAgent {
   }
 
   /**
-   * Run startup health check and report to WhatsApp owner
+   * Send startup notification to WhatsApp owner
    */
+  private async sendStartupMessage(): Promise<void> {
+    const ownerJids = this.config.whatsapp?.ownerJids || [];
+    const startupRecipients = this.config.whatsapp?.startupRecipients || [];
+    const recipients = startupRecipients.length > 0 ? startupRecipients : ownerJids;
+
+    if (recipients.length === 0 || !this.sendMessage) {
+      this.logger.debug("No WhatsApp recipients configured for startup message");
+      return;
+    }
+
+    const message = "🤖 *Queen Ant Started*\n\nAutonomous work mode is now active!";
+
+    for (const jid of recipients) {
+      try {
+        await this.sendMessage(jid, message);
+        this.logger.info({ jid }, "Startup message sent to owner");
+      } catch (err) {
+        this.logger.warn({ error: err, jid }, "Failed to send startup message to owner");
+      }
+    }
+  }
   private async runStartupHealthCheck(): Promise<void> {
     if (this.startupHealthCheckDone) return;
     
@@ -129,6 +157,9 @@ System is healthy and ready!`,
         chatId: "system",
         channel: "cli",
       });
+
+      // Persist the health check response
+      await this.persistMessage("main-agent:startup-health", "assistant", result.response, result.providerId, result.model);
 
       this.startupHealthCheckDone = true;
       
@@ -200,6 +231,25 @@ System is healthy and ready!`,
    */
   getAllTasks(): MainAgentTask[] {
     return Array.from(this.tasks.values()).sort((a, b) => b.createdAt - a.createdAt);
+  }
+
+  /**
+   * Persist a message to session storage
+   */
+  private async persistMessage(sessionKey: string, role: "user" | "assistant", content: string, providerId?: string, model?: string): Promise<void> {
+    if (!this.sessionManager) return;
+    
+    try {
+      await this.sessionManager.appendMessage(sessionKey, {
+        role,
+        content,
+        timestamp: Date.now(),
+        providerId,
+        model,
+      });
+    } catch (err) {
+      this.logger.warn({ error: err, sessionKey }, "Failed to persist Main Agent message");
+    }
   }
 
   private async runCycle() {
@@ -278,6 +328,10 @@ Output <promise>NEEDS_HELP</promise> if you need human assistance.`,
         channel: "cli",
       });
 
+      // Persist the task result
+      const sessionKey = `main-agent:task:${task.id}`;
+      await this.persistMessage(sessionKey, "assistant", result.response, result.providerId, result.model);
+
       task.status = "completed";
       task.completedAt = Date.now();
       task.result = result.response;
@@ -298,7 +352,7 @@ Output <promise>NEEDS_HELP</promise> if you need human assistance.`,
   private async runAutonomousDuties() {
     const duties = await this.loadDuties();
     
-    await this.agentEngine.execute({
+    const result = await this.agentEngine.execute({
       query: `Execute your duties as the Autonomous Main Agent.
 
 PHILOSOPHY: Work like an expert software engineer - investigate, fix, test, iterate.
@@ -350,6 +404,9 @@ Output <promise>ISSUES_FOUND</promise> if you found and fixed issues.`,
       chatId: "system",
       channel: "cli",
     });
+
+    // Persist the autonomous duty cycle result
+    await this.persistMessage("main-agent:system", "assistant", result.response, result.providerId, result.model);
 
     this.logger.info("Main Agent duty cycle complete");
   }

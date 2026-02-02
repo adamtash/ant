@@ -15,6 +15,7 @@ import { WebSocketServer, WebSocket } from "ws";
 import type { Channel } from "../agent/types.js";
 import type { Logger } from "../log.js";
 import { EventBus } from "./event-bus.js";
+import { getEventStream, createEventPublishers } from "../monitor/event-stream.js";
 import { SessionManager } from "./session-manager.js";
 import { loadConfig, saveConfig } from "../config.js";
 import type { MessageRouter } from "../channels/router.js";
@@ -28,6 +29,13 @@ import type {
 } from "./types.js";
 import type { AgentEngine } from "../agent/engine.js";
 import type { MainAgent } from "../agent/main-agent.js";
+import type { MemoryManager } from "../memory/manager.js";
+import type { Scheduler } from "../scheduler/scheduler.js";
+import type { SkillRegistryManager } from "../agent/skill-registry.js";
+import type { ToolRegistry } from "../agent/tool-registry.js";
+import os from "node:os";
+import { classifyError, type ClassificationResult } from "../monitor/error-classifier.js";
+import { ProviderHealthTracker } from "../monitor/provider-health.js";
 
 /**
  * Gateway configuration
@@ -39,6 +47,21 @@ export interface GatewayConfig {
   staticDir?: string;
   logFilePath?: string;
   configPath?: string;
+}
+
+/**
+ * System health metrics
+ */
+export interface SystemHealth {
+  cpu: number;
+  memory: number;
+  disk: number;
+  uptime: number;
+  lastRestart: number;
+  queueDepth: number;
+  activeConnections: number;
+  totalErrors?: number;
+  errorRate?: number;
 }
 
 /**
@@ -79,6 +102,15 @@ export class GatewayServer {
       error?: string;
     }
   > = new Map();
+  private memoryManager?: MemoryManager;
+  private scheduler?: Scheduler;
+  private skillRegistry?: SkillRegistryManager;
+  private toolRegistry?: ToolRegistry;
+  private errorCount = 0;
+  private lastErrorTime = 0;
+  private eventStream = getEventStream();
+  private events = createEventPublishers(this.eventStream);
+  private providerHealthTracker: ProviderHealthTracker;
 
   constructor(params: {
     config: GatewayConfig;
@@ -86,6 +118,10 @@ export class GatewayServer {
     agentEngine?: AgentEngine;
     router?: MessageRouter;
     mainAgent?: MainAgent;
+    memoryManager?: MemoryManager;
+    scheduler?: Scheduler;
+    skillRegistry?: SkillRegistryManager;
+    toolRegistry?: ToolRegistry;
   }) {
     this.config = params.config;
     this.logger = params.logger.child({ component: "gateway" });
@@ -93,10 +129,80 @@ export class GatewayServer {
     this.agentEngine = params.agentEngine;
     this.router = params.router;
     this.mainAgent = params.mainAgent;
+    this.memoryManager = params.memoryManager;
+    this.scheduler = params.scheduler;
+    this.skillRegistry = params.skillRegistry;
+    this.toolRegistry = params.toolRegistry;
     this.sessions = new SessionManager({
       stateDir: params.config.stateDir,
       logger: this.logger,
     });
+    this.providerHealthTracker = new ProviderHealthTracker(this.logger);
+    this.providerHealthTracker.connectToStream(this.eventStream);
+    this.setupPersistence();
+    this.setupErrorTracking();
+  }
+
+  /**
+   * Set up error tracking for health monitoring
+   */
+  private setupErrorTracking(): void {
+    // Listen to event stream for errors
+    getEventStream().subscribeAll((event) => {
+      if (event.type === "error_occurred") {
+        this.errorCount++;
+        this.lastErrorTime = Date.now();
+      }
+    });
+  }
+
+  /**
+   * Set up persistence for messages
+   */
+  private setupPersistence(): void {
+    if (!this.router) return;
+
+    this.router.on("event", async (event) => {
+      // Persist incoming messages
+      if (event.type === "message_received") {
+        const { message } = event;
+        // Skip if it's an agent reply (shouldn't happen on message_received but good to check)
+        if (message.sender.isAgent) return;
+
+        try {
+          await this.sessions.appendMessage(message.context.sessionKey, {
+            role: "user",
+            content: message.content,
+            timestamp: message.timestamp,
+            name: message.sender.name,
+          });
+        } catch (err) {
+          const error = err instanceof Error ? err.message : String(err);
+          this.logger.error({ error, sessionKey: message.context.sessionKey }, "Failed to persist user message");
+        }
+      }
+
+      // Persist agent responses
+      else if (event.type === "message_processed") {
+        const { response } = event;
+        if (!response) return;
+
+        try {
+          await this.sessions.appendMessage(response.context.sessionKey, {
+            role: "assistant",
+            content: response.content,
+            timestamp: response.timestamp,
+            providerId: response.metadata?.providerId as string | undefined,
+            model: response.metadata?.model as string | undefined,
+          });
+        } catch (err) {
+          const error = err instanceof Error ? err.message : String(err);
+          this.logger.error({ error, sessionKey: response.context.sessionKey }, "Failed to persist agent message");
+        }
+      }
+    });
+
+    this.logger.info("Session persistence enabled");
   }
 
   /**
@@ -130,6 +236,7 @@ export class GatewayServer {
         mainAgent: {
           enabled: this.mainAgentRunning,
           running: this.mainAgentRunning,
+          tasks: this.mainAgent?.getAllTasks() || [],
           lastCheckAt: this.startupHealthCheck.lastCheckAt ?? null,
           lastError: this.startupHealthCheck.ok ? null : this.startupHealthCheck.error ?? null,
         },
@@ -146,23 +253,30 @@ export class GatewayServer {
           disk: 0,
           uptime: Date.now() - this.startTime,
           lastRestart: this.startTime,
-          queueDepth: 0,
+          queueDepth: this.router?.getSessionQueueStats().queued ?? 0,
           activeConnections: this.connections.size,
         },
       };
       res.json(status);
     });
 
-    // Sessions list
+    // Sessions list (paginated)
     app.get("/api/sessions", (req, res) => {
-      const list = this.sessions.list().map((s) => ({
+      const limit = Math.min(Math.max(parseInt(req.query.limit as string) || 20, 1), 100);
+      const offset = Math.max(parseInt(req.query.offset as string) || 0, 0);
+      
+      const allSessions = this.sessions.list().map((s) => ({
         key: s.sessionKey,
         channel: s.channel,
         createdAt: s.createdAt,
         lastMessageAt: s.lastActivityAt,
         messageCount: s.messageCount || 0,
       }));
-      res.json({ ok: true, sessions: list });
+      
+      const total = allSessions.length;
+      const sessions = allSessions.slice(offset, offset + limit);
+      
+      res.json({ ok: true, sessions, total, limit, offset });
     });
 
     // Session detail
@@ -175,7 +289,6 @@ export class GatewayServer {
         res.status(404).json({ ok: false, error: "Session not found" });
         return;
       }
-
       res.json({
         ok: true,
         sessionKey: key,
@@ -184,6 +297,8 @@ export class GatewayServer {
           content: m.content,
           ts: m.timestamp,
           toolCalls: [],
+          providerId: m.providerId,
+          model: m.model,
         })),
       });
     });
@@ -211,18 +326,211 @@ export class GatewayServer {
         }
     });
 
-    // Channels
-    app.get("/api/channels", (req, res) => {
-        const channels = [];
-        if (this.router) {
-            for (const [id, adapter] of this.router.getAdapters()) {
-                channels.push({
-                    id,
-                    status: adapter.getStatus(),
-                });
-            }
+    // ============================================
+    // Agents API Endpoints
+    // ============================================
+    
+    // GET /api/agents
+    app.get("/api/agents", (req, res) => {
+      // Build agent list from main agent tasks and subagent records
+      const agents: Array<{
+        id: string;
+        caste: "queen" | "worker" | "soldier" | "nurse" | "forager" | "architect" | "drone";
+        name: string;
+        status: "spawning" | "active" | "thinking" | "idle" | "retired" | "error";
+        currentTask?: string;
+        progress: number;
+        toolsUsed: string[];
+        taskCount: number;
+        averageDuration: number;
+        errorCount: number;
+        createdAt: number;
+        retiredAt?: number;
+        parentAgentId?: string;
+        metadata: {
+          age: number;
+          energy: number;
+          specialization: string[];
+        };
+      }> = [];
+      
+      // Add main agent as queen
+      if (this.mainAgent) {
+        const mainTasks = this.mainAgent.getAllTasks();
+        agents.push({
+          id: "main-agent",
+          caste: "queen",
+          name: "Queen",
+          status: this.mainAgentRunning ? "active" : "idle",
+          currentTask: mainTasks.find(t => t.status === "in_progress")?.description,
+          progress: mainTasks.length > 0 
+            ? mainTasks.filter(t => t.status === "completed").length / mainTasks.length 
+            : 0,
+          toolsUsed: [],
+          taskCount: mainTasks.length,
+          averageDuration: 0,
+          errorCount: mainTasks.filter(t => t.status === "failed").length,
+          createdAt: this.startTime,
+          metadata: {
+            age: Math.floor((Date.now() - this.startTime) / 1000 / 60), // minutes
+            energy: 100,
+            specialization: ["management", "supervision"],
+          },
+        });
+      }
+      
+      // Add running tasks as worker agents
+      for (const task of this.tasks.values()) {
+        if (task.status === "running" || task.status === "queued") {
+          agents.push({
+            id: task.id,
+            caste: "worker",
+            name: `Worker-${task.id.slice(-4)}`,
+            status: task.status === "running" ? "active" : "spawning",
+            currentTask: task.description,
+            progress: 0,
+            toolsUsed: [],
+            taskCount: 1,
+            averageDuration: task.startedAt ? Date.now() - task.startedAt : 0,
+            errorCount: task.error ? 1 : 0,
+            createdAt: task.createdAt,
+            parentAgentId: "main-agent",
+            metadata: {
+              age: 0,
+              energy: 80,
+              specialization: ["execution"],
+            },
+          });
         }
-        res.json({ ok: true, channels });
+      }
+      
+      res.json({ ok: true, agents });
+    });
+
+    // GET /api/agents/:id
+    app.get("/api/agents/:id", (req, res) => {
+      const { id } = req.params;
+      
+      // Handle main agent
+      if (id === "main-agent" && this.mainAgent) {
+        const mainTasks = this.mainAgent.getAllTasks();
+        res.json({
+          ok: true,
+          agent: {
+            id: "main-agent",
+            caste: "queen",
+            name: "Queen",
+            status: this.mainAgentRunning ? "active" : "idle",
+            currentTask: mainTasks.find(t => t.status === "in_progress")?.description,
+            progress: mainTasks.length > 0 
+              ? mainTasks.filter(t => t.status === "completed").length / mainTasks.length 
+              : 0,
+            toolsUsed: [],
+            taskCount: mainTasks.length,
+            averageDuration: 0,
+            errorCount: mainTasks.filter(t => t.status === "failed").length,
+            createdAt: this.startTime,
+            metadata: {
+              age: Math.floor((Date.now() - this.startTime) / 1000 / 60),
+              energy: 100,
+              specialization: ["management", "supervision"],
+            },
+          },
+        });
+        return;
+      }
+      
+      // Handle task agents
+      const task = this.tasks.get(id);
+      if (task) {
+        res.json({
+          ok: true,
+          agent: {
+            id: task.id,
+            caste: "worker",
+            name: `Worker-${task.id.slice(-4)}`,
+            status: task.status === "running" ? "active" : "idle",
+            currentTask: task.description,
+            progress: 0,
+            toolsUsed: [],
+            taskCount: 1,
+            averageDuration: task.startedAt && task.endedAt 
+              ? task.endedAt - task.startedAt 
+              : 0,
+            errorCount: task.error ? 1 : 0,
+            createdAt: task.createdAt,
+            parentAgentId: "main-agent",
+            metadata: {
+              age: Math.floor((Date.now() - task.createdAt) / 1000 / 60),
+              energy: task.status === "running" ? 70 : 100,
+              specialization: ["execution"],
+            },
+          },
+        });
+        return;
+      }
+      
+      res.status(404).json({ ok: false, error: "Agent not found" });
+    });
+
+    // ============================================
+    // Channels API Endpoints
+    // ============================================
+    
+    // GET /api/channels
+    app.get("/api/channels", (req, res) => {
+      const channels: Array<{
+        id: string;
+        status: {
+          connected: boolean;
+          selfJid?: string;
+          qr?: string;
+          message?: string;
+          connectedAt?: number;
+          messageCount?: number;
+          lastMessageAt?: number;
+          activeUsers?: number;
+          responseTime?: number;
+          errorRate?: number;
+          [key: string]: any;
+        };
+      }> = [];
+      
+      if (this.router) {
+        for (const [id, adapter] of this.router.getAdapters()) {
+          const adapterStatus = adapter.getStatus();
+          channels.push({
+            id,
+            status: {
+              connected: adapterStatus.connected ?? false,
+              selfJid: adapterStatus.selfJid,
+              qr: adapterStatus.qr,
+              message: adapterStatus.message,
+              connectedAt: adapterStatus.connectedAt,
+              messageCount: adapterStatus.messageCount ?? 0,
+              lastMessageAt: adapterStatus.lastMessageAt,
+              activeUsers: adapterStatus.activeUsers ?? (adapterStatus.connected ? 1 : 0),
+              responseTime: adapterStatus.responseTime ?? 0,
+              errorRate: adapterStatus.errorRate ?? 0,
+            },
+          });
+        }
+      }
+      
+      // Add web channel if not present
+      if (!channels.find(c => c.id === "web")) {
+        channels.push({
+          id: "web",
+          status: {
+            connected: this.connections.size > 0,
+            activeUsers: this.connections.size,
+            responseTime: 0,
+            errorRate: 0,
+          },
+        });
+      }
+      
+      res.json({ ok: true, channels });
     });
 
     // Validations for Tasks
@@ -326,10 +634,43 @@ export class GatewayServer {
       res.json(task);
     });
 
-    // Task list
+    // Task list (paginated)
     app.get("/api/tasks", (req, res) => {
-      const list = Array.from(this.tasks.values()).sort((a, b) => b.createdAt - a.createdAt);
-      res.json({ ok: true, tasks: list });
+      const limit = Math.min(Math.max(parseInt(req.query.limit as string) || 20, 1), 100);
+      const offset = Math.max(parseInt(req.query.offset as string) || 0, 0);
+      
+      const allTasks = Array.from(this.tasks.values()).sort((a, b) => b.createdAt - a.createdAt);
+      const total = allTasks.length;
+      const tasks = allTasks.slice(offset, offset + limit);
+      
+      res.json({ ok: true, tasks, total, limit, offset });
+    });
+
+    // Logs (paginated)
+    app.get("/api/logs", (req, res) => {
+      const limit = Math.min(Math.max(parseInt(req.query.limit as string) || 20, 1), 100);
+      const offset = Math.max(parseInt(req.query.offset as string) || 0, 0);
+      
+      const logPath = this.config.logFilePath;
+      if (!logPath || !fsSync.existsSync(logPath)) {
+        res.json({ ok: true, data: [], total: 0, limit, offset });
+        return;
+      }
+      
+      try {
+        const content = fsSync.readFileSync(logPath, "utf-8");
+        const lines = content.split("\n").filter(Boolean).reverse(); // Most recent first
+        
+        const total = lines.length;
+        const data = lines.slice(offset, offset + limit);
+        
+        res.json({ ok: true, data, total, limit, offset });
+      } catch (err) {
+        res.status(500).json({ 
+          ok: false, 
+          error: err instanceof Error ? err.message : String(err) 
+        });
+      }
     });
 
     // Logs Stream (SSE)
@@ -346,12 +687,26 @@ export class GatewayServer {
         return;
       }
 
+      const shouldSkipLogLine = (line: string): boolean => {
+        try {
+          const entry = JSON.parse(line) as { level?: number; msg?: string; component?: string; module?: string };
+          if ((entry.component === "adapter" && entry.module === "whatsapp-client") && (entry.level ?? 0) <= 20) {
+            return true;
+          }
+        } catch {
+          // Ignore parse errors
+        }
+        return false;
+      };
+
       // Send last 50 lines first
       try {
         const content = fsSync.readFileSync(logPath, "utf-8");
         const lines = content.split("\n").filter(Boolean).slice(-50);
         for (const line of lines) {
-          res.write(`event: log\ndata: ${line}\n\n`);
+          if (!shouldSkipLogLine(line)) {
+            res.write(`event: log\ndata: ${line}\n\n`);
+          }
         }
       } catch (err) {
         this.logger.error({ error: err instanceof Error ? err.message : String(err) }, "Failed to read logs");
@@ -372,9 +727,11 @@ export class GatewayServer {
               const newContent = buffer.toString("utf-8");
               const newLines = newContent.split("\n").filter(Boolean);
 
-              for (const line of newLines) {
-                res.write(`event: log\ndata: ${line}\n\n`);
-              }
+                for (const line of newLines) {
+                  if (!shouldSkipLogLine(line)) {
+                    res.write(`event: log\ndata: ${line}\n\n`);
+                  }
+                }
               lastSize = stats.size;
             } else {
               lastSize = stats.size;
@@ -399,14 +756,8 @@ export class GatewayServer {
         "Connection": "keep-alive",
       });
 
-      const unsubscribe = this.eventBus.on("*", (event) => {
-        // SSE expects `event:` to be the event name, but here we use generic `event` type
-        // and put the actual data in `data`.
-        // However, the `client.ts` expects `event instanceof MessageEvent` and parses `data`.
-        // The `onEvent` callback in `client.ts` expects `SystemEvent`.
-        // `GatewayEvent` should map to `SystemEvent`.
-        // Let's ensure the format matches client expectations.
-        // Client: `source.addEventListener('event', ...)` so we send `event: event`
+      // Subscribe to global event stream
+      const unsubscribe = getEventStream().subscribeAll((event) => {
         res.write(`event: event\ndata: ${JSON.stringify(event)}\n\n`);
       });
 
@@ -416,7 +767,703 @@ export class GatewayServer {
       });
     });
 
+    // ============================================
+    // Health Endpoint
+    // ============================================
+    app.get("/api/health", (req, res) => {
+      const memUsage = process.memoryUsage();
+      const totalMem = os.totalmem();
+      const freeMem = os.freemem();
+      
+      // Calculate CPU usage (simplified)
+      const cpuUsage = os.loadavg()[0] || 0;
+      const cpuCount = os.cpus().length || 1;
+      const cpuPercent = Math.min(100, Math.round((cpuUsage / cpuCount) * 100));
+      
+      // Calculate memory percentage
+      const memPercent = Math.round(((totalMem - freeMem) / totalMem) * 100);
+      
+      // Error rate (errors per minute)
+      const now = Date.now();
+      const timeSinceLastError = now - this.lastErrorTime;
+      const errorRate = timeSinceLastError < 60000 ? this.errorCount : 0;
+      
+      const health: SystemHealth = {
+        cpu: cpuPercent,
+        memory: memPercent,
+        disk: 0, // Would need additional library to calculate
+        uptime: Date.now() - this.startTime,
+        lastRestart: this.startTime,
+        queueDepth: this.router?.getSessionQueueStats().queued ?? 0,
+        activeConnections: this.connections.size,
+        totalErrors: this.errorCount,
+        errorRate: errorRate,
+      };
+      
+      res.json({ ok: true, health });
+    });
+
+    // ============================================
+    // Error Classification Endpoint
+    // ============================================
+    
+    // POST /api/errors/classify
+    app.post("/api/errors/classify", (req, res) => {
+      const { error, context } = req.body;
+      
+      if (!error) {
+        res.status(400).json({ ok: false, error: "Error message is required" });
+        return;
+      }
+      
+      try {
+        const classification = classifyError(error, context);
+        res.json({ ok: true, classification });
+      } catch (err) {
+        res.status(500).json({ 
+          ok: false, 
+          error: err instanceof Error ? err.message : String(err) 
+        });
+      }
+    });
+
+    // GET /api/errors/stats
+    app.get("/api/errors/stats", (req, res) => {
+      // Return error statistics from health tracking
+      res.json({
+        ok: true,
+        stats: {
+          totalErrors: this.errorCount,
+          lastErrorAt: this.lastErrorTime,
+          errorRate: Date.now() - this.lastErrorTime < 60000 ? this.errorCount : 0,
+        },
+      });
+    });
+
+    // ============================================
+    // Provider Health API Endpoints
+    // ============================================
+    
+    // GET /api/providers/health
+    app.get("/api/providers/health", (req, res) => {
+      try {
+        const providers = this.providerHealthTracker.getAllProviderHealth();
+        const summary = this.providerHealthTracker.getSummary();
+        
+        res.json({
+          ok: true,
+          providers,
+          summary,
+        });
+      } catch (err) {
+        res.status(500).json({ 
+          ok: false, 
+          error: err instanceof Error ? err.message : String(err) 
+        });
+      }
+    });
+
+    // GET /api/providers/health/:id
+    app.get("/api/providers/health/:id", (req, res) => {
+      try {
+        const provider = this.providerHealthTracker.getProviderHealth(req.params.id);
+        if (!provider) {
+          res.status(404).json({ ok: false, error: "Provider not found" });
+          return;
+        }
+        
+        res.json({
+          ok: true,
+          provider,
+        });
+      } catch (err) {
+        res.status(500).json({ 
+          ok: false, 
+          error: err instanceof Error ? err.message : String(err) 
+        });
+      }
+    });
+
+    // ============================================
+    // Memory API Endpoints
+    // ============================================
+    
+    // GET /api/memory/stats
+    app.get("/api/memory/stats", async (req, res) => {
+      if (!this.memoryManager) {
+        res.json({ 
+          ok: true, 
+          stats: { 
+            enabled: false, 
+            fileCount: 0, 
+            lastRunAt: 0,
+            categories: {},
+            totalSize: 0,
+          } 
+        });
+        return;
+      }
+      
+      try {
+        // Get stats from skill registry or estimate from memory system
+        const stats = {
+          enabled: true,
+          fileCount: 0, // Would need to get from SQLite store
+          lastRunAt: Date.now(),
+          categories: {} as Record<string, number>,
+          totalSize: 0,
+        };
+        
+        res.json({ ok: true, stats });
+      } catch (err) {
+        res.status(500).json({ 
+          ok: false, 
+          error: err instanceof Error ? err.message : String(err) 
+        });
+      }
+    });
+
+    // GET /api/memory/search?q=<query>
+    app.get("/api/memory/search", async (req, res) => {
+      const query = req.query.q as string;
+      
+      if (!query) {
+        res.status(400).json({ ok: false, error: "Query parameter 'q' is required" });
+        return;
+      }
+      
+      if (!this.memoryManager) {
+        res.json({ ok: true, results: [], query });
+        return;
+      }
+      
+      try {
+        const results = await this.memoryManager.search(query);
+        
+        // Transform results to match UI expected format
+        const memories = results.map((r, i) => ({
+          id: r.chunkId || `${r.path}#${r.startLine}`,
+          content: r.snippet,
+          type: r.source === "sessions" ? "session" : "indexed" as const,
+          category: r.source,
+          tags: [],
+          searchScore: r.score,
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+          accessCount: 0,
+          references: [],
+        }));
+        
+        res.json({ ok: true, results: memories, query });
+      } catch (err) {
+        res.status(500).json({ 
+          ok: false, 
+          error: err instanceof Error ? err.message : String(err) 
+        });
+      }
+    });
+
+    // GET /api/memory/index
+    app.get("/api/memory/index", async (req, res) => {
+      if (!this.memoryManager) {
+        res.json({ ok: true, memories: [], total: 0 });
+        return;
+      }
+      
+      try {
+        // Return empty for now - full index listing would need store support
+        res.json({ ok: true, memories: [], total: 0 });
+      } catch (err) {
+        res.status(500).json({ 
+          ok: false, 
+          error: err instanceof Error ? err.message : String(err) 
+        });
+      }
+    });
+
+    // POST /api/memory
+    app.post("/api/memory", async (req, res) => {
+      const { content, category, tags } = req.body;
+      
+      if (!content) {
+        res.status(400).json({ ok: false, error: "Content is required" });
+        return;
+      }
+      
+      if (!this.memoryManager) {
+        res.status(503).json({ ok: false, error: "Memory manager not available" });
+        return;
+      }
+      
+      try {
+        await this.memoryManager.update(content);
+        
+        res.json({ 
+          ok: true, 
+          id: `mem-${Date.now()}`, 
+          timestamp: Date.now() 
+        });
+      } catch (err) {
+        res.status(500).json({ 
+          ok: false, 
+          error: err instanceof Error ? err.message : String(err) 
+        });
+      }
+    });
+
+    // ============================================
+    // Jobs API Endpoints
+    // ============================================
+    
+    // GET /api/jobs (paginated)
+    app.get("/api/jobs", (req, res) => {
+      if (!this.scheduler) {
+        res.json({ ok: true, data: [], total: 0, limit: 20, offset: 0 });
+        return;
+      }
+      
+      const limit = Math.min(Math.max(parseInt(req.query.limit as string) || 20, 1), 100);
+      const offset = Math.max(parseInt(req.query.offset as string) || 0, 0);
+      
+      try {
+        const jobs = this.scheduler.listJobs();
+        
+        // Transform to UI expected format
+        const allJobs = jobs.map((job) => ({
+          id: job.id,
+          name: job.name,
+          schedule: job.schedule,
+          naturalLanguage: job.schedule, // Could be improved with natural language parsing
+          enabled: job.enabled,
+          lastRunAt: job.lastRun,
+          nextRunAt: Date.now() + 3600000, // Placeholder - would need cron-parser
+          trigger: {
+            type: job.trigger.type as "agent_ask" | "tool_call" | "webhook",
+            data: job.trigger.type === "agent_ask" 
+              ? { prompt: (job.trigger as any).prompt || "" }
+              : job.trigger.type === "tool_call"
+              ? { tool: (job.trigger as any).tool, args: (job.trigger as any).args }
+              : { url: (job.trigger as any).url },
+          },
+          actions: (job.actions || []).map((a) => ({
+            type: a.type as "memory_update" | "send_message" | "log_event",
+            data: a,
+          })),
+          executionHistory: job.lastResult 
+            ? [{
+                runAt: job.lastRun || Date.now(),
+                duration: job.lastResult.duration || 0,
+                status: job.lastResult.status === "success" ? "success" as const : "error" as const,
+              }]
+            : [],
+        }));
+        
+        const total = allJobs.length;
+        const data = allJobs.slice(offset, offset + limit);
+        
+        res.json({ ok: true, data, total, limit, offset });
+      } catch (err) {
+        res.status(500).json({ 
+          ok: false, 
+          error: err instanceof Error ? err.message : String(err) 
+        });
+      }
+    });
+
+    // GET /api/jobs/:id
+    app.get("/api/jobs/:id", (req, res) => {
+      if (!this.scheduler) {
+        res.status(503).json({ ok: false, error: "Scheduler not available" });
+        return;
+      }
+      
+      const job = this.scheduler.getJob(req.params.id);
+      if (!job) {
+        res.status(404).json({ ok: false, error: "Job not found" });
+        return;
+      }
+      
+      res.json({ ok: true, job });
+    });
+
+    // POST /api/jobs/:id/toggle
+    app.post("/api/jobs/:id/toggle", async (req, res) => {
+      if (!this.scheduler) {
+        res.status(503).json({ ok: false, error: "Scheduler not available" });
+        return;
+      }
+      
+      const job = this.scheduler.getJob(req.params.id);
+      if (!job) {
+        res.status(404).json({ ok: false, error: "Job not found" });
+        return;
+      }
+      
+      try {
+        if (job.enabled) {
+          await this.scheduler.disableJob(req.params.id);
+          await this.events.jobDisabled({ jobId: job.id, name: job.name });
+        } else {
+          await this.scheduler.enableJob(req.params.id);
+          await this.events.jobEnabled({ jobId: job.id, name: job.name });
+        }
+        res.json({ ok: true });
+      } catch (err) {
+        res.status(500).json({ 
+          ok: false, 
+          error: err instanceof Error ? err.message : String(err) 
+        });
+      }
+    });
+
+    // POST /api/jobs/:id/run
+    app.post("/api/jobs/:id/run", async (req, res) => {
+      if (!this.scheduler) {
+        res.status(503).json({ ok: false, error: "Scheduler not available" });
+        return;
+      }
+      
+      const job = this.scheduler.getJob(req.params.id);
+      if (!job) {
+        res.status(404).json({ ok: false, error: "Job not found" });
+        return;
+      }
+      
+      try {
+        await this.events.jobStarted({
+          jobId: job.id,
+          name: job.name,
+          schedule: job.schedule,
+          triggeredAt: Date.now(),
+        });
+        
+        const result = await this.scheduler.runJob(req.params.id);
+        
+        if (result.status === "success") {
+          await this.events.jobCompleted({
+            jobId: job.id,
+            name: job.name,
+            duration: result.duration,
+            retryCount: result.retryCount || 0,
+          });
+        } else {
+          await this.events.jobFailed({
+            jobId: job.id,
+            name: job.name,
+            duration: result.duration,
+            error: result.error || "Unknown error",
+            retryCount: result.retryCount || 0,
+          });
+        }
+        
+        res.json({ 
+          ok: result.status === "success" || result.status === "failure", 
+          executedAt: result.completedAt,
+          jobRunId: `run-${Date.now()}`,
+          error: result.error,
+        });
+      } catch (err) {
+        const errorMsg = err instanceof Error ? err.message : String(err);
+        await this.events.jobFailed({
+          jobId: req.params.id,
+          name: job?.name || "Unknown",
+          duration: 0,
+          error: errorMsg,
+          retryCount: 0,
+        });
+        res.status(500).json({ 
+          ok: false, 
+          error: errorMsg 
+        });
+      }
+    });
+
+    // POST /api/jobs
+    app.post("/api/jobs", async (req, res) => {
+      if (!this.scheduler) {
+        res.status(503).json({ ok: false, error: "Scheduler not available" });
+        return;
+      }
+      
+      const { name, schedule, trigger, actions } = req.body;
+      
+      if (!name || !schedule) {
+        res.status(400).json({ ok: false, error: "Name and schedule are required" });
+        return;
+      }
+      
+      try {
+        const job = await this.scheduler.addJob({
+          id: `job-${Date.now()}`,
+          name,
+          schedule,
+          trigger: trigger || { type: "agent_ask", prompt: "" },
+          actions: actions || [],
+          enabled: true,
+        });
+        
+        await this.events.jobCreated({
+          jobId: job.id,
+          name: job.name,
+          schedule: job.schedule,
+          triggerType: job.trigger.type,
+        });
+        
+        res.json({ ok: true, id: job.id });
+      } catch (err) {
+        res.status(500).json({ 
+          ok: false, 
+          error: err instanceof Error ? err.message : String(err) 
+        });
+      }
+    });
+
+    // DELETE /api/jobs/:id
+    app.delete("/api/jobs/:id", async (req, res) => {
+      if (!this.scheduler) {
+        res.status(503).json({ ok: false, error: "Scheduler not available" });
+        return;
+      }
+      
+      const job = this.scheduler.getJob(req.params.id);
+      if (!job) {
+        res.status(404).json({ ok: false, error: "Job not found" });
+        return;
+      }
+      
+      try {
+        const removed = await this.scheduler.removeJob(req.params.id);
+        if (!removed) {
+          res.status(404).json({ ok: false, error: "Job not found" });
+          return;
+        }
+        
+        await this.events.jobRemoved({
+          jobId: job.id,
+          name: job.name,
+        });
+        
+        res.json({ ok: true });
+      } catch (err) {
+        res.status(500).json({ 
+          ok: false, 
+          error: err instanceof Error ? err.message : String(err) 
+        });
+      }
+    });
+
+    // ============================================
+    // Skills API Endpoints
+    // ============================================
+    
+    // GET /api/skills
+    app.get("/api/skills", async (req, res) => {
+      try {
+        let skills: any[] = [];
+        
+        // Get skills from skill registry if available
+        if (this.skillRegistry) {
+          const registeredSkills = await this.skillRegistry.getAllSkills();
+          skills = registeredSkills.map((s) => ({
+            name: s.name,
+            description: s.purpose,
+            category: "custom",
+            version: "1.0.0",
+            author: s.author,
+            createdAt: new Date(s.createdAt).getTime(),
+            updatedAt: Date.now(),
+            usageCount: 0,
+            parameters: {},
+            source: s.usage,
+          }));
+        }
+        
+        // Also get built-in tools from tool registry
+        if (this.toolRegistry) {
+          const tools = this.toolRegistry.getAll();
+          const toolSkills = tools.map((t: { meta: { name: string; description: string; category: string; version: string; author?: string }; parameters: unknown }) => ({
+            name: t.meta.name,
+            description: t.meta.description,
+            category: t.meta.category,
+            version: t.meta.version,
+            author: t.meta.author || "system",
+            createdAt: Date.now(),
+            updatedAt: Date.now(),
+            usageCount: 0,
+            parameters: t.parameters,
+          }));
+          skills = [...skills, ...toolSkills];
+        }
+        
+        // Get unique categories
+        const categories = [...new Set(skills.map((s) => s.category))];
+        
+        res.json({ ok: true, skills, categories });
+      } catch (err) {
+        res.status(500).json({ 
+          ok: false, 
+          error: err instanceof Error ? err.message : String(err) 
+        });
+      }
+    });
+
+    // GET /api/skills/:name
+    app.get("/api/skills/:name", async (req, res) => {
+      const name = decodeURIComponent(req.params.name);
+      
+      try {
+        // Check skill registry first
+        if (this.skillRegistry) {
+          const skill = await this.skillRegistry.getSkill(name);
+          if (skill) {
+            res.json({
+              ok: true,
+              skill: {
+                name: skill.name,
+                description: skill.purpose,
+                category: "custom",
+                version: "1.0.0",
+                author: skill.author,
+                createdAt: new Date(skill.createdAt).getTime(),
+                updatedAt: Date.now(),
+                usageCount: 0,
+                parameters: {},
+              },
+              source: skill.usage,
+            });
+            return;
+          }
+        }
+        
+        // Check tool registry
+        if (this.toolRegistry) {
+          const tool = this.toolRegistry.get(name);
+          if (tool) {
+            res.json({
+              ok: true,
+              skill: {
+                name: tool.meta.name,
+                description: tool.meta.description,
+                category: tool.meta.category,
+                version: tool.meta.version,
+                author: tool.meta.author || "system",
+                createdAt: Date.now(),
+                updatedAt: Date.now(),
+                usageCount: 0,
+                parameters: tool.parameters,
+              },
+              source: "built-in",
+            });
+            return;
+          }
+        }
+        
+        res.status(404).json({ ok: false, error: "Skill not found" });
+      } catch (err) {
+        res.status(500).json({ 
+          ok: false, 
+          error: err instanceof Error ? err.message : String(err) 
+        });
+      }
+    });
+
+    // POST /api/skills
+    app.post("/api/skills", async (req, res) => {
+      const { name, description, source, category } = req.body;
+      
+      if (!name || !description) {
+        res.status(400).json({ ok: false, error: "Name and description are required" });
+        return;
+      }
+      
+      if (!this.skillRegistry) {
+        res.status(503).json({ ok: false, error: "Skill registry not available" });
+        return;
+      }
+      
+      try {
+        await this.skillRegistry.addSkill({
+          name,
+          purpose: description,
+          usage: source || `tool_${name}`,
+          createdAt: new Date().toISOString(),
+          author: "user",
+          parameters: "",
+          status: "active",
+        });
+        
+        await this.events.skillCreated({
+          name,
+          description,
+          author: "user",
+        });
+        
+        res.json({ ok: true, id: name });
+      } catch (err) {
+        res.status(500).json({ 
+          ok: false, 
+          error: err instanceof Error ? err.message : String(err) 
+        });
+      }
+    });
+
+    // DELETE /api/skills/:name
+    app.delete("/api/skills/:name", async (req, res) => {
+      const name = decodeURIComponent(req.params.name);
+      
+      if (!this.skillRegistry) {
+        res.status(503).json({ ok: false, error: "Skill registry not available" });
+        return;
+      }
+      
+      try {
+        const removed = await this.skillRegistry.removeSkill(name);
+        if (!removed) {
+          res.status(404).json({ ok: false, error: "Skill not found" });
+          return;
+        }
+        
+        await this.events.skillDeleted({ name });
+        
+        res.json({ ok: true });
+      } catch (err) {
+        res.status(500).json({ 
+          ok: false, 
+          error: err instanceof Error ? err.message : String(err) 
+        });
+      }
+    });
+
+    // GET /api/tools (built-in tools; read-only)
+    app.get("/api/tools", (req, res) => {
+      if (!this.toolRegistry) {
+        res.json({ ok: true, tools: [] });
+        return;
+      }
+      
+      try {
+        const tools = this.toolRegistry.getAll().map((t: { meta: { name: string; description: string; category: string; version: string; author?: string }; parameters: unknown }) => ({
+          name: t.meta.name,
+          description: t.meta.description,
+          category: t.meta.category,
+          version: t.meta.version,
+          author: t.meta.author || "system",
+          parameters: t.parameters,
+        }));
+        
+        res.json({ ok: true, tools });
+      } catch (err) {
+        res.status(500).json({ 
+          ok: false, 
+          error: err instanceof Error ? err.message : String(err) 
+        });
+      }
+    });
+
+    // ============================================
     // Main Agent Routes
+    // ============================================
+    
     // List Main Agent tasks
     app.get("/api/main-agent/tasks", (req, res) => {
       if (!this.mainAgent) {
@@ -513,7 +1560,16 @@ export class GatewayServer {
         resolve();
       });
     });
-  }
+    // Wire up global event stream to gateway broadcast
+    getEventStream().subscribeAll((event) => {
+      this.broadcast({
+        type: event.type as any, // Cast to match GatewayEvent type mostly
+        sessionKey: event.sessionKey ?? undefined,
+        channel: event.channel,
+        data: event.data,
+        timestamp: event.timestamp || Date.now(),
+      });
+    });  }
 
   /**
    * Stop the gateway server
@@ -573,7 +1629,7 @@ export class GatewayServer {
     }
 
     const prompt = options?.prompt ?? "Health check: respond with OK.";
-    const timeoutMs = options?.timeoutMs ?? 30000;
+    const timeoutMs = options?.timeoutMs ?? 300000;
     const delayMs = options?.delayMs ?? 3000;
     const startedAt = Date.now();
 
@@ -847,7 +1903,7 @@ export class GatewayServer {
       uptime: this.startTime ? Date.now() - this.startTime : 0,
       connections: this.connections.size,
       activeSessions: this.sessions.activeCount,
-      queueDepth: 0, // TODO: Implement queue
+      queueDepth: this.router?.getSessionQueueStats().queued ?? 0,
       channels: this.router ? 
         Object.fromEntries(
             Array.from(this.router.getAdapters().entries()).map(([k, v]) => [k, v.getStatus()])
