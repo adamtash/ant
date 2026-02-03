@@ -51,7 +51,7 @@ export interface Task {
     code: string;
   };
   subagents: Agent[];
-  channel: 'whatsapp' | 'cli' | 'web';
+  channel: 'whatsapp' | 'cli' | 'web' | 'telegram' | 'discord';
   sessionKey: string;
   iterations: number;
 }
@@ -161,7 +161,7 @@ export interface SystemHealth {
 
 export interface Session {
   key: string;
-  channel: 'whatsapp' | 'cli' | 'web';
+  channel: 'whatsapp' | 'cli' | 'web' | 'telegram' | 'discord';
   createdAt: number;
   lastMessageAt: number;
   messageCount: number;

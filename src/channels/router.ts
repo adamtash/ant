@@ -845,7 +845,15 @@ export class MessageRouter extends EventEmitter {
     if (!session) {
       if (isSessionRecoverable) {
         const [channel, type, ...rest] = parts;
-        const chatId = rest.join(":");
+        let chatId = rest.join(":");
+        let threadId: string | undefined;
+
+        // Channel-specific session key recovery
+        // Telegram forum topics: telegram:topic:<chatId>:<threadId>
+        if (channel === "telegram" && type === "topic") {
+          chatId = rest[0] ?? "";
+          threadId = rest[1];
+        }
         
         if (channel && chatId && this.adapters.has(channel as Channel)) {
            this.logger.info({ sessionKey }, "Recovering missing session from key");
@@ -853,6 +861,7 @@ export class MessageRouter extends EventEmitter {
              sessionKey,
              channel: channel as Channel,
              chatId,
+             threadId,
              createdAt: Date.now(),
              lastActivity: Date.now(),
              messageCount: 0

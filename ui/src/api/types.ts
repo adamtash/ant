@@ -101,7 +101,7 @@ export type Task = {
     code: string;
   };
   subagents: Agent[];
-  channel: 'whatsapp' | 'cli' | 'web';
+  channel: 'whatsapp' | 'cli' | 'web' | 'telegram' | 'discord';
   sessionKey: string;
   iterations: number;
 };
@@ -267,7 +267,7 @@ export type JobDetailResponse = {
 
 export type Session = {
   key: string;
-  channel: 'whatsapp' | 'cli' | 'web';
+  channel: 'whatsapp' | 'cli' | 'web' | 'telegram' | 'discord';
   createdAt: number;
   lastMessageAt: number;
   messageCount: number;

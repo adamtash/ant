@@ -129,6 +129,38 @@ const WhatsAppSchema = z.object({
   startupRecipients: z.array(z.string()).default([]),
 });
 
+const TelegramSchema = z
+  .object({
+    enabled: z.boolean().default(false),
+    /** Bot API mode: long polling (local) or webhook (public). */
+    mode: z.enum(["polling", "webhook"]).default("polling"),
+    botToken: z.string().optional(),
+    /** Secure-by-default DM access control. */
+    dmPolicy: z.enum(["pairing", "allowlist", "open", "disabled"]).default("pairing"),
+    webhook: z
+      .object({
+        /** Public base URL (e.g. https://example.com) used to register the webhook with Telegram. */
+        publicUrl: z.string().min(1).optional(),
+        /** Path on our gateway server to receive webhook updates. */
+        path: z.string().min(1).default("/api/telegram/webhook"),
+        /** Optional Telegram secret token (checked via X-Telegram-Bot-Api-Secret-Token). */
+        secretToken: z.string().min(1).optional(),
+      })
+      .default({}),
+    respondToGroups: z.boolean().default(false),
+    mentionOnly: z.boolean().default(true),
+    botName: z.string().optional(),
+    typingIndicator: z.boolean().default(true),
+    linkPreview: z.boolean().default(true),
+    /** Download inbound media to the state dir and attach local paths to messages. */
+    downloadMedia: z.boolean().default(false),
+    /** Hard limit for inbound media downloads (bytes). */
+    maxInboundMediaBytes: z.number().int().positive().default(20_000_000),
+    mentionKeywords: z.array(z.string()).default([]),
+    allowFrom: z.array(z.string()).default([]),
+  })
+  .default({});
+
 const MemorySchema = z.object({
   enabled: z.boolean().default(true),
   indexSessions: z.boolean().default(true),
@@ -474,6 +506,7 @@ const ConfigSchema = z.object({
   browser: BrowserSchema.default({}),
   ui: UiSchema.default({}),
   whatsapp: WhatsAppSchema,
+  telegram: TelegramSchema,
   memory: MemorySchema,
   agent: AgentSchema.default({}),
   toolPolicies: ToolPoliciesSchema,
@@ -495,6 +528,7 @@ export type AntConfig = z.infer<typeof ConfigSchema> & {
     stateDir: string;
     memorySqlitePath: string;
     whatsappSessionDir: string;
+    telegramStateDir: string;
     providerEmbeddingsModel: string;
     providers: ProvidersOutput;
     routing: RoutingOutput;
@@ -654,6 +688,34 @@ function applyEnvOverrides(raw: unknown): unknown {
     config.logging = logging;
   }
 
+  const telegramEnabled = envStr("ANT_TELEGRAM_ENABLED");
+  const telegramToken = envStr("ANT_TELEGRAM_BOT_TOKEN");
+  const telegramMode = envStr("ANT_TELEGRAM_MODE");
+  const telegramWebhookPublicUrl = envStr("ANT_TELEGRAM_WEBHOOK_PUBLIC_URL");
+  const telegramWebhookPath = envStr("ANT_TELEGRAM_WEBHOOK_PATH");
+  const telegramWebhookSecret = envStr("ANT_TELEGRAM_WEBHOOK_SECRET_TOKEN");
+  if (
+    telegramEnabled ||
+    telegramToken ||
+    telegramMode ||
+    telegramWebhookPublicUrl ||
+    telegramWebhookPath ||
+    telegramWebhookSecret
+  ) {
+    const telegram = isPlainObject(config.telegram) ? { ...config.telegram } : {};
+    if (telegramEnabled) telegram.enabled = telegramEnabled.toLowerCase() === "true";
+    if (telegramToken) telegram.botToken = telegramToken;
+    if (telegramMode && (telegramMode === "polling" || telegramMode === "webhook")) telegram.mode = telegramMode;
+    if (telegramWebhookPublicUrl || telegramWebhookPath || telegramWebhookSecret) {
+      const webhook = isPlainObject((telegram as any).webhook) ? { ...(telegram as any).webhook } : {};
+      if (telegramWebhookPublicUrl) webhook.publicUrl = telegramWebhookPublicUrl;
+      if (telegramWebhookPath) webhook.path = telegramWebhookPath;
+      if (telegramWebhookSecret) webhook.secretToken = telegramWebhookSecret;
+      (telegram as any).webhook = webhook;
+    }
+    config.telegram = telegram;
+  }
+
   return config;
 }
 
@@ -665,6 +727,7 @@ function resolveConfig(base: z.infer<typeof ConfigSchema>, configPath: string): 
   );
   const memorySqlitePath = resolveUserPath(base.memory.sqlitePath, workspaceDir);
   const whatsappSessionDir = resolveUserPath(base.whatsapp.sessionDir, workspaceDir);
+  const telegramStateDir = path.join(stateDir, "telegram");
   const logFilePath = resolveUserPath(
     base.logging.filePath?.trim() || path.join(stateDir, "ant.log"),
     workspaceDir,
@@ -684,6 +747,7 @@ function resolveConfig(base: z.infer<typeof ConfigSchema>, configPath: string): 
       stateDir,
       memorySqlitePath,
       whatsappSessionDir,
+      telegramStateDir,
       providerEmbeddingsModel,
       providers,
       routing,

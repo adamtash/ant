@@ -42,6 +42,12 @@ import type { MonitorEvent, ErrorOccurredData } from "../monitor/types.js";
 import { buildAgentScopedSessionKey, buildAgentTaskSessionKey, normalizeAgentId } from "../routing/session-key.js";
 import { onAgentEvent, type AgentEventPayload } from "../monitor/agent-events.js";
 import { listActiveRuns } from "../agent/active-runs.js";
+import {
+  approveTelegramPairingCode,
+  denyTelegramPairingCode,
+  getTelegramPairingSnapshot,
+  removeTelegramAllowFromEntry,
+} from "../channels/telegram/pairing-store.js";
 
 /**
  * Gateway configuration
@@ -405,6 +411,29 @@ export class GatewayServer {
    */
   private setupApiRoutes(app: express.Application): void {
     app.use(express.json());
+
+    // Telegram webhook handler (path configurable via config; handled by TelegramAdapter)
+    app.use(async (req, res, next) => {
+      if (req.method !== "POST") return next();
+      if (!this.router) return next();
+
+      const adapter = this.router.getAdapter("telegram") as any;
+      if (!adapter || typeof adapter.handleWebhook !== "function") return next();
+
+      const expectedPath =
+        (typeof adapter.getStatus === "function" ? adapter.getStatus()?.webhookPath : undefined) ??
+        "/api/telegram/webhook";
+
+      if (typeof expectedPath !== "string" || req.path !== expectedPath) return next();
+
+      try {
+        await adapter.handleWebhook(req, res);
+      } catch (err) {
+        const error = err instanceof Error ? err.message : String(err);
+        this.logger.warn({ error }, "Telegram webhook handler failed");
+        res.status(500).json({ ok: false, error });
+      }
+    });
 
     // Status
     app.get("/api/status", async (req, res) => {
@@ -805,6 +834,99 @@ export class GatewayServer {
     });
 
     // ============================================
+    // Telegram Pairing API
+    // ============================================
+
+    app.get("/api/telegram/pairing", async (_req, res) => {
+      if (!this.config.configPath) {
+        res.status(500).json({ ok: false, error: "configPath not configured" });
+        return;
+      }
+
+      try {
+        const cfg = await loadConfig(this.config.configPath);
+        const snapshot = await getTelegramPairingSnapshot(cfg);
+        res.json({ ok: true, ...snapshot });
+      } catch (err) {
+        res
+          .status(500)
+          .json({ ok: false, error: err instanceof Error ? err.message : String(err) });
+      }
+    });
+
+    app.post("/api/telegram/pairing/approve", async (req, res) => {
+      if (!this.config.configPath) {
+        res.status(500).json({ ok: false, error: "configPath not configured" });
+        return;
+      }
+
+      const code = typeof req.body?.code === "string" ? req.body.code : "";
+      try {
+        const cfg = await loadConfig(this.config.configPath);
+        const result = await approveTelegramPairingCode({ cfg, code });
+
+        if (result.ok && result.request && this.router) {
+          const sessionKey = `telegram:dm:${result.request.chatId}`;
+          await this.router.sendToSession(
+            sessionKey,
+            "✅ Pairing approved. You can now message me."
+          );
+        }
+
+        res.json(result);
+      } catch (err) {
+        res
+          .status(500)
+          .json({ ok: false, error: err instanceof Error ? err.message : String(err) });
+      }
+    });
+
+    app.post("/api/telegram/pairing/deny", async (req, res) => {
+      if (!this.config.configPath) {
+        res.status(500).json({ ok: false, error: "configPath not configured" });
+        return;
+      }
+
+      const code = typeof req.body?.code === "string" ? req.body.code : "";
+      try {
+        const cfg = await loadConfig(this.config.configPath);
+        const result = await denyTelegramPairingCode({ cfg, code });
+
+        if (result.ok && result.request && this.router) {
+          const sessionKey = `telegram:dm:${result.request.chatId}`;
+          await this.router.sendToSession(
+            sessionKey,
+            "❌ Pairing denied. Ask the admin to grant access."
+          );
+        }
+
+        res.json(result);
+      } catch (err) {
+        res
+          .status(500)
+          .json({ ok: false, error: err instanceof Error ? err.message : String(err) });
+      }
+    });
+
+    app.post("/api/telegram/pairing/remove", async (req, res) => {
+      if (!this.config.configPath) {
+        res.status(500).json({ ok: false, error: "configPath not configured" });
+        return;
+      }
+
+      const entry = typeof req.body?.entry === "string" ? req.body.entry : "";
+      try {
+        const cfg = await loadConfig(this.config.configPath);
+        const result = await removeTelegramAllowFromEntry({ cfg, entry });
+        res.json(result);
+      } catch (err) {
+        res
+          .status(500)
+          .json({ ok: false, error: err instanceof Error ? err.message : String(err) });
+      }
+    });
+
+    // ============================================
     // Test Harness Endpoints (test mode only)
     // ============================================
 
@@ -878,6 +1000,82 @@ export class GatewayServer {
         const adapter = this.router.getAdapter("whatsapp") as any;
         if (!adapter || typeof adapter.clearOutbound !== "function") {
           res.status(501).json({ ok: false, error: "WhatsApp test adapter not available" });
+          return;
+        }
+
+        adapter.clearOutbound();
+        res.json({ ok: true });
+      });
+
+      app.post("/api/test/telegram/inbound", (req, res) => {
+        if (!this.router) {
+          res.status(503).json({ ok: false, error: "Router not available" });
+          return;
+        }
+
+        const adapter = this.router.getAdapter("telegram") as any;
+        if (!adapter || typeof adapter.injectInbound !== "function") {
+          res.status(501).json({ ok: false, error: "Telegram test adapter not available" });
+          return;
+        }
+
+        const chatId = typeof req.body?.chatId === "string" ? req.body.chatId : "";
+        const text = typeof req.body?.text === "string" ? req.body.text : "";
+        const senderId = typeof req.body?.senderId === "string" ? req.body.senderId : undefined;
+        const username = typeof req.body?.username === "string" ? req.body.username : undefined;
+        const isGroup = typeof req.body?.isGroup === "boolean" ? req.body.isGroup : undefined;
+        const threadId = typeof req.body?.threadId === "string" ? req.body.threadId : undefined;
+        const timestampMs = typeof req.body?.timestampMs === "number" ? req.body.timestampMs : undefined;
+
+        if (!chatId.trim() || !text.trim()) {
+          res.status(400).json({ ok: false, error: "chatId and text are required" });
+          return;
+        }
+
+        const result = adapter.injectInbound({
+          chatId,
+          text,
+          senderId,
+          username,
+          isGroup,
+          threadId,
+          timestampMs,
+        });
+
+        res.json({ ok: true, ...result });
+      });
+
+      app.get("/api/test/telegram/outbound", (req, res) => {
+        if (!this.router) {
+          res.status(503).json({ ok: false, error: "Router not available" });
+          return;
+        }
+
+        const adapter = this.router.getAdapter("telegram") as any;
+        if (!adapter || typeof adapter.getOutbound !== "function") {
+          res.status(501).json({ ok: false, error: "Telegram test adapter not available" });
+          return;
+        }
+
+        const chatId = typeof req.query.chatId === "string" ? req.query.chatId : undefined;
+        const sessionKey = typeof req.query.sessionKey === "string" ? req.query.sessionKey : undefined;
+
+        let outbound = adapter.getOutbound();
+        if (chatId) outbound = outbound.filter((m: any) => m.chatId === chatId);
+        if (sessionKey) outbound = outbound.filter((m: any) => m.sessionKey === sessionKey);
+
+        res.json({ ok: true, outbound });
+      });
+
+      app.post("/api/test/telegram/outbound/clear", (_req, res) => {
+        if (!this.router) {
+          res.status(503).json({ ok: false, error: "Router not available" });
+          return;
+        }
+
+        const adapter = this.router.getAdapter("telegram") as any;
+        if (!adapter || typeof adapter.clearOutbound !== "function") {
+          res.status(501).json({ ok: false, error: "Telegram test adapter not available" });
           return;
         }
 

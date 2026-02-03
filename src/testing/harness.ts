@@ -277,7 +277,7 @@ async function startInProcessHarness(
       for (const attachment of attachments) {
         await router.sendToSession(message.context.sessionKey, attachment.caption ?? "", {
           media: {
-            type: "file",
+            type: attachment.mediaType ?? "file",
             data: attachment.path,
             filename: path.basename(attachment.path),
           },

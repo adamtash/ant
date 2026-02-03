@@ -30,6 +30,8 @@ export interface TestEnvConfig {
   configPath: string;
   /** Whether to enable WhatsApp (mock) */
   enableWhatsApp: boolean;
+  /** Whether to enable Telegram (mock) */
+  enableTelegram: boolean;
   /** Whether to enable memory */
   enableMemory: boolean;
   /** Whether to enable main agent */
@@ -155,6 +157,17 @@ async function createTestConfig(config: TestEnvConfig): Promise<void> {
       allowSelfMessages: true,
       resetOnLogout: false,
     },
+    telegram: {
+      enabled: config.enableTelegram,
+      mode: "polling",
+      dmPolicy: "open",
+      respondToGroups: false,
+      mentionOnly: true,
+      typingIndicator: false,
+      linkPreview: true,
+      mentionKeywords: [],
+      allowFrom: [],
+    },
     memory: {
       enabled: config.enableMemory,
       indexSessions: config.enableMemory,
@@ -248,6 +261,7 @@ export async function spawnTestInstance(
     uiPort,
     configPath,
     enableWhatsApp: options.enableWhatsApp ?? false,
+    enableTelegram: options.enableTelegram ?? false,
     enableMemory: options.enableMemory ?? false,
     enableMainAgent: options.enableMainAgent ?? false,
   };

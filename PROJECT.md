@@ -4,10 +4,11 @@
 
 # ant
 
-A lightweight, autonomous assistant that runs on your own machine and talks to you over WhatsApp. ant can use local tools, manage subagents, and keep memory from past sessions.
+A lightweight, autonomous assistant that runs on your own machine and talks to you over WhatsApp or Telegram. ant can use local tools, manage subagents, and keep memory from past sessions.
 
 ### Highlights
 - WhatsApp-first agent (Baileys-based) with typing indicators and media replies.
+- Telegram Bot API channel (grammY) with secure-by-default DM pairing/allowlist.
 - Local tool execution (files, commands, screenshots, browser automation).
 - Subagents for parallel work.
 - Memory indexing with embeddings (SQLite + optional session transcript indexing).
@@ -16,7 +17,7 @@ A lightweight, autonomous assistant that runs on your own machine and talks to y
 
 ### Requirements
 - Node.js 22+
-- WhatsApp account for QR pairing
+- WhatsApp account for QR pairing (or a Telegram bot token)
 - LM Studio (or any OpenAI-compatible API)
 
 ### Quick start
@@ -360,6 +361,7 @@ If `startupRecipients` is empty, ant falls back to `ownerJids` or your own JID w
 - When `respondToSelfOnly` is true, ant only replies in the self-chat (your own number), not other chats.
 - `ownerJids` can further restrict allowed senders or chats (example: `15551234567@s.whatsapp.net`).
 - `typingIndicator` sends WhatsApp "composing" presence updates while replies are generated.
+- Telegram DMs are locked down by default via `telegram.dmPolicy: "pairing"` (approve pairing codes in the UI).
 - For screen capture on macOS, grant Screen Recording permission to Terminal (or your Node binary).
 - `logging.filePath` defaults to `~/.ant/ant.log`. `logging.fileLevel` controls verbosity for the file output (defaults to `logging.level`).
 - `cliTools` uses non-interactive CLI modes by default when `args` is empty.
@@ -389,6 +391,16 @@ If `startupRecipients` is empty, ant falls back to `ownerJids` or your own JID w
 - OS control tools (read/write/exec/ls) plus screenshot and screen recording capture.
 - Twitter/X access via bird CLI.
 - Headless browser automation via Playwright.
+
+### Telegram
+- Telegram Bot API integration using grammY (polling or webhook).
+- Secure-by-default DM access control:
+  - `telegram.dmPolicy: "pairing"` (default): users request pairing with `/pair`; approve in the UI.
+  - `telegram.dmPolicy: "allowlist"`: only configured allowlist entries can DM.
+  - `telegram.dmPolicy: "open"`: allow all DMs.
+  - `telegram.dmPolicy: "disabled"`: ignore DMs.
+- Group gating (`telegram.respondToGroups`, `telegram.mentionOnly`, `telegram.mentionKeywords`).
+- Optional inbound media download to state dir (`telegram.downloadMedia`).
 
 ### Providers + routing
 - Multiple providers (OpenAI-compatible APIs and CLI providers).
@@ -442,6 +454,8 @@ npm run dev -- run -c ant.config.json
 ```
 
 You should see a QR code in the terminal. Scan it with WhatsApp.
+
+If you enable Telegram (`telegram.enabled: true` + `telegram.botToken`), the Web UI (Tunnels page) shows a QR code that opens your bot (t.me link) and a pairing approval UI.
 
 If you want Codex/Copilot/Claude as the main model, keep an OpenAI provider for tools and set routing:
 

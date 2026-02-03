@@ -41,6 +41,7 @@ export const DEFAULT_RELOAD_RULES: ReloadRule[] = [
   { prefix: "gateway", kind: "restart" },
   { prefix: "ui", kind: "restart" },
   { prefix: "whatsapp", kind: "restart" },
+  { prefix: "telegram", kind: "restart" },
   { prefix: "browser", kind: "restart" },
   { prefix: "workspaceDir", kind: "restart" },
   { prefix: "stateDir", kind: "restart" },
@@ -158,4 +159,3 @@ export function buildReloadPlanFromConfigs(prev: AntConfig, next: AntConfig): Re
   const paths = diffConfigPaths(prevRaw, nextRaw).filter((p) => p !== "<root>");
   return buildReloadPlan(paths);
 }
-

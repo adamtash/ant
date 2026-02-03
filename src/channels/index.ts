@@ -62,6 +62,19 @@ export {
   type WhatsAppMediaInfo,
 } from "./whatsapp/message-handler.js";
 
+// Telegram Adapter
+export {
+  TelegramAdapter,
+  type TelegramAdapterConfig,
+} from "./telegram/adapter.js";
+export { TestTelegramAdapter } from "./telegram/test-adapter.js";
+export {
+  extractTextFromMessage as extractTelegramTextFromMessage,
+  hasKeywordMention as hasTelegramKeywordMention,
+  hasMentionOfUser as hasTelegramMentionOfUser,
+  isGroupChatType as isTelegramGroupChatType,
+} from "./telegram/message-handler.js";
+
 // CLI Adapter
 export {
   CLIAdapter,

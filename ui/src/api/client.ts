@@ -311,6 +311,41 @@ export interface ChannelResponse {
 export const getChannels = () => apiGet<ChannelResponse>('/channels');
 
 // ============================================
+// Telegram Pairing
+// ============================================
+
+export interface TelegramPairingRequest {
+  id: string;
+  code: string;
+  userId: string;
+  chatId: string;
+  username?: string;
+  createdAt: number;
+  lastSeenAt: number;
+}
+
+export interface TelegramPairingSnapshotResponse {
+  ok: true;
+  allowFrom: string[];
+  requests: TelegramPairingRequest[];
+}
+
+export interface TelegramPairingActionResponse {
+  ok: boolean;
+  error?: string;
+  request?: TelegramPairingRequest;
+  allowFrom?: string[];
+}
+
+export const getTelegramPairing = () => apiGet<TelegramPairingSnapshotResponse>('/telegram/pairing');
+export const approveTelegramPairing = (code: string) =>
+  apiPost<TelegramPairingActionResponse>('/telegram/pairing/approve', { code });
+export const denyTelegramPairing = (code: string) =>
+  apiPost<TelegramPairingActionResponse>('/telegram/pairing/deny', { code });
+export const removeTelegramAllowFrom = (entry: string) =>
+  apiPost<TelegramPairingActionResponse>('/telegram/pairing/remove', { entry });
+
+// ============================================
 // EventSource (SSE)
 // ============================================
 

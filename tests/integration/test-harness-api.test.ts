@@ -19,7 +19,7 @@ describe("Test Harness API", () => {
   let instance: TestInstance;
 
   beforeAll(async () => {
-    instance = await spawnTestInstance({ enableWhatsApp: true, enableMemory: false });
+    instance = await spawnTestInstance({ enableWhatsApp: true, enableTelegram: true, enableMemory: false });
     await waitForGateway(instance, 15000);
   }, 300000);
 
@@ -59,5 +59,12 @@ describe("Test Harness API", () => {
     expect(out.ok).toBe(true);
     expect(out.outbound.length).toBe(0);
   });
-});
 
+  it("should expose Telegram outbound endpoint in test mode", async () => {
+    const res = await httpGet(instance, "/api/test/telegram/outbound");
+    expect(res.status).toBe(200);
+    const data = await res.json();
+    expect(data.ok).toBe(true);
+    expect(Array.isArray(data.outbound)).toBe(true);
+  });
+});

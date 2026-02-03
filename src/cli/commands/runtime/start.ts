@@ -151,7 +151,7 @@ export async function start(cfg: AntConfig, options: StartOptions = {}): Promise
     const { GatewayServer } = await import("../../../gateway/server.js");
     const { createLogger } = await import("../../../log.js");
     const { createAgentEngine } = await import("../../../agent/engine.js");
-    const { MessageRouter, WhatsAppAdapter, TestWhatsAppAdapter } = await import("../../../channels/index.js");
+    const { MessageRouter, WhatsAppAdapter, TestWhatsAppAdapter, TelegramAdapter, TestTelegramAdapter } = await import("../../../channels/index.js");
     const { Scheduler } = await import("../../../scheduler/scheduler.js");
     const { createSkillRegistryManager } = await import("../../../agent/skill-registry.js");
     const { SessionManager } = await import("../../../gateway/session-manager.js");
@@ -202,6 +202,33 @@ export async function start(cfg: AntConfig, options: StartOptions = {}): Promise
       }
     } else {
       logger.info("WhatsApp disabled via ANT_WHATSAPP_ENABLED=false");
+    }
+
+    // Initialize Telegram Adapter
+    const telegramEnabled =
+      (process.env.ANT_TELEGRAM_ENABLED || "true").trim().toLowerCase() !== "false";
+    const isTestEnv = process.env.NODE_ENV === "test";
+    const telegramConfigured = Boolean(currentConfig.telegram?.botToken?.trim());
+    if (telegramEnabled && currentConfig.telegram?.enabled) {
+      if (!isTestEnv && !telegramConfigured) {
+        logger.warn("Telegram enabled but botToken is missing");
+      } else {
+        try {
+          const telegram = isTestEnv
+            ? new TestTelegramAdapter({ cfg: currentConfig, logger })
+            : new TelegramAdapter({ cfg: currentConfig, logger });
+          await telegram.start();
+          router.registerAdapter(telegram);
+          logger.info("Telegram adapter registered");
+        } catch (err) {
+          logger.error(
+            { error: err instanceof Error ? err.message : String(err) },
+            "Failed to start Telegram adapter"
+          );
+        }
+      }
+    } else if (!telegramEnabled) {
+      logger.info("Telegram disabled via ANT_TELEGRAM_ENABLED=false");
     }
 
     const sessionManager = new SessionManager({
@@ -454,7 +481,7 @@ export async function start(cfg: AntConfig, options: StartOptions = {}): Promise
           for (const attachment of attachments) {
             await router.sendToSession(message.context.sessionKey, attachment.caption ?? "", {
               media: {
-                type: "file",
+                type: attachment.mediaType ?? "file",
                 data: attachment.path,
                 filename: path.basename(attachment.path),
               },
