@@ -1,3 +1,4 @@
+#!/usr/bin/env node
 /**
  * ANT CLI - Main CLI Application
  *
@@ -5,6 +6,8 @@
  * It provides a discoverable, user-friendly interface to the ANT agent system.
  */
 
+import "dotenv/config";
+import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -84,6 +87,8 @@ program
 program
   .command("restart")
   .description("Restart the agent")
+  .option("--tui", "Show a live TUI with agent status")
+  .option("-d, --detached", "Run in background")
   .action(async (options, cmd) => {
     const cfg = await loadConfig(cmd.optsWithGlobals().config);
     await handleError(() => restart(cfg, options));
@@ -530,7 +535,9 @@ function isMainModule(): boolean {
   const entry = process.argv[1];
   if (!entry) return false;
   try {
-    return path.resolve(entry) === fileURLToPath(import.meta.url);
+    const entryPath = fs.realpathSync(entry);
+    const modulePath = fs.realpathSync(fileURLToPath(import.meta.url));
+    return entryPath === modulePath;
   } catch {
     return false;
   }

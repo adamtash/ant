@@ -1,20 +1,18 @@
 {
   "workspaceDir": "~",
   "providers": {
-    "default": "copilot",
+    "default": "codex",
     "items": {
-     
       "codex": {
         "type": "cli",
         "cliProvider": "codex",
         "model": "gpt-5.2-codex",
         "args": [
           "exec",
-          "--output-last-message",
-          "{output}",
-          "--color",
-          "never",
           "--skip-git-repo-check",
+          "--add-dir",
+          "~/",
+          "--full-auto",
           "-"
         ]
       },
@@ -77,10 +75,10 @@
     }
   },
   "routing": {
-    "chat": "copilot",
-    "tools": "copilot",
+    "chat": "codex",
+    "tools": "codex",
     "embeddings": "lmstudio",
-    "parentForCli": "copilot"
+    "parentForCli": "codex"
   },
   "ui": {
     "enabled": true,
@@ -89,6 +87,12 @@
     "autoOpen": true,
     "openUrl": "http://127.0.0.1:5117",
     "staticDir": "/Users/a/Projects/ant-cli/ui/dist"
+  },
+  "telegram": {
+    "enabled": true,
+    "botToken": "",
+    "mode": "polling",
+    "dmPolicy": "pairing"
   },
   "whatsapp": {
     "sessionDir": "./.ant/whatsapp",
@@ -128,15 +132,28 @@
     "providers": {
       "codex": {
         "command": "codex",
-        "args": []
+        "args": [
+          "--skip-git-repo-check",
+          "--add-dir",
+          "~/",
+          "--full-auto"
+        ]
       },
       "copilot": {
         "command": "copilot",
-        "args": []
+        "args": [
+          "--yolo",
+          "--no-ask-user",
+          "--silent",
+          "--no-color",
+          "--allow-all-tools"
+        ]
       },
       "claude": {
         "command": "claude",
-        "args": []
+        "args": [
+          "--no-color"
+        ]
       },
       "kimi": {
         "command": "kimi",

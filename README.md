@@ -194,6 +194,9 @@ docker build -t ant-watchdog:latest -f Dockerfile.watchdog .
 | `ant schedule run <jobId>` | Manually trigger a job |
 | `ant schedule remove <jobId>` | Delete a scheduled job |
 
+Built-in drone flights are registered automatically at runtime start. See `DRONE_FLIGHTS.md`
+for the hourly X AI+Tech digest and Safari cookie helper requirements.
+
 ### Memory
 
 | Command | Description |

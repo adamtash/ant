@@ -4,6 +4,7 @@ import {
   FLIGHT_LIGHT_CHECK,
   FLIGHT_HOURLY_MAINTENANCE,
   FLIGHT_WEEKLY_REVIEW,
+  FLIGHT_X_AI_TECH_DIGEST,
   getDroneFlightPrompt,
   getAllDroneFlights,
   getEnabledDroneFlights,
@@ -18,6 +19,7 @@ describe("drone-flights", () => {
     expect(getDroneFlightPrompt("light-check")).toContain("light health check");
     expect(getDroneFlightPrompt("hourly-maintenance")).toContain("hourly deep maintenance");
     expect(getDroneFlightPrompt("weekly-review")).toContain("weekly comprehensive review");
+    expect(getDroneFlightPrompt("x-ai-tech-digest")).toContain("X AI + Tech digest");
   });
 
   it("getDroneFlightPrompt() throws for unknown flight types", () => {
@@ -30,6 +32,7 @@ describe("drone-flights", () => {
       FLIGHT_LIGHT_CHECK.id,
       FLIGHT_HOURLY_MAINTENANCE.id,
       FLIGHT_WEEKLY_REVIEW.id,
+      FLIGHT_X_AI_TECH_DIGEST.id,
     ]);
 
     const enabled = getEnabledDroneFlights();
@@ -54,4 +57,3 @@ describe("drone-flights", () => {
     expect(getFlightIdFromSession("cli:test")).toBeNull();
   });
 });
-

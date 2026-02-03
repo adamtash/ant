@@ -3,8 +3,10 @@
  */
 
 import { spawn } from "node:child_process";
+import fsSync from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { loadConfig, saveConfig, type AntConfig } from "../../../config.js";
 import { OutputFormatter } from "../../output-formatter.js";
 import { RuntimeError } from "../../error-handler.js";
@@ -15,6 +17,8 @@ import { collectToolMediaAttachments } from "../../../utils/tool-media.js";
 import { collectToolOutboundMessages } from "../../../utils/tool-outbound.js";
 import type { ReloadPlan } from "../../../config/reload-rules.js";
 import type { ConfigWatcher } from "../../../config/watcher.js";
+import type { Message } from "../../../agent/types.js";
+import type { SessionManager } from "../../../gateway/session-manager.js";
 
 export interface StartOptions {
   config?: string;
@@ -56,6 +60,20 @@ function deepMerge(base: Record<string, unknown>, patch: Record<string, unknown>
   return out;
 }
 
+function findUiDist(startDir: string): string | null {
+  let cursor = path.resolve(startDir);
+  while (true) {
+    const candidate = path.join(cursor, "ui", "dist", "index.html");
+    if (fsSync.existsSync(candidate)) {
+      return path.dirname(candidate);
+    }
+    const parent = path.dirname(cursor);
+    if (parent === cursor) break;
+    cursor = parent;
+  }
+  return null;
+}
+
 function parseConfigValue(raw: string): unknown {
   const trimmed = raw.trim();
   if (!trimmed) return "";
@@ -73,6 +91,46 @@ function parseConfigValue(raw: string): unknown {
   }
 
   return trimmed;
+}
+
+const DEFAULT_HISTORY_MESSAGE_LIMIT = 80;
+
+async function buildSessionHistory(params: {
+  sessionManager: SessionManager;
+  sessionKey: string;
+  currentContent?: string | null;
+  currentTimestamp?: number;
+  limit?: number;
+}): Promise<Message[]> {
+  const limit = params.limit ?? DEFAULT_HISTORY_MESSAGE_LIMIT;
+  const messages = await params.sessionManager.readMessages(params.sessionKey, limit);
+  const history = messages
+    .filter((message) => message.role === "user" || message.role === "assistant" || message.role === "system")
+    .map((message) => ({
+      role: message.role,
+      content: message.content,
+      toolCallId: message.toolCallId,
+      name: message.name,
+      timestamp: message.timestamp,
+      metadata: message.metadata,
+    }));
+
+  if (history.length > 0 && params.currentContent) {
+    const last = history[history.length - 1];
+    const timeDelta =
+      typeof params.currentTimestamp === "number" && typeof last.timestamp === "number"
+        ? Math.abs(params.currentTimestamp - last.timestamp)
+        : undefined;
+    const isDuplicateUser =
+      last.role === "user" &&
+      last.content.trim() === params.currentContent.trim() &&
+      (timeDelta === undefined || timeDelta <= 5000);
+    if (isDuplicateUser) {
+      history.pop();
+    }
+  }
+
+  return history;
 }
 
 function buildPatchFromDotPath(dotPath: string, value: unknown): Record<string, unknown> {
@@ -97,7 +155,7 @@ export async function start(cfg: AntConfig, options: StartOptions = {}): Promise
   const out = new OutputFormatter({ quiet: options.quiet });
   let currentConfig: AntConfig = cfg;
   const gatewayHost = cfg.gateway?.host ?? cfg.ui.host;
-  const gatewayPort = cfg.gateway?.port ?? cfg.ui.port;
+  const gatewayPort = cfg.ui.enabled ? cfg.ui.port : (cfg.gateway?.port ?? cfg.ui.port);
   const uiUrl = cfg.ui.openUrl || `http://${gatewayHost}:${gatewayPort}`;
 
   // Ensure directories exist
@@ -162,6 +220,31 @@ export async function start(cfg: AntConfig, options: StartOptions = {}): Promise
       cfg.resolved.logFilePath,
       cfg.resolved.logFileLevel
     );
+
+    if (currentConfig.ui.enabled) {
+      const resolvedUiDir = currentConfig.resolved.uiStaticDir;
+      const resolvedUiIndex = path.join(resolvedUiDir, "index.html");
+      if (!fsSync.existsSync(resolvedUiIndex)) {
+        const fallbackFromCwd = findUiDist(process.cwd());
+        const fallbackFromSource = findUiDist(path.dirname(fileURLToPath(import.meta.url)));
+        const fallback = fallbackFromCwd ?? fallbackFromSource;
+        if (fallback) {
+          logger.warn({ from: resolvedUiDir, to: fallback }, "UI static dir not found; using fallback");
+          currentConfig = {
+            ...currentConfig,
+            resolved: {
+              ...currentConfig.resolved,
+              uiStaticDir: fallback,
+            },
+          };
+        } else {
+          logger.warn(
+            { path: resolvedUiDir },
+            "UI static dir not found; web UI will return 404. Set ui.staticDir or workspaceDir."
+          );
+        }
+      }
+    }
 
     // Initialize Router
     const router = new MessageRouter({
@@ -459,11 +542,27 @@ export async function start(cfg: AntConfig, options: StartOptions = {}): Promise
           return null;
         }
 
+        let history: Message[] = [];
+        try {
+          history = await buildSessionHistory({
+            sessionManager,
+            sessionKey: message.context.sessionKey,
+            currentContent: message.content,
+            currentTimestamp: message.timestamp,
+          });
+        } catch (err) {
+          logger.debug(
+            { error: err instanceof Error ? err.message : String(err), sessionKey: message.context.sessionKey },
+            "Failed to load session history"
+          );
+        }
+
         const result = await agentEngine.execute({
           sessionKey: message.context.sessionKey,
           query: message.content,
           chatId: message.context.chatId,
           channel: message.channel,
+          history,
         });
 
         try {

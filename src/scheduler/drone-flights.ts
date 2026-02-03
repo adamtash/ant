@@ -9,6 +9,7 @@
  * - Light Check: Every 5 minutes (quick health check)
  * - Hourly Deep Maintenance: Every hour (detailed analysis & fixes)
  * - Weekly Deep Dive: Every Monday 00:00 (comprehensive review)
+ * - Hourly X AI+Tech Digest: Every hour (X/Twitter AI + tech scan)
  */
 
 import type { ScheduledJob, AgentAskTrigger, LogEventAction } from "./types.js";
@@ -17,7 +18,11 @@ import type { ScheduledJob, AgentAskTrigger, LogEventAction } from "./types.js";
 // Drone Flight Types
 // ============================================================================
 
-export type DroneFlightType = "light-check" | "hourly-maintenance" | "weekly-review";
+export type DroneFlightType =
+  | "light-check"
+  | "hourly-maintenance"
+  | "weekly-review"
+  | "x-ai-tech-digest";
 
 export interface DroneFlightDefinition {
   id: string;
@@ -92,6 +97,20 @@ export const FLIGHT_WEEKLY_REVIEW: DroneFlightDefinition = {
   schedule: "0 0 * * 1", // Every Monday at 00:00
   enabled: true,
   timeout: 3600000, // 60 minutes
+  maxRetries: 1,
+};
+
+/**
+ * Hourly X AI+Tech Digest - Top AI + tech developments from X
+ */
+export const FLIGHT_X_AI_TECH_DIGEST: DroneFlightDefinition = {
+  id: "flight:x-ai-tech-digest",
+  name: "Hourly X AI+Tech Digest",
+  description: "Top AI + tech developments from X (Safari cookies)",
+  flightType: "x-ai-tech-digest",
+  schedule: "0 * * * *", // Every hour at :00
+  enabled: true,
+  timeout: 900000, // 15 minutes
   maxRetries: 1,
 };
 
@@ -171,6 +190,47 @@ Use format:
 - Impact Score: X/10
 - Next Week Focus: [priorities]`;
 
+    case "x-ai-tech-digest":
+      return `Execute hourly X AI + Tech digest:
+
+1) Get X cookies from Safari:
+   - Prefer env BIRD_AUTH_TOKEN/BIRD_CT0 if already set.
+   - Otherwise run:
+     node ./scripts/x-safari-cookies.js --format args --domain x.com,twitter.com
+   - If auth_token/ct0 are missing, output exactly: AUTH FAILURE and stop.
+
+2) Fetch sources (append cookie args to each command):
+   - bird news --ai-only -n 80 --json --plain <COOKIE_ARGS>
+   - bird news -n 80 --json --plain <COOKIE_ARGS>
+   - bird search "(AI OR artificial intelligence OR LLM OR model OR openai OR anthropic OR deepmind OR xAI OR nvidia OR amd OR microsoft OR apple OR amazon OR meta OR cybersecurity OR chip OR datacenter OR startup OR funding OR regulation) lang:en -filter:replies -filter:retweets" -n 80 --json --plain <COOKIE_ARGS>
+
+3) Dedupe by tweet id and external URL; keep only last 24 hours.
+
+4) Produce 6–10 items ranked by impact + recency.
+   Each item must include:
+   - Title (short)
+   - 1–2 sentence summary
+   - Tweet URL
+   - External link (if present)
+
+5) End with "What to watch next" (3 bullets).
+
+6) Write the report to:
+   ~/.ant/reports/x-ai-tech-YYYY-MM-DD-HH.md
+   and print the same report to stdout.
+
+7) Send the report to WhatsApp and Telegram (if configured):
+   - Read env vars via exec:
+     * ANT_X_DIGEST_WHATSAPP_TO (WhatsApp JID or full session key)
+     * ANT_X_DIGEST_TELEGRAM_TO (full Telegram session key recommended)
+   - If ANT_X_DIGEST_WHATSAPP_TO is non-empty, use message_send:
+     { "to": "<value>", "message": "<full report>" }
+   - If ANT_X_DIGEST_TELEGRAM_TO is non-empty, use message_send:
+     { "to": "<value>", "message": "<full report>" }
+   - For Telegram, prefer a full session key like:
+     "telegram:dm:<chatId>" or "telegram:group:<chatId>".
+     If missing or invalid, skip Telegram sending.`;
+
     default:
       throw new Error(`Unknown flight type: ${flightType}`);
   }
@@ -184,7 +244,12 @@ Use format:
  * Get all available drone flights
  */
 export function getAllDroneFlights(): DroneFlightDefinition[] {
-  return [FLIGHT_LIGHT_CHECK, FLIGHT_HOURLY_MAINTENANCE, FLIGHT_WEEKLY_REVIEW];
+  return [
+    FLIGHT_LIGHT_CHECK,
+    FLIGHT_HOURLY_MAINTENANCE,
+    FLIGHT_WEEKLY_REVIEW,
+    FLIGHT_X_AI_TECH_DIGEST,
+  ];
 }
 
 /**

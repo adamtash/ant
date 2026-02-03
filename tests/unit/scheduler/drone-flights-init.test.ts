@@ -31,8 +31,8 @@ describe("initializeDroneFlights", () => {
 
     const count = await initializeDroneFlights(scheduler as any, logger as any);
 
-    expect(count).toBe(3);
-    expect(scheduler.addJob).toHaveBeenCalledTimes(3);
+    expect(count).toBe(4);
+    expect(scheduler.addJob).toHaveBeenCalledTimes(4);
     for (const call of scheduler.addJob.mock.calls) {
       expect(call[0]).toEqual(expect.objectContaining({ emitEvent: false }));
     }
@@ -50,7 +50,7 @@ describe("initializeDroneFlights", () => {
 
     const count = await initializeDroneFlights(scheduler as any, logger as any, { emitEvents: true });
 
-    expect(count).toBe(3);
+    expect(count).toBe(4);
     expect(scheduler.updateJob).toHaveBeenCalledWith(
       "flight:light-check",
       expect.objectContaining({ enabled: true })
@@ -72,8 +72,7 @@ describe("initializeDroneFlights", () => {
 
     const count = await initializeDroneFlights(scheduler as any, logger as any);
 
-    expect(count).toBe(2);
+    expect(count).toBe(3);
     expect(logger.warn).toHaveBeenCalledWith(expect.any(Object), expect.stringContaining("Failed to register"));
   });
 });
-

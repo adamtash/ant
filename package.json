@@ -13,6 +13,8 @@
     "dev:all": "bash -lc 'pkill -f \"node.*ant-cli\" || true && rm -f ~/.ant/ant.pid' && npm run build && npm run ui:build && bash -lc 'npm run dev -- start -c ant.config.json & npm run ui:dev'",
     "kill": "bash -lc 'if [ -f ~/.ant/ant.pid ]; then kill -9 \"$(cat ~/.ant/ant.pid)\"; rm -f ~/.ant/ant.pid; fi'",
     "build": "tsc -p tsconfig.json",
+    "postbuild": "node scripts/add-shebang.js",
+    "prepublishOnly": "npm run build",
     "lint": "eslint src --ext .ts",
     "typecheck": "tsc --noEmit",
     "cli": "tsx src/cli.ts",

@@ -5,7 +5,7 @@ import path from "node:path";
 import { z } from "zod";
 import { readProvidersDiscoveredOverlay } from "./config/provider-writer.js";
 
-const DEFAULT_CONFIG_PATH = "ant.config.json";
+const DEFAULT_CONFIG_PATH = path.join(os.homedir(), ".ant", "ant.config.json");
 
 const ProviderItemSchema = z
   .object({

@@ -148,10 +148,11 @@
 - **Concept**: "Drone Flights" are worker bees performing routine maintenance at specific times
 - **Implementation**: `src/scheduler/drone-flights.ts` with node-cron integration
 - **Documentation**: See [DRONE_FLIGHTS.md](DRONE_FLIGHTS.md) for detailed reference
-- **Three Flight Types**:
+- **Four Flight Types**:
   - **Light Check** (every 5 min): Quick health checks, error monitoring
   - **Hourly Deep Maintenance** (every hour): Log analysis, auto-fix known issues
   - **Weekly Deep Dive** (every Monday 00:00): Comprehensive review, trend analysis
+  - **Hourly X AI+Tech Digest** (every hour): Top AI + tech developments from X (Safari cookies via `scripts/x-safari-cookies.js`, optional WhatsApp/Telegram delivery via `ANT_X_DIGEST_*`)
 - **Session keys**: `drone-flight:<flightId>` (separate from main agent)
 - **Auto-initialization**: Flights register with scheduler on runtime start
 - **Customizable**: Edit cron expressions and timeouts in `src/scheduler/drone-flights.ts`
@@ -174,7 +175,7 @@
   - Task assignment API via `/api/main-agent/tasks`
   - Startup health checks with WhatsApp reporting
 - **Drone Flights**: Scheduled maintenance tasks (cron jobs)
-  - Light Check, Hourly Deep Maintenance, Weekly Deep Dive
+  - Light Check, Hourly Deep Maintenance, Weekly Deep Dive, Hourly X AI+Tech Digest
   - Auto-initialization on runtime start
   - Integrated with scheduler system
 - Supervisor: Process supervisor for graceful restarts (exit code 42)
@@ -188,7 +189,7 @@
   - Implementation: `src/agent/main-agent.ts`
   - API endpoints: `/api/main-agent/tasks`
 - **Drone Flights**: Scheduled maintenance tasks (cron job based)
-  - Light Check, Hourly Deep Maintenance, Weekly Deep Dive
+  - Light Check, Hourly Deep Maintenance, Weekly Deep Dive, Hourly X AI+Tech Digest
   - Auto-initialization on runtime start
   - Integrated with scheduler system
   - Implementation: `src/scheduler/drone-flights.ts` and `src/scheduler/drone-flights-init.ts`

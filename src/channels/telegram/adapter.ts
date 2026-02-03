@@ -381,7 +381,13 @@ export class TelegramAdapter extends BaseChannelAdapter {
     } catch {
       // ignore
     }
-    await this.bot.start();
+    void this.bot
+      .start()
+      .catch((err) => {
+        const message = err instanceof Error ? err.message : String(err);
+        this.lastError = message;
+        this.logger.error({ error: message }, "Telegram polling start failed");
+      });
   }
 
   private async startWebhookMode(): Promise<void> {

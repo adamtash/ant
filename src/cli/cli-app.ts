@@ -73,9 +73,11 @@ export function createProgram(): Command {
   program
     .command("restart")
     .description("Restart the agent")
+    .option("--tui", "Show TUI dashboard")
+    .option("--detached", "Run in background")
     .action(withErrorHandling(async (_options, cmd) => {
       const cfg = await loadConfig(cmd.parent?.opts().config);
-      await restart(cfg, cmd.parent?.opts());
+      await restart(cfg, { ..._options, ...cmd.parent?.opts() });
     }));
 
   program
