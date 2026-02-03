@@ -2,7 +2,14 @@
 
 This is a major architectural enhancement spanning 9 workstreams that can be developed in parallel. The goal is to make the ant-cli system fully autonomous, observable, self-healing, and production-ready with intelligent provider routing and unified memory management.
 
-**TL;DR**: Implement tiered provider routing with automatic failover and WhatsApp notifications, add real-time task observability to UI, create prioritized memory categorization, enhance Main Agent (Queen Ant) to autonomously detect/delegate/fix issues, add hot-reload configuration, fix LM Studio tool call parsing, **auto-discover free AI API providers as backups**, **add a lightweight watchdog process**, and **make the system production-ready with Docker support**. Each workstream maps to a subagent that can execute independently.
+**TL;DR**: Implement tiered provider routing with automatic failover and WhatsApp notifications, add real-time task observability to UI, create prioritized memory categorization, enhance Main Agent (Queen Ant) to autonomously detect/delegate/fix issues, add hot-reload configuration, fix LM Studio tool call parsing, **auto-discover free AI API providers as backups** (safely), **add a lightweight watchdog process**, and **make the system production-ready with Docker support**. Each workstream maps to a subagent that can execute independently.
+
+**Plan Notes (Risk & Safety Improvements)**
+- Avoid writing discovered providers directly into `ant.config.json`; use a separate `providers.discovered.json` overlay and merge at runtime.
+- Add provider capability filtering (tools, streaming, JSON mode) and circuit breaker states to prevent thrashing.
+- Gate auto-download and auto-restart actions behind explicit config flags (default off) to avoid surprising behavior.
+- Prefer strict tool-call parsing with a safe retry prompt before attempting brittle XML recovery.
+- Keep `/health` liveness minimal (no provider checks) and `/ready` for dependency readiness.
 
 ---
 
@@ -35,12 +42,19 @@ This is a major architectural enhancement spanning 9 workstreams that can be dev
      - Diagnose why primary provider failed
      - Attempt auto-fix (e.g., restart LM Studio, clear cache)
      - Report findings to memory
+  - Add **circuit breaker** states (closed/half-open/open) with cooldowns
+  - Add **provider capability filtering** (tools, streaming, JSON mode) so fallback only picks compatible providers
+  - Add per-task **retry budget** to avoid long failover chains
 
 4. **Add WhatsApp notification on failover** in `src/agent/engine.ts`:
    - Hook into `callProviderWithFallback()` to emit failover events
    - Send formatted WhatsApp message: "⚠️ Provider {primary} failed ({reason}). Switched to {fallback}. Investigation started."
 
 5. **Implement tier escalation** - If fast tier fails, auto-promote to quality tier
+
+**Additions**:
+- Track provider health score (success rate + latency) and use it for ordering within a tier
+- Expose provider capability and health summary via API for UI display
 
 **Verification**: Test with intentionally broken provider, verify WhatsApp notification received, check investigation subagent spawned.
 
@@ -118,11 +132,13 @@ This is a major architectural enhancement spanning 9 workstreams that can be dev
      - `/user prefers|always|never/i` → critical
      - `/error|exception|failed/i` → diagnostic
      - `/fixed|solved|resolved/i` → important
+  - Add manual override syntax to `/memory` to force category/priority and skip auto-classification
 
 4. **Add memory pruning** in `src/memory/pruner.ts`:
    - `prune(targetSizeBytes, categories)` - Removes lowest priority first
    - Preserve critical/important, prune ephemeral/diagnostic first
    - Apply decay: older + low-access = lower effective priority
+  - Use soft-delete (mark pruned first) to allow rollback
 
 5. **Enhance `/memory` command** to support categories:
    - `/memory important: API keys are in ~/.secrets`
@@ -203,6 +219,7 @@ This is a major architectural enhancement spanning 9 workstreams that can be dev
    - Exit with code 42 for restart request
    - On boot: detect restart (check `.ant/restart-pending`)
    - Resume pending tasks from checkpoint
+  - Add restart backoff to avoid restart loops
 
 5. **Add config API enhancements**:
    - `POST /api/config` with `{ changes, dryRun? }` → returns required actions
@@ -231,9 +248,10 @@ This is a major architectural enhancement spanning 9 workstreams that can be dev
    - This is likely a `max_tokens` issue or model context limit
 
 2. **Add robust tool call parser** in new file `src/agent/tool-call-parser.ts`:
-   - Handle incomplete XML gracefully
-   - Attempt recovery: complete partial tags, extract what's parseable
-   - Log warning but don't fail silently
+  - Prefer strict JSON parsing first
+  - On parse failure, re-ask the model to emit tool calls in the strict schema
+  - Only attempt partial XML recovery as a last resort
+  - Log warning but don't fail silently
 
 3. **Add model-specific handling** for LM Studio models:
    - Some models use XML-style tool calls instead of OpenAI JSON
@@ -280,8 +298,8 @@ This is a major architectural enhancement spanning 9 workstreams that can be dev
      - Query available models from local providers
      - For local models, always prefer **fast/small models** (e.g., `llama-3.2-1b`, `qwen2.5-0.5b`, `phi-3-mini`, `gemma-2b`)
      - Auto-download recommended fast models if none available
-   - Store discovered providers in memory (important category)
-   - Update `ant.config.json` with new providers dynamically
+  - Store discovered providers in memory (important category)
+  - Write results to `.ant/providers.discovered.json` (overlay) instead of editing `ant.config.json`
 
 2. **Create Local LLM Manager** in `src/agent/duties/local-llm-manager.ts`:
    - Detect local LLM runtimes (LM Studio, Ollama)
@@ -293,8 +311,8 @@ This is a major architectural enhancement spanning 9 workstreams that can be dev
        lmstudio: ['lmstudio-community/Llama-3.2-1B-Instruct-GGUF', 'Qwen/Qwen2.5-0.5B-Instruct-GGUF']
      };
      ```
-   - Auto-pull missing fast models: `ollama pull llama3.2:1b`
-   - Load model into LM Studio if needed (via CLI or API)
+  - Auto-pull missing fast models: `ollama pull llama3.2:1b` (guarded by config flag)
+  - Load model into LM Studio if needed (guarded by config flag)
    - Health check local endpoints: `http://localhost:11434` (Ollama), `http://localhost:1234` (LM Studio)
 
 3. **Create Provider Health Monitor** in `src/agent/duties/provider-health.ts`:
@@ -310,7 +328,7 @@ This is a major architectural enhancement spanning 9 workstreams that can be dev
      // User-configured providers
      items: Record<string, ProviderConfig>,
      // Auto-discovered backup providers
-     discovered: Record<string, DiscoveredProviderConfig>,
+    discovered: Record<string, DiscoveredProviderConfig>,
      // Discovery settings
      discovery: {
        enabled: boolean,
@@ -323,7 +341,7 @@ This is a major architectural enhancement spanning 9 workstreams that can be dev
      local: {
        enabled: boolean,
        preferFastModels: true,  // Always use fast models for local backups
-       autoDownloadModels: boolean,  // Auto-pull recommended models
+      autoDownloadModels: boolean,  // Auto-pull recommended models (default false)
        ollama: {
          enabled: boolean,
          endpoint: string,  // default: http://localhost:11434
@@ -343,6 +361,7 @@ This is a major architectural enhancement spanning 9 workstreams that can be dev
    - `unregisterProvider(id)` - Remove failed provider
    - `getProvidersByReliability()` - Return sorted by success rate
    - Update fallback chain dynamically when providers added/removed
+  - Filter providers by capability and circuit breaker state
 
 6. **Create Provider Research Template** in `src/agent/templates/provider-research.ts`:
    ```typescript
@@ -374,6 +393,7 @@ This is a major architectural enhancement spanning 9 workstreams that can be dev
      5. Bootstrap recovery from minimal provider access
    - Add `survivalMode` flag to track degraded state
    - WhatsApp notification: "⚠️ All primary providers down. Running on backup: {provider}"
+  - Add a degraded-mode retry budget to avoid long recovery loops
 
 8. **Add Provider Priority Logic** in `src/routing/provider-priority.ts`:
    ```typescript
@@ -407,10 +427,10 @@ This is a major architectural enhancement spanning 9 workstreams that can be dev
    - Log all provider changes to AGENT_LOG.md
 
 10. **Create Provider Config Writer** in `src/config/provider-writer.ts`:
-    - Safely update `ant.config.json` with discovered providers
-    - Backup config before changes
-    - Validate provider config before writing
-    - Trigger hot-reload after config update
+  - Safely update `.ant/providers.discovered.json`
+  - Backup file before changes
+  - Validate provider config before writing
+  - Trigger hot-reload after config update
 
 11. **Implement Provider Verification** before adding:
     - Test API key/access (if required)
@@ -593,6 +613,10 @@ This is a major architectural enhancement spanning 9 workstreams that can be dev
     # Linux systemd service
     # /etc/systemd/system/ant-watchdog.service
     ```
+
+**Additions**:
+- Separate liveness (`/health`) from readiness (`/ready`) so the watchdog only depends on liveness
+- Add restart backoff if multiple crashes occur within a short window
 
 **Watchdog Guarantees**:
 - **Minimal footprint**: < 50KB of code, < 20MB RAM
@@ -808,7 +832,7 @@ This is a major architectural enhancement spanning 9 workstreams that can be dev
 6. **Create Production Health Checks** in `src/gateway/server.ts`:
    ```typescript
    // Kubernetes/Docker compatible health endpoints
-   app.get('/health', (req, res) => res.send('OK'));  // Liveness
+  app.get('/health', (req, res) => res.send('OK'));  // Liveness (no provider checks)
    
    app.get('/ready', async (req, res) => {  // Readiness
      const checks = {
@@ -1047,6 +1071,28 @@ Based on your ask for suggestions, here's tier 6:
 - **Batch**: Embeddings, summarization → Batch-optimized tier
 
 Implementation: Add intent classifier that uses simple heuristics + optional LLM quick-check to route appropriately.
+
+---
+
+## Additional Recommendations (Operational Safety)
+
+1. **Discovery Overlay (No Config Mutation)**
+  - Use `.ant/providers.discovered.json` as an overlay merged at runtime.
+  - User config remains authoritative; discovered providers are advisory by default.
+
+2. **Circuit Breaker + Capability Matrix**
+  - Track provider states and cooldowns to avoid repeated failovers.
+  - Only fallback to providers that support required capabilities (tools, JSON, streaming).
+
+3. **Guarded Auto-Actions**
+  - Auto-download models and auto-restart LM Studio should be explicit opt-in flags.
+  - Default behavior is observe + notify + suggest.
+
+4. **Safer Tool Call Recovery**
+  - Prefer strict re-ask before partial XML recovery to prevent unintended tool args.
+
+5. **Restart Backoff**
+  - Add backoff for repeated crash/restart cycles in supervisor/watchdog.
 
 ---
 
@@ -1320,3 +1366,40 @@ class FailoverError extends Error {
 | `package.json` | WS8, WS9 | Add watchdog script, Docker build scripts |
 | `src/cli.ts` | WS9 | Graceful shutdown handling, env var config |
 | `src/log.ts` | WS9 | Structured JSON logging for production |
+
+---
+
+## Refinements & Safety Layer (Added 2026-02-03)
+
+### 1. Safer Provider Discovery: "Shadow Mode"
+**Refinement for Workstream 7**
+Instead of immediately promoting a discovered provider to a live tier, implement a **Shadow Mode**.
+- **Mechanism**: When a new provider is found (or local LLM auto-downloaded), copy non-sensitive `background` tier traffic to it asynchronously.
+- **Validation**: Compare result format (JSON validity, tool calls) against primary provider.
+- **Promotion**: Promote to active fallback only after N successful shadow calls.
+- **Why**: Prevents "compatible" APIs with broken JSON output from crashing live user sessions.
+
+### 2. Watchdog: "Zombie" Detection via Heartbeat
+**Refinement for Workstream 8**
+HTTP polling (`/health`) fails to detect event loop starvation (e.g., synchronous infinite loops) where the socket remains open but the process is frozen.
+- **Improvement**: Main Ant writes timestamp to `.ant/heartbeat` every 5 seconds.
+- **Check**: Watchdog checks file mtime; if `Date.now() - mtime > 15s`, restart.
+- **Why**: Detects frozen processes that are technically still listening on the port.
+
+### 3. Memory: "Summarize-to-Compress" Strategy
+**Refinement for Workstream 3**
+Instead of deleting low-priority "contextual" memories, use a Summarizer job.
+- **Logic**: Compress 50 old messages into a single "Narrative Memory" entry (e.g., "User spent 2 hours debugging Docker config").
+- **Why**: Preserves long-term semantic history without token bloat, preventing total amnesia.
+
+### 4. Safety: Subagent Tool Scoping (Blacklist)
+**Refinement for Workstream 4**
+Investigation subagents must not have unlimited power to "fix" issues by deleting files.
+- **Blacklist**: Initialize Investigation subagents with a **denylist** for dangerous tools: `fs_delete`, `fs_write` (except logs), `exec` (except harmless lookups).
+- **Escalation**: If a fix requires code changes, the subagent must propose the fix (write to file) and request user confirmation or a specialized `Repair` subagent.
+
+### 5. Configuration: Atomic Generation Binding
+**Refinement for Workstream 5**
+Hot-reloading config during a long task can cause undefined behavior.
+- **Fix**: Capture a `configVersion` snapshot at the start of every Task/Session.
+- **Logic**: Pass this snapshot to the tool execution loop. Hot-reloaded changes apply only to *new* tasks.
