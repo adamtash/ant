@@ -216,6 +216,7 @@ export class AgentEngine {
       // 2. Prepare prompt context (bootstrap + memory)
       const bootstrapFiles = await loadBootstrapFiles({
         workspaceDir: this.workspaceDir,
+        stateDir: this.stateDir,
         isSubagent: input.isSubagent,
       });
 
@@ -879,6 +880,7 @@ export class AgentEngine {
     // Load bootstrap files
     const bootstrapFiles = await loadBootstrapFiles({
       workspaceDir: this.workspaceDir,
+      stateDir: this.stateDir,
       isSubagent: input.isSubagent,
     });
 
@@ -1732,6 +1734,7 @@ export async function createAgentEngine(params: {
     }>;
     defaultProvider: string;
     fallbackChain?: string[];
+    allowCliToolCalls?: boolean;
     routing?: {
       chat?: string;
       tools?: string;

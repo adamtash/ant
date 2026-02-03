@@ -185,6 +185,7 @@ async function startInProcessHarness(
       defaultProvider: cfg.resolved.providers.default,
       routing: cfg.resolved.routing,
       fallbackChain: cfg.resolved.providers.fallbackChain,
+      allowCliToolCalls: cfg.cliTools.allowToolCalls,
     },
     logger,
     workspaceDir: cfg.resolved.workspaceDir,

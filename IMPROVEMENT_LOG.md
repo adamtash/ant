@@ -14,3 +14,4 @@
 
 ## Ideas
 - [2026-02-03 14:26:36] Log rotation still needed; ant.log now ~73MB. Consider implementing rotation/retention policy.
+- [2026-02-03 15:38:55] Light-check error counts scan full ant.log; switch to time-windowed or tail-based counts to avoid false critical alerts.

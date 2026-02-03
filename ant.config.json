@@ -3,13 +3,7 @@
   "providers": {
     "default": "copilot",
     "items": {
-      "lmstudio": {
-        "type": "openai",
-        "baseUrl": "http://localhost:1234/v1",
-        "apiKey": "",
-        "model": "zai-org/glm-4.7-flash",
-        "embeddingsModel": "text-embedding-nomic-embed-text-v1.5"
-      },
+     
       "codex": {
         "type": "cli",
         "cliProvider": "codex",
@@ -49,9 +43,38 @@
     },
     "fallbackChain": [
       "copilot",
-      "kimi",
-      "lmstudio"
-    ]
+      "kimi"
+    ],
+    "discovery": {
+      "enabled": true,
+      "researchIntervalHours": 24,
+      "healthCheckIntervalMinutes": 15,
+      "minBackupProviders": 2,
+      "trustSources": []
+    },
+    "local": {
+      "enabled": true,
+      "preferFastModels": false,
+      "autoDownloadModels": false,
+      "ollama": {
+        "enabled": false,
+        "endpoint": "http://localhost:11434",
+        "fastModels": [
+          "nvidia/nemotron-3-nano",
+          "qwen2.5:0.5b",
+          "phi3:mini",
+          "gemma2:2b"
+        ]
+      },
+      "lmstudio": {
+        "enabled": false,
+        "endpoint": "http://localhost:1234/v1",
+        "fastModels": [
+          "nvidia/nemotron-3-nano",
+          "zai-org/glm-4.7-flash"
+        ]
+      }
+    }
   },
   "routing": {
     "chat": "copilot",
@@ -100,6 +123,7 @@
   },
   "cliTools": {
     "enabled": true,
+    "allowToolCalls": true,
     "timeoutMs": 1200000,
     "providers": {
       "codex": {
@@ -141,7 +165,7 @@
     "host": "127.0.0.1"
   },
   "logging": {
-    "level": "debug",
+    "level": "warn",
     "fileLevel": "trace",
     "filePath": "./.ant/ant.log"
   },

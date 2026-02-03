@@ -226,6 +226,7 @@ export async function start(cfg: AntConfig, options: StartOptions = {}): Promise
         defaultProvider: cfg.resolved.providers.default,
         routing: cfg.resolved.routing,
         fallbackChain: cfg.resolved.providers.fallbackChain,
+        allowCliToolCalls: cfg.cliTools.allowToolCalls,
       },
 
       logger,

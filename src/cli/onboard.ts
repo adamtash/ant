@@ -19,7 +19,7 @@ interface OnboardConfig {
   workspaceDir: string;
   provider: {
     type: "openai" | "cli";
-    cliProvider?: "codex" | "copilot" | "claude";
+    cliProvider?: "codex" | "copilot" | "claude" | "kimi";
     baseUrl?: string;
     model: string;
   };

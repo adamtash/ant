@@ -267,6 +267,7 @@ export interface ProviderManagerConfig {
   providers: Record<string, ProviderConfig>;
   defaultProvider: string;
   fallbackChain?: string[];
+  allowCliToolCalls?: boolean;
   routing?: {
     chat?: string;
     tools?: string;
@@ -425,7 +426,8 @@ export class ProviderManager {
   }
 
   private isToolCapable(provider: LLMProvider): boolean {
-    return provider.type !== "cli";
+    if (provider.type !== "cli") return true;
+    return Boolean(this.config.allowCliToolCalls);
   }
 
   /**

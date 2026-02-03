@@ -264,7 +264,7 @@ const MainAgentSchema = z.object({
   enabled: z.boolean().default(true),
   intervalMs: z.number().int().positive().default(60000),
   dutiesFile: z.string().default("AGENT_DUTIES.md"),
-  logFile: z.string().default("AGENT_LOG.md"),
+  logFile: z.string().default(".ant/AGENT_LOG.md"),
 });
 
 const SubagentsSchema = z.object({
@@ -371,6 +371,7 @@ const KimiProviderSchema = z.object({
 
 const CliToolsSchema = z.object({
   enabled: z.boolean().default(true),
+  allowToolCalls: z.boolean().default(false),
   timeoutMs: z.number().int().positive().default(120_000),
   mcp: z
     .object({

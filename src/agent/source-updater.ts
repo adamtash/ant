@@ -76,6 +76,8 @@ export class SourceUpdater {
       "SKILL_REGISTRY.md",
       "AGENT_DUTIES.md",
       "AGENT_LOG.md",
+      ".ant",
+      ".ant/AGENT_LOG.md",
     ];
 
     // Patterns that should never be modified

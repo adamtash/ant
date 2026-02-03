@@ -69,7 +69,9 @@ export class ProviderDiscoveryService {
   }
 
   private async writeAgentLog(note: string): Promise<void> {
-    const filePath = path.join(this.cfg.resolved.workspaceDir, "AGENT_LOG.md");
+    const filePath = path.isAbsolute(this.cfg.mainAgent.logFile)
+      ? this.cfg.mainAgent.logFile
+      : path.join(this.cfg.resolved.workspaceDir, this.cfg.mainAgent.logFile);
     const date = new Date().toISOString();
     await appendLine(filePath, `- [${date}] ${note}`);
   }
@@ -196,4 +198,3 @@ export class ProviderDiscoveryService {
     return { ok: true, overlay: checked.overlay, removedIds: checked.removedIds };
   }
 }
-

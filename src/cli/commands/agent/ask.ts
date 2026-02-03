@@ -132,6 +132,7 @@ async function askDirect(cfg: AntConfig, prompt: string, options: AskOptions): P
       defaultProvider: cfg.resolved.providers.default,
       routing: cfg.resolved.routing,
       fallbackChain: cfg.resolved.providers.fallbackChain,
+      allowCliToolCalls: cfg.cliTools.allowToolCalls,
     };
 
     const sessionManager = new SessionManager({

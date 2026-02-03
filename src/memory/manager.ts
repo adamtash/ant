@@ -61,6 +61,9 @@ export class MemoryManager {
   private sessionUpdateTimer?: NodeJS.Timeout;
   private progressCallback?: MemoryProgressCallback;
   private started = false;
+  private embeddingsAvailable = true;
+  private lastEmbeddingsCheckAt = 0;
+  private nextEmbeddingsCheckAt = 0;
 
   // Session delta tracking for incremental indexing
   private sessionDeltas = new Map<
@@ -122,7 +125,7 @@ export class MemoryManager {
     // The createEmbeddingProvider function is async and requires different handling
     return new SimpleEmbeddingProvider(
       config.local?.baseUrl ?? "http://localhost:1234/v1",
-      config.local?.model ?? "nomic-embed-text"
+      config.local?.model ?? this.cfg.memory.embeddingsModel ?? "nomic-embed-text"
     );
   }
 
@@ -136,6 +139,14 @@ export class MemoryManager {
     }
 
     try {
+      const embeddingsOk = await this.ensureEmbeddingsAvailable("startup");
+      if (!embeddingsOk) {
+        this.embeddingsAvailable = false;
+        console.warn(
+          "Embeddings endpoint unavailable. Memory indexing will skip embeddings until it recovers."
+        );
+      }
+
       // Start file watcher if enabled
       if (this.cfg.memory.sync.watch) {
         this.fileWatcher = createMemoryFileWatcher(
@@ -492,9 +503,10 @@ export class MemoryManager {
     try {
       const content = await fs.readFile(filePath, "utf-8");
       const fileHash = crypto.createHash("sha256").update(content).digest("hex");
+      const relPath = path.relative(this.cfg.resolved.workspaceDir, filePath);
 
       // Check if file needs re-indexing
-      const existing = this.store.getFile(path.basename(filePath));
+      const existing = this.store.getFile(relPath);
       if (existing?.hash === fileHash) {
         return; // Already indexed
       }
@@ -511,44 +523,88 @@ export class MemoryManager {
 
       const chunks = createMemoryChunks(
         textChunks,
-        path.relative(this.cfg.resolved.workspaceDir, filePath),
+        relPath,
         source,
         fileHash
       );
 
-      // Generate embeddings
-      const embeddings = await this.embedder.embed(
-        chunks.map((c) => c.text)
+      if (chunks.length === 0) return;
+
+      // Update file metadata first (required for FK on chunks.path)
+      this.store.upsertFile(
+        chunks[0]?.path ?? relPath,
+        source,
+        fileHash,
+        content.length,
+        content.split("\n").length
       );
 
-      // Store chunks and embeddings
-      this.store.storeChunks(chunks[0]?.path ?? "", chunks);
+      // Store chunks
+      this.store.storeChunks(chunks[0]?.path ?? relPath, chunks);
 
-      // Store embeddings
-      this.store.storeEmbeddings(
-        chunks.map((chunk, i) => ({
-          chunkId: chunk.id,
-          embedding: embeddings[i] ?? [],
-          model: this.embedder.getModel(),
-        }))
-      );
+      // Generate embeddings (best-effort)
+      try {
+        const ok = await this.ensureEmbeddingsAvailable("index");
+        if (ok) {
+          const embeddings = await this.embedder.embed(chunks.map((c) => c.text));
+          if (embeddings.length === chunks.length) {
+            const valid = chunks
+              .map((chunk, i) => ({
+                chunkId: chunk.id,
+                embedding: embeddings[i] ?? [],
+                model: this.embedder.getModel(),
+              }))
+              .filter((item) => Array.isArray(item.embedding) && item.embedding.length > 0);
+
+            if (valid.length > 0) {
+              this.store.storeEmbeddings(valid);
+            }
+          }
+        }
+      } catch (err) {
+        console.warn(`Embedding error for ${filePath}:`, err);
+        this.embeddingsAvailable = false;
+        this.nextEmbeddingsCheckAt = Date.now() + 60_000;
+      }
 
       // Index in FTS5 if available
       for (const chunk of chunks) {
         this.store.indexChunkFts(chunk);
       }
 
-      // Update file metadata
-      this.store.upsertFile(
-        chunks[0]?.path ?? "",
-        source,
-        fileHash,
-        content.length,
-        content.split("\n").length
-      );
     } catch (err) {
       console.warn(`Failed to index ${filePath}:`, err);
     }
+  }
+
+  private async ensureEmbeddingsAvailable(reason: "startup" | "index"): Promise<boolean> {
+    if (!this.cfg.memory.enabled) return false;
+    if (this.embeddingsAvailable && !(reason === "startup" && this.lastEmbeddingsCheckAt === 0)) {
+      return true;
+    }
+
+    const now = Date.now();
+    if (now < this.nextEmbeddingsCheckAt) return false;
+    this.lastEmbeddingsCheckAt = now;
+
+    try {
+      const provider = this.embedder as EmbeddingProvider & { health?: () => Promise<boolean> };
+      if (typeof provider.health === "function") {
+        const ok = await provider.health();
+        this.embeddingsAvailable = ok;
+      } else {
+        const test = await this.embedder.embed(["ping"]);
+        this.embeddingsAvailable = Array.isArray(test) && test.length === 1 && test[0]?.length > 0;
+      }
+    } catch {
+      this.embeddingsAvailable = false;
+    }
+
+    if (!this.embeddingsAvailable) {
+      this.nextEmbeddingsCheckAt = now + (reason === "startup" ? 30_000 : 60_000);
+    }
+
+    return this.embeddingsAvailable;
   }
 
   /**
@@ -648,6 +704,18 @@ class SimpleEmbeddingProvider implements IEmbeddingProvider {
     } catch (err) {
       console.warn("Embedding error:", err);
       return texts.map(() => []);
+    }
+  }
+
+  async health(): Promise<boolean> {
+    try {
+      const response = await fetch(`${this.baseUrl}/models`, {
+        method: "GET",
+        signal: AbortSignal.timeout(3000),
+      });
+      return response.ok;
+    } catch {
+      return false;
     }
   }
 

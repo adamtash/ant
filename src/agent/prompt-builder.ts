@@ -67,7 +67,7 @@ export function buildSystemPrompt(options: PromptBuilderOptions): string {
 
   // Tools documentation
   if (options.tools.length > 0) {
-    sections.push(buildToolsSection(options.tools));
+    sections.push(buildToolsSection(options.tools, options.runtimeInfo.providerType));
   }
 
   // Memory context
@@ -131,7 +131,7 @@ function buildRuntimeSection(runtimeInfo: RuntimeInfo): string {
 /**
  * Build tools documentation section
  */
-function buildToolsSection(tools: ToolDefinition[]): string {
+function buildToolsSection(tools: ToolDefinition[], providerType: "openai" | "cli"): string {
   const toolDocs = tools.map(tool => {
     const params = tool.function.parameters.properties
       ? Object.entries(tool.function.parameters.properties as Record<string, { type: string; description?: string }>)
@@ -151,9 +151,18 @@ ${params}
 **Required:** ${required}`;
   }).join("\n\n");
 
+  const callInstruction =
+    providerType === "cli"
+      ? [
+          "When you need a tool, respond ONLY with valid JSON (no markdown, no XML) in this exact shape:",
+          '{"toolCalls":[{"name":"tool_name","arguments":{}}]}',
+          "Choose tool_name from the available tools and include all required arguments.",
+        ].join("\n")
+      : "Call tools using the standard function calling format.";
+
   return `# Available Tools
 
-You can use the following tools to accomplish tasks. Call tools using the standard function calling format.
+You can use the following tools to accomplish tasks. ${callInstruction}
 
 ${toolDocs}`;
 }
@@ -236,6 +245,7 @@ You are running as a subagent (parallel task). Your output will be collected and
  */
 export async function loadBootstrapFiles(params: {
   workspaceDir: string;
+  stateDir?: string;
   isSubagent?: boolean;
 }): Promise<BootstrapFile[]> {
   const files: BootstrapFile[] = [];
@@ -254,8 +264,34 @@ export async function loadBootstrapFiles(params: {
     ? ["PROJECT.md", "SKILL_REGISTRY.md"]
     : fileNames;
 
+  const logCandidates = params.stateDir ? [path.join(params.stateDir, "AGENT_LOG.md")] : [];
+  const seen = new Set<string>();
+
   for (const fileName of filesToLoad) {
+    if (fileName === "AGENT_LOG.md" && logCandidates.length > 0) {
+      // Prefer stateDir log if present
+      for (const candidate of logCandidates) {
+        if (seen.has(candidate)) continue;
+        seen.add(candidate);
+        try {
+          const content = await fs.readFile(candidate, "utf-8");
+          if (content.trim()) {
+            files.push({
+              name: "AGENT_LOG.md",
+              path: candidate,
+              content: truncateContent(content, 4000),
+            });
+          }
+          break;
+        } catch {
+          // fall through to workspace log
+        }
+      }
+    }
+
     const filePath = path.join(params.workspaceDir, fileName);
+    if (seen.has(filePath)) continue;
+    seen.add(filePath);
     try {
       const content = await fs.readFile(filePath, "utf-8");
       if (content.trim()) {
