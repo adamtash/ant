@@ -10,6 +10,10 @@
  */
 
 import { spawn } from "node:child_process";
+import crypto from "node:crypto";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import type {
   LLMProvider,
   ProviderType,
@@ -124,6 +128,20 @@ function isTimeoutError(err: unknown): boolean {
   return hasTimeoutHint(cause) || hasTimeoutHint(reason);
 }
 
+function isTruthyEnv(name: string): boolean {
+  const value = (process.env[name] || "").trim().toLowerCase();
+  return value === "1" || value === "true" || value === "yes";
+}
+
+function shouldDisableProviderTools(): boolean {
+  // Explicit kill-switch
+  if (isTruthyEnv("ANT_DISABLE_PROVIDER_TOOLS")) return true;
+  // If we are blocking deletes in ANT's exec tool, also prevent the upstream CLI
+  // provider from executing tools/commands outside ANT's logging/guardrails.
+  if (isTruthyEnv("ANT_EXEC_BLOCK_DELETE")) return true;
+  return false;
+}
+
 type ErrorPattern = RegExp | string;
 const ERROR_PATTERNS = {
   rateLimit: [
@@ -228,7 +246,9 @@ export interface ProviderManagerConfig {
     chat?: string;
     tools?: string;
     embeddings?: string;
+    summary?: string;
     subagent?: string;
+    parentForCli?: string;
   };
   healthCheck?: {
     timeoutMs?: number;
@@ -319,7 +339,9 @@ export class ProviderManager {
   /**
    * Get provider for a specific action
    */
-  getProvider(action: "chat" | "tools" | "embeddings" | "subagent" = "chat"): LLMProvider {
+  getProvider(
+    action: "chat" | "tools" | "embeddings" | "summary" | "subagent" | "parentForCli" = "chat"
+  ): LLMProvider {
     const providerId = this.config.routing?.[action] || this.config.defaultProvider;
     const provider = this.providers.get(providerId);
 
@@ -348,14 +370,16 @@ export class ProviderManager {
   /**
    * Select best available provider based on health
    */
-  async selectBestProvider(): Promise<LLMProvider> {
+  async selectBestProvider(
+    action: "chat" | "tools" | "embeddings" | "summary" | "subagent" | "parentForCli" = "chat"
+  ): Promise<LLMProvider> {
     // Check providers in order: routing preference, then fallback chain
     const preferredOrder = [
-      this.config.routing?.chat || this.config.defaultProvider,
+      this.config.routing?.[action] || this.config.defaultProvider,
       ...(this.config.fallbackChain || []),
     ];
 
-    this.logger.debug({ preferredOrder }, "Selecting best provider");
+    this.logger.debug({ action, preferredOrder }, "Selecting best provider");
 
     for (const id of preferredOrder) {
       const provider = this.providers.get(id);
@@ -447,10 +471,17 @@ export class ProviderManager {
   }
 
   private async withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+    let timer: NodeJS.Timeout | undefined;
     const timeout = new Promise<never>((_, reject) => {
-      setTimeout(() => reject(new Error(message)), timeoutMs);
+      timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+      timer.unref?.();
     });
-    return Promise.race([promise, timeout]);
+    return Promise.race([
+      promise.finally(() => {
+        if (timer) clearTimeout(timer);
+      }),
+      timeout,
+    ]);
   }
 
   isProviderCoolingDown(providerId: string): boolean {
@@ -545,6 +576,7 @@ export class OpenAIProvider implements LLMProvider {
 
   async chat(messages: Message[], options?: ChatOptions): Promise<ChatResponse> {
     const url = `${this.baseUrl}/chat/completions`;
+    const signal = options?.timeoutMs && options.timeoutMs > 0 ? AbortSignal.timeout(options.timeoutMs) : undefined;
 
     const body: Record<string, unknown> = {
       model: this.model,
@@ -600,6 +632,7 @@ export class OpenAIProvider implements LLMProvider {
         "Authorization": `Bearer ${this.resolveApiKey()}`,
       },
       body: JSON.stringify(body),
+      ...(signal ? { signal } : {}),
     });
 
     if (!response.ok) {
@@ -713,6 +746,7 @@ export class OpenAIProvider implements LLMProvider {
         headers: {
           "Authorization": `Bearer ${this.resolveApiKey()}`,
         },
+        signal: AbortSignal.timeout(5000),
       });
       return response.ok;
     } catch {
@@ -772,6 +806,25 @@ interface CLIProviderOptions {
   timeoutMs?: number;
 }
 
+function sanitizeCliArgs(params: {
+  cliType: CLIProviderType;
+  args: string[];
+  logger: Logger;
+  providerId: string;
+}): string[] {
+  if (!shouldDisableProviderTools()) return params.args;
+
+  const filtered = params.args.filter((arg) => arg !== "--allow-all-tools");
+  if (filtered.length !== params.args.length) {
+    params.logger.warn(
+      { providerId: params.providerId, cliType: params.cliType },
+      "Removed --allow-all-tools from CLI provider args (provider tools disabled)"
+    );
+  }
+
+  return filtered;
+}
+
 /**
  * CLI-based LLM provider (Copilot, Claude, Codex)
  */
@@ -795,13 +848,22 @@ export class CLIProvider implements LLMProvider {
     this.name = `CLI (${options.cliType})`;
     this.logger = options.logger;
     this.command = options.command || options.cliType;
-    this.args = options.args || [];
+    this.args = sanitizeCliArgs({
+      cliType: options.cliType,
+      args: options.args || [],
+      logger: this.logger,
+      providerId: this.id,
+    });
     this.timeoutMs = options.timeoutMs || 1200000;
   }
 
   async chat(messages: Message[], options?: ChatOptions): Promise<ChatResponse> {
     // Build prompt from messages
     const prompt = this.buildPromptFromMessages(messages, options?.thinking?.level);
+    const timeoutMs =
+      typeof options?.timeoutMs === "number" && options.timeoutMs > 0
+        ? options.timeoutMs
+        : this.timeoutMs;
 
     // Log the CLI call details
     this.logger.info({
@@ -812,11 +874,11 @@ export class CLIProvider implements LLMProvider {
       args: this.args,
       promptPreview: prompt.slice(0, 200) + (prompt.length > 200 ? "..." : ""),
       promptLength: prompt.length,
-      timeoutMs: this.timeoutMs,
+      timeoutMs,
     }, "CLI provider chat call started");
 
     // Run CLI command
-    const result = await this.runCLI(prompt);
+    const result = await this.runCLI(prompt, timeoutMs);
 
     // Log detailed result information
     const logLevel = result.ok ? "info" : "error";
@@ -893,29 +955,53 @@ export class CLIProvider implements LLMProvider {
     return parts.join("\n\n");
   }
 
-  private async runCLI(prompt: string): Promise<{ ok: boolean; output: string; error?: string }> {
+  private async runCLI(
+    prompt: string,
+    timeoutMs: number
+  ): Promise<{ ok: boolean; output: string; error?: string }> {
     return new Promise((resolve) => {
       const args = [...this.args];
       let stdinPrompt: string | null = null;
+      let outputFilePath: string | null = null;
+
+      // Placeholder substitution
+      if (args.some((arg) => arg.includes("{output}"))) {
+        const fileName = `ant-cli-${this.cliType}-output-${Date.now()}-${crypto.randomUUID()}.txt`;
+        outputFilePath = path.join(os.tmpdir(), fileName);
+        for (let i = 0; i < args.length; i++) {
+          if (!args[i]) continue;
+          args[i] = args[i].split("{output}").join(outputFilePath);
+        }
+      }
+
+      const hasPromptPlaceholder = args.some((arg) => arg.includes("{prompt}"));
+      if (hasPromptPlaceholder) {
+        for (let i = 0; i < args.length; i++) {
+          if (!args[i]) continue;
+          args[i] = args[i].split("{prompt}").join(prompt);
+        }
+      }
 
       // Add prompt based on CLI type
-      switch (this.cliType) {
-        case "claude":
-          args.push("-p", prompt);
-          break;
-        case "copilot":
-          args.push("--prompt", prompt);
-          break;
-        case "codex":
-          if (args.includes("-")) {
-            stdinPrompt = prompt;
-          } else {
-            args.push(prompt);
-          }
-          break;
-        case "kimi":
-          args.push("-p", prompt, "--print");
-          break;
+      if (!hasPromptPlaceholder) {
+        switch (this.cliType) {
+          case "claude":
+            args.push("-p", prompt);
+            break;
+          case "copilot":
+            args.push("--prompt", prompt);
+            break;
+          case "codex":
+            if (args.includes("-")) {
+              stdinPrompt = prompt;
+            } else {
+              args.push(prompt);
+            }
+            break;
+          case "kimi":
+            args.push("-p", prompt, "--print");
+            break;
+        }
       }
 
       this.logger.debug(
@@ -947,7 +1033,7 @@ export class CLIProvider implements LLMProvider {
       const timer = setTimeout(() => {
         timedOut = true;
         child.kill("SIGKILL");
-      }, this.timeoutMs);
+      }, timeoutMs);
 
       child.stdout.on("data", (data) => {
         stdout += data.toString();
@@ -974,29 +1060,49 @@ export class CLIProvider implements LLMProvider {
       });
 
       child.on("close", (code) => {
-        clearTimeout(timer);
-        
-        this.logger.debug(
-          {
-            exitCode: code,
-            stdoutLength: stdout.length,
-            stderrLength: stderr.length,
-            stdoutPreview: stdout.slice(0, 300),
-            stderrFull: stderr.length > 0 ? stderr : undefined,
-            timedOut,
-          },
-          "runCLI: Process closed"
-        );
-        
-        if (timedOut) {
-          resolve({
-            ok: false,
-            output: stdout,
-            error: `Command timed out after ${this.timeoutMs}ms`,
-          });
-        } else {
-          const error = code !== 0 ? (stderr || stdout || "Command failed") : undefined;
-          
+        void (async () => {
+          clearTimeout(timer);
+
+          let finalOutput = stdout;
+          if (outputFilePath) {
+            try {
+              const fileOutput = await fs.readFile(outputFilePath, "utf-8");
+              if (fileOutput.trim()) {
+                finalOutput = fileOutput;
+              }
+            } catch {
+              // ignore missing output file
+            }
+            try {
+              await fs.rm(outputFilePath, { force: true });
+            } catch {
+              // ignore cleanup errors
+            }
+          }
+
+          this.logger.debug(
+            {
+              exitCode: code,
+              stdoutLength: stdout.length,
+              stderrLength: stderr.length,
+              stdoutPreview: stdout.slice(0, 300),
+              stderrFull: stderr.length > 0 ? stderr : undefined,
+              timedOut,
+              usedOutputFile: Boolean(outputFilePath),
+            },
+            "runCLI: Process closed"
+          );
+
+          if (timedOut) {
+            resolve({
+              ok: false,
+              output: finalOutput,
+              error: `Command timed out after ${timeoutMs}ms`,
+            });
+            return;
+          }
+
+          const error = code !== 0 ? (stderr || finalOutput || "Command failed") : undefined;
           if (error) {
             this.logger.warn(
               {
@@ -1006,13 +1112,13 @@ export class CLIProvider implements LLMProvider {
               "runCLI: Non-zero exit code"
             );
           }
-          
+
           resolve({
             ok: code === 0,
-            output: stdout,
+            output: finalOutput,
             error,
           });
-        }
+        })();
       });
     });
   }
@@ -1264,6 +1370,7 @@ export class OllamaProvider implements LLMProvider {
 
   async chat(messages: Message[], options?: ChatOptions): Promise<ChatResponse> {
     const url = `${this.baseUrl}/api/chat`;
+    const signal = options?.timeoutMs && options.timeoutMs > 0 ? AbortSignal.timeout(options.timeoutMs) : undefined;
 
     const body = {
       model: this.model,
@@ -1283,6 +1390,7 @@ export class OllamaProvider implements LLMProvider {
         "Content-Type": "application/json",
       },
       body: JSON.stringify(body),
+      ...(signal ? { signal } : {}),
     });
 
     if (!response.ok) {
@@ -1330,7 +1438,7 @@ export class OllamaProvider implements LLMProvider {
 
   async health(): Promise<boolean> {
     try {
-      const response = await fetch(`${this.baseUrl}/api/tags`);
+      const response = await fetch(`${this.baseUrl}/api/tags`, { signal: AbortSignal.timeout(5000) });
       return response.ok;
     } catch {
       return false;

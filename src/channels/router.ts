@@ -69,6 +69,7 @@ export type MiddlewareFunction = (
 export type RouterEvent =
   | { type: "message_received"; message: NormalizedMessage }
   | { type: "message_processed"; message: NormalizedMessage; response?: NormalizedMessage }
+  | { type: "message_sent"; message: NormalizedMessage; success: boolean; error?: string }
   | { type: "message_queued"; message: NormalizedMessage; queueSize: number }
   | { type: "message_dropped"; message: NormalizedMessage; reason: string }
   | { type: "error"; error: Error; message?: NormalizedMessage }
@@ -805,6 +806,12 @@ export class MessageRouter extends EventEmitter {
     }, "Router sending message to adapter");
 
     const result = await adapter.sendMessage(message);
+    this.emit("event", {
+      type: "message_sent",
+      message,
+      success: result.ok,
+      error: result.error,
+    });
     
     this.logger.info({
       channel: message.channel,
@@ -822,13 +829,19 @@ export class MessageRouter extends EventEmitter {
   async sendToSession(
     sessionKey: string,
     content: string,
-    options?: { media?: NormalizedMessage["media"] }
+    options?: { media?: NormalizedMessage["media"]; metadata?: Record<string, unknown> }
   ): Promise<boolean> {
     let session = this.sessions.get(sessionKey);
+    const parts = sessionKey.split(":");
+    const isSystemSession = ["cron", "agent", "subagent", "system"].includes(parts[0]);
+
+    if (!session && isSystemSession) {
+      this.logger.info({ sessionKey }, "Skipping send for system session without channel");
+      return false;
+    }
     
     // Attempt to recover session from key if missing
     if (!session) {
-      const parts = sessionKey.split(":");
       if (parts.length >= 3) {
         const [channel, type, ...rest] = parts;
         const chatId = rest.join(":");
@@ -869,6 +882,7 @@ export class MessageRouter extends EventEmitter {
       sender: { id: "agent", name: "Agent", isAgent: true },
       content,
       media: options?.media,
+      metadata: options?.metadata,
       context: {
         sessionKey,
         chatId: session.chatId,

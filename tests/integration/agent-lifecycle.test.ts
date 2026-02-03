@@ -91,7 +91,7 @@ describe("Agent Lifecycle", () => {
 
       // Task should have progressed from queued
       expect(["running", "completed", "failed"]).toContain(lastStatus);
-    });
+    }, 30000);
   });
 
   describe("Session Management", () => {

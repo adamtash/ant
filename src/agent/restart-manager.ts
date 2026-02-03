@@ -163,7 +163,14 @@ export class RestartManager {
       await this.triggerRestart();
     } else {
       // Schedule restart after a brief delay
-      setTimeout(() => this.triggerRestart(), 100);
+      setTimeout(() => {
+        void this.triggerRestart().catch((err) => {
+          this.logger.warn(
+            { error: err instanceof Error ? err.message : String(err) },
+            "Restart trigger failed"
+          );
+        });
+      }, 100);
     }
   }
 

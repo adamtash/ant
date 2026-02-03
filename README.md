@@ -200,6 +200,39 @@ Scan the QR code in the terminal to pair with WhatsApp and start chatting!
 
 ---
 
+## Programmatic Testing Harness
+
+ANT includes a **programmatic harness** for repeatable “polish loops”: inject a simulated WhatsApp inbound message, observe outbound responses, and capture **full trace logs + session artifacts** in an isolated temp run directory.
+
+### Run a Harness Scenario
+
+```bash
+# Inject an inbound WhatsApp message (child-process mode; closest to real CLI runtime)
+npm run dev -- diagnostics harness -c ant.config.json --message "Reply with exactly: PONG" --mode child_process --timeout 120000
+
+# Faster, in-process mode (best observability)
+npm run dev -- diagnostics harness -c ant.config.json --message "Reply with exactly: PONG" --mode in_process --timeout 120000
+```
+
+The command writes a `harness-report.json` and a full `.ant/` state tree (sessions, logs) into a temp directory printed at the end of the run.
+
+Useful flags:
+- `--launch-target src|dist` (default: `src`) to run against TypeScript or built output
+- `--enable-memory`, `--enable-main-agent`, `--enable-scheduler` to include more subsystems
+- `--no-block-exec-deletes` to disable the exec delete guard
+
+### Test-only API Endpoints
+
+When running in test mode (`NODE_ENV=test`) the gateway exposes endpoints used by harnesses:
+
+- `POST /api/test/whatsapp/inbound` — inject an inbound message
+- `GET /api/test/whatsapp/outbound` — list outbound messages recorded by the test adapter
+- `POST /api/test/whatsapp/outbound/clear` — clear outbound buffer
+
+These endpoints are disabled outside test mode (or can be forced with `ANT_ENABLE_TEST_API=1`).
+
+---
+
 ## Configuration (`ant.config.json`)
 
 ### Core Settings
@@ -227,14 +260,14 @@ Scan the QR code in the terminal to pair with WhatsApp and start chatting!
         "model": "your-model",
         "embeddingsModel": "text-embedding-nomic-embed-text-v1.5"
       },
-      "codex-cli": {
+      "codex": {
         "type": "cli",
         "cliProvider": "codex"
       }
     }
   },
   "routing": {
-    "chat": "codex-cli",            // Provider for chat responses
+    "chat": "codex",            // Provider for chat responses
     "tools": "lmstudio",            // Provider for tool calls
     "embeddings": "lmstudio"        // Provider for memory embeddings
   }

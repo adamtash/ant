@@ -265,8 +265,15 @@ export async function spawnTestInstance(
 
   const logs: string[] = [];
 
+  const launchTarget = (process.env.ANT_TEST_LAUNCH_TARGET || "").trim().toLowerCase();
+  const useDist = launchTarget === "dist" || process.env.ANT_TEST_USE_DIST === "1";
+  const command = useDist ? "node" : path.join(PROJECT_ROOT, "node_modules/.bin/tsx");
+  const args = useDist
+    ? [path.join(PROJECT_ROOT, "dist/cli.js"), "start", "-c", configPath]
+    : [path.join(PROJECT_ROOT, "src/cli.ts"), "start", "-c", configPath];
+
   // Spawn the process
-  const proc = spawn("node", [path.join(PROJECT_ROOT, "dist/cli.js"), "start", "-c", configPath], {
+  const proc = spawn(command, args, {
     cwd: tempDir,
     env: {
       ...process.env,

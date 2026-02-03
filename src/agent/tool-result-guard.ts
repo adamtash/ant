@@ -1,10 +1,12 @@
 import type { SessionManager, SessionMessage } from "../gateway/session-manager.js";
 import type { Logger } from "../log.js";
-import type { ToolCall, ToolPart, ToolResult } from "./types.js";
+import type { Channel, ToolCall, ToolPart, ToolResult } from "./types.js";
 
 export async function persistToolResult(params: {
   sessionManager: SessionManager | undefined;
   sessionKey: string;
+  channel?: Channel;
+  chatId?: string;
   toolCall: ToolCall;
   result: ToolResult;
   toolPart?: ToolPart;
@@ -22,6 +24,8 @@ export async function persistToolResult(params: {
       error: params.result.error,
     }),
     timestamp: Date.now(),
+    channel: params.channel,
+    chatId: params.chatId,
     toolCallId: params.toolCall.id,
     name: params.toolCall.name,
   };

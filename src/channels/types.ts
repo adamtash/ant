@@ -81,6 +81,9 @@ export interface NormalizedMessage {
   /** Session and conversation context */
   context: MessageContext;
 
+  /** Optional metadata (provider IDs, run IDs, etc.) */
+  metadata?: Record<string, unknown>;
+
   /** Unix timestamp in milliseconds */
   timestamp: number;
 

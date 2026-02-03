@@ -72,10 +72,16 @@ export default defineTool({
         },
       };
     } catch (err) {
-      ctx.logger?.error({ filePath, error: err instanceof Error ? err.message : String(err) }, "Failed to read file");
+      const errorMessage = err instanceof Error ? err.message : String(err);
+      const errorCode = (err as NodeJS.ErrnoException | null)?.code;
+      if (errorCode === "ENOENT") {
+        ctx.logger?.warn({ filePath, error: errorMessage }, "Read file not found");
+      } else {
+        ctx.logger?.error({ filePath, error: errorMessage }, "Failed to read file");
+      }
       return {
         ok: false,
-        error: err instanceof Error ? err.message : String(err),
+        error: errorMessage,
       };
     }
   },

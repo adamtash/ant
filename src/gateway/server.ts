@@ -118,6 +118,7 @@ export class GatewayServer {
   private events = createEventPublishers(this.eventStream);
   private providerHealthTracker: ProviderHealthTracker;
   private agentEventUnsubscribe?: () => void;
+  private eventStreamUnsubscribe?: () => void;
 
   /** Status broadcast state */
   private lastStatus: Record<string, unknown> | null = null;
@@ -152,6 +153,10 @@ export class GatewayServer {
     this.providerHealthTracker.connectToStream(this.eventStream);
     this.setupPersistence();
     this.setupErrorTracking();
+  }
+
+  private isTestApiEnabled(): boolean {
+    return process.env.NODE_ENV === "test" || process.env.ANT_ENABLE_TEST_API === "1";
   }
 
   /**
@@ -314,10 +319,17 @@ export class GatewayServer {
         if (message.sender.isAgent) return;
 
         try {
+          await this.sessions.getOrCreate({
+            sessionKey: message.context.sessionKey,
+            channel: message.channel,
+            chatId: message.context.chatId,
+          });
           await this.sessions.appendMessage(message.context.sessionKey, {
             role: "user",
             content: message.content,
             timestamp: message.timestamp,
+            channel: message.channel,
+            chatId: message.context.chatId,
             name: message.sender.name,
           });
         } catch (err) {
@@ -326,22 +338,54 @@ export class GatewayServer {
         }
       }
 
-      // Persist agent responses
-      else if (event.type === "message_processed") {
-        const { response } = event;
-        if (!response) return;
+      // Persist outbound agent messages (actual sends, including media and system notices)
+      else if (event.type === "message_sent") {
+        const { message } = event;
+        if (!message.sender.isAgent) return;
+
+        const mediaMeta = message.media
+          ? {
+              type: message.media.type,
+              filename: message.media.filename,
+              mimeType: message.media.mimeType,
+              path: typeof message.media.data === "string" ? message.media.data : undefined,
+              bytes: Buffer.isBuffer(message.media.data) ? message.media.data.length : undefined,
+            }
+          : undefined;
+
+        const providerId =
+          typeof message.metadata?.providerId === "string"
+            ? String(message.metadata.providerId)
+            : undefined;
+        const model =
+          typeof message.metadata?.model === "string"
+            ? String(message.metadata.model)
+            : undefined;
 
         try {
-          await this.sessions.appendMessage(response.context.sessionKey, {
+          await this.sessions.getOrCreate({
+            sessionKey: message.context.sessionKey,
+            channel: message.channel,
+            chatId: message.context.chatId,
+          });
+          await this.sessions.appendMessage(message.context.sessionKey, {
             role: "assistant",
-            content: response.content,
-            timestamp: response.timestamp,
-            providerId: response.metadata?.providerId as string | undefined,
-            model: response.metadata?.model as string | undefined,
+            content: message.content,
+            timestamp: message.timestamp,
+            channel: message.channel,
+            chatId: message.context.chatId,
+            providerId,
+            model,
+            metadata: {
+              ...(typeof message.metadata === "object" && message.metadata ? (message.metadata as Record<string, unknown>) : {}),
+              ...(mediaMeta ? { media: mediaMeta } : {}),
+              ...(event.error ? { sendError: event.error } : {}),
+              sendOk: event.success,
+            },
           });
         } catch (err) {
           const error = err instanceof Error ? err.message : String(err);
-          this.logger.error({ error, sessionKey: response.context.sessionKey }, "Failed to persist agent message");
+          this.logger.error({ error, sessionKey: message.context.sessionKey }, "Failed to persist outbound agent message");
         }
       }
     });
@@ -701,6 +745,88 @@ export class GatewayServer {
       
       res.json({ ok: true, channels });
     });
+
+    // ============================================
+    // Test Harness Endpoints (test mode only)
+    // ============================================
+
+    if (this.isTestApiEnabled()) {
+      app.post("/api/test/whatsapp/inbound", (req, res) => {
+        if (!this.router) {
+          res.status(503).json({ ok: false, error: "Router not available" });
+          return;
+        }
+
+        const adapter = this.router.getAdapter("whatsapp") as any;
+        if (!adapter || typeof adapter.injectInbound !== "function") {
+          res.status(501).json({ ok: false, error: "WhatsApp test adapter not available" });
+          return;
+        }
+
+        const chatId = typeof req.body?.chatId === "string" ? req.body.chatId : "";
+        const text = typeof req.body?.text === "string" ? req.body.text : "";
+        const senderId = typeof req.body?.senderId === "string" ? req.body.senderId : undefined;
+        const pushName = typeof req.body?.pushName === "string" ? req.body.pushName : undefined;
+        const fromMe = typeof req.body?.fromMe === "boolean" ? req.body.fromMe : undefined;
+        const mentions = Array.isArray(req.body?.mentions) ? req.body.mentions : undefined;
+        const timestampMs = typeof req.body?.timestampMs === "number" ? req.body.timestampMs : undefined;
+
+        if (!chatId.trim() || !text.trim()) {
+          res.status(400).json({ ok: false, error: "chatId and text are required" });
+          return;
+        }
+
+        const result = adapter.injectInbound({
+          chatId,
+          text,
+          senderId,
+          pushName,
+          fromMe,
+          mentions,
+          timestampMs,
+        });
+
+        res.json({ ok: true, ...result });
+      });
+
+      app.get("/api/test/whatsapp/outbound", (req, res) => {
+        if (!this.router) {
+          res.status(503).json({ ok: false, error: "Router not available" });
+          return;
+        }
+
+        const adapter = this.router.getAdapter("whatsapp") as any;
+        if (!adapter || typeof adapter.getOutbound !== "function") {
+          res.status(501).json({ ok: false, error: "WhatsApp test adapter not available" });
+          return;
+        }
+
+        const chatId = typeof req.query.chatId === "string" ? req.query.chatId : undefined;
+        const sessionKey = typeof req.query.sessionKey === "string" ? req.query.sessionKey : undefined;
+
+        let outbound = adapter.getOutbound();
+        if (chatId) outbound = outbound.filter((m: any) => m.chatId === chatId);
+        if (sessionKey) outbound = outbound.filter((m: any) => m.sessionKey === sessionKey);
+
+        res.json({ ok: true, outbound });
+      });
+
+      app.post("/api/test/whatsapp/outbound/clear", (req, res) => {
+        if (!this.router) {
+          res.status(503).json({ ok: false, error: "Router not available" });
+          return;
+        }
+
+        const adapter = this.router.getAdapter("whatsapp") as any;
+        if (!adapter || typeof adapter.clearOutbound !== "function") {
+          res.status(501).json({ ok: false, error: "WhatsApp test adapter not available" });
+          return;
+        }
+
+        adapter.clearOutbound();
+        res.json({ ok: true });
+      });
+    }
 
     // Validations for Tasks
     app.post("/api/tasks", async (req, res) => {
@@ -1767,7 +1893,7 @@ export class GatewayServer {
       });
     });
     // Wire up global event stream to gateway broadcast
-    getEventStream().subscribeAll((event) => {
+    this.eventStreamUnsubscribe = getEventStream().subscribeAll((event) => {
       const normalized = this.mapMonitorEventToSystemEvent(event as MonitorEvent);
       this.broadcast(normalized);
       this.scheduleStatusDelta();
@@ -1809,6 +1935,10 @@ export class GatewayServer {
     if (this.agentEventUnsubscribe) {
       this.agentEventUnsubscribe();
       this.agentEventUnsubscribe = undefined;
+    }
+    if (this.eventStreamUnsubscribe) {
+      this.eventStreamUnsubscribe();
+      this.eventStreamUnsubscribe = undefined;
     }
     this.logger.info("Gateway server stopped");
   }

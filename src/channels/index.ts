@@ -45,6 +45,7 @@ export {
   WhatsAppAdapter,
   type WhatsAppAdapterConfig,
 } from "./whatsapp/adapter.js";
+export { TestWhatsAppAdapter } from "./whatsapp/test-adapter.js";
 export {
   extractTextFromMessage,
   extractMentions,

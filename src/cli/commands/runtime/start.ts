@@ -3,16 +3,34 @@
  */
 
 import { spawn } from "node:child_process";
+import path from "node:path";
 import type { AntConfig } from "../../../config.js";
 import { OutputFormatter } from "../../output-formatter.js";
 import { RuntimeError } from "../../error-handler.js";
 import { readPidFile, writePidFile, removePidFile, ensureRuntimePaths } from "../../../gateway/process-control.js";
+import type { AgentEngine } from "../../../agent/engine.js";
+import type { AgentExecutor } from "../../../scheduler/types.js";
+import { collectToolMediaAttachments } from "../../../utils/tool-media.js";
+import { collectToolOutboundMessages } from "../../../utils/tool-outbound.js";
 
 export interface StartOptions {
   config?: string;
   tui?: boolean;
   detached?: boolean;
   quiet?: boolean;
+}
+
+export function createSchedulerAgentExecutor(agentEngine: AgentEngine): AgentExecutor {
+  return async (params) => {
+    const result = await agentEngine.execute({
+      sessionKey: params.sessionKey,
+      query: params.query,
+      channel: "web",
+      cronContext: params.cronContext,
+    });
+
+    return { response: result.response, error: result.error };
+  };
 }
 
 /**
@@ -75,8 +93,7 @@ export async function start(cfg: AntConfig, options: StartOptions = {}): Promise
     const { GatewayServer } = await import("../../../gateway/server.js");
     const { createLogger } = await import("../../../log.js");
     const { createAgentEngine } = await import("../../../agent/engine.js");
-    const { MessageRouter, WhatsAppAdapter } = await import("../../../channels/index.js");
-    const { MemoryManager } = await import("../../../memory/manager.js");
+    const { MessageRouter, WhatsAppAdapter, TestWhatsAppAdapter } = await import("../../../channels/index.js");
     const { Scheduler } = await import("../../../scheduler/scheduler.js");
     const { createSkillRegistryManager } = await import("../../../agent/skill-registry.js");
     const { SessionManager } = await import("../../../gateway/session-manager.js");
@@ -100,26 +117,27 @@ export async function start(cfg: AntConfig, options: StartOptions = {}): Promise
     router.start();
 
     // Initialize WhatsApp Adapter
-    const whatsapp = new WhatsAppAdapter({
-      cfg,
-      logger,
-      // onStatusUpdate handled by adapter events/router
-    });
+    const whatsapp =
+      process.env.NODE_ENV === "test"
+        ? new TestWhatsAppAdapter({ cfg, logger })
+        : new WhatsAppAdapter({
+            cfg,
+            logger,
+            // onStatusUpdate handled by adapter events/router
+          });
 
-    if (process.env.NODE_ENV === "test") {
+    try {
+      await whatsapp.start();
       router.registerAdapter(whatsapp);
-      logger.info("WhatsApp adapter registered (test mode)");
-    } else {
-      try {
-        await whatsapp.start();
-        router.registerAdapter(whatsapp);
-        logger.info("WhatsApp adapter registered");
-      } catch (err) {
-        logger.error(
-          { error: err instanceof Error ? err.message : String(err) },
-          "Failed to start WhatsApp adapter"
-        );
-      }
+      logger.info(
+        { mode: process.env.NODE_ENV === "test" ? "test" : "live" },
+        "WhatsApp adapter registered"
+      );
+    } catch (err) {
+      logger.error(
+        { error: err instanceof Error ? err.message : String(err) },
+        "Failed to start WhatsApp adapter"
+      );
     }
 
     const sessionManager = new SessionManager({
@@ -169,6 +187,7 @@ export async function start(cfg: AntConfig, options: StartOptions = {}): Promise
 
     // Set up message routing from router to agent engine
     router.setDefaultHandler(async (message) => {
+      const startedAt = Date.now();
       try {
         const result = await agentEngine.execute({
           sessionKey: message.context.sessionKey,
@@ -176,6 +195,37 @@ export async function start(cfg: AntConfig, options: StartOptions = {}): Promise
           chatId: message.context.chatId,
           channel: message.channel,
         });
+
+        try {
+          const toolParts = await sessionManager.listToolParts(message.context.sessionKey);
+          const outboundMessages = collectToolOutboundMessages({ toolParts, startedAt });
+          for (const outbound of outboundMessages) {
+            await router.sendToSession(outbound.sessionKey, outbound.content, {
+              metadata: {
+                toolOutbound: outbound,
+              },
+            });
+          }
+
+          const attachments = collectToolMediaAttachments({ toolParts, startedAt });
+          for (const attachment of attachments) {
+            await router.sendToSession(message.context.sessionKey, attachment.caption ?? "", {
+              media: {
+                type: "file",
+                data: attachment.path,
+                filename: path.basename(attachment.path),
+              },
+              metadata: {
+                toolMedia: attachment,
+              },
+            });
+          }
+        } catch (err) {
+          logger.warn(
+            { error: err instanceof Error ? err.message : String(err), sessionKey: message.context.sessionKey },
+            "Failed to send tool media attachments"
+          );
+        }
 
         // Send response back through the router
         logger.info({
@@ -187,7 +237,15 @@ export async function start(cfg: AntConfig, options: StartOptions = {}): Promise
           iterations: result.iterations,
           toolsUsed: result.toolsUsed,
         }, "Sending response to session");
-        await router.sendToSession(message.context.sessionKey, result.response);
+        await router.sendToSession(message.context.sessionKey, result.response, {
+          metadata: {
+            providerId: result.providerId,
+            model: result.model,
+            runId: result.runId,
+            iterations: result.iterations,
+            toolsUsed: result.toolsUsed,
+          },
+        });
 
         return {
           id: message.id,
@@ -200,6 +258,7 @@ export async function start(cfg: AntConfig, options: StartOptions = {}): Promise
           metadata: {
             providerId: result.providerId,
             model: result.model,
+            runId: result.runId,
           },
         };
       } catch (error) {
@@ -214,30 +273,30 @@ export async function start(cfg: AntConfig, options: StartOptions = {}): Promise
     logger.info("Agent handler registered with message router");
 
     // Initialize Memory Manager
-    const memoryManager = new MemoryManager(cfg);
-    if (process.env.NODE_ENV === "test" && !cfg.memory.enabled) {
-      logger.info("Memory manager skipped (test mode)");
+    const memoryManager = cfg.memory.enabled
+      ? new (await import("../../../memory/manager.js")).MemoryManager(cfg)
+      : undefined;
+    if (!memoryManager) {
+      logger.info("Memory manager disabled");
     } else {
       await memoryManager.start();
       logger.info("Memory manager started");
     }
 
-    // Initialize Scheduler
-    const scheduler = new Scheduler({
-      stateDir: cfg.resolved.stateDir,
-      logger,
-      agentExecutor: async (params) => {
-        const result = await agentEngine.execute({
-          sessionKey: params.sessionKey,
-          query: params.cronContext.jobName,
-          channel: "web",
-          cronContext: params.cronContext,
-        });
-        return { response: result.response, error: result.error };
-      },
-    });
-    await scheduler.start();
-    logger.info("Scheduler started");
+	    // Initialize Scheduler
+	    const scheduler = (cfg.scheduler?.enabled ?? false)
+	      ? new Scheduler({
+	          stateDir: cfg.resolved.stateDir,
+	          logger,
+	          agentExecutor: createSchedulerAgentExecutor(agentEngine),
+	        })
+	      : undefined;
+	    if (!scheduler) {
+	      logger.info("Scheduler disabled");
+	    } else {
+	      await scheduler.start();
+	      logger.info("Scheduler started");
+	    }
 
     // Initialize Skill Registry
     const skillRegistry = createSkillRegistryManager({
@@ -250,7 +309,7 @@ export async function start(cfg: AntConfig, options: StartOptions = {}): Promise
     // Initialize Gateway Server first (so UI is available immediately)
     const { MainAgent } = await import("../../../agent/main-agent.js");
     
-    const server = new GatewayServer({
+	    const server = new GatewayServer({
       config: {
         port: gatewayPort,
         host: gatewayHost,
@@ -262,8 +321,8 @@ export async function start(cfg: AntConfig, options: StartOptions = {}): Promise
       logger,
       agentEngine,
       router,
-      memoryManager,
-      scheduler,
+	      memoryManager,
+	      scheduler,
       skillRegistry,
       toolRegistry: agentEngine.getToolRegistry(),
     });
@@ -312,15 +371,15 @@ export async function start(cfg: AntConfig, options: StartOptions = {}): Promise
         timeout.unref();
 
         try {
-          mainAgent.stop();
-          server.setMainAgentRunning(false);
-          await router.stop();
-          await server.stop();
-          scheduler.stop();
-          memoryManager.stop();
-        } catch (err) {
-          out.error(`Error during shutdown: ${err}`);
-        } finally {
+	          mainAgent.stop();
+	          server.setMainAgentRunning(false);
+	          await router.stop();
+	          await server.stop();
+	          await scheduler?.stop();
+	          memoryManager?.stop();
+	        } catch (err) {
+	          out.error(`Error during shutdown: ${err}`);
+	        } finally {
           await removePidFile(cfg);
           clearTimeout(timeout);
           process.exit(0);

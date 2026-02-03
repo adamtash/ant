@@ -2,6 +2,8 @@
  * Memory Search Tool - Search through memory files and session transcripts
  */
 
+import fs from "node:fs/promises";
+import path from "node:path";
 import { defineTool, defineParams } from "../../../agent/tool-registry.js";
 import type { ToolResult, ToolContext } from "../../../agent/types.js";
 
@@ -26,20 +28,20 @@ export default defineTool({
     const maxResults = typeof args.maxResults === "number" ? args.maxResults : 6;
     const minScore = typeof args.minScore === "number" ? args.minScore : 0.35;
 
-    // Note: This tool requires memory manager to be injected via context
-    // For now, return a placeholder that indicates memory search is not available
-    // The actual implementation will use ctx.memory.search()
-
     try {
-      // Placeholder - in production, this would call:
-      // const results = await ctx.memory.search(query, maxResults, minScore);
+      const results = await searchWorkspaceAndSessions({
+        query,
+        maxResults,
+        minScore,
+        workspaceDir: ctx.workspaceDir,
+        stateDir: ctx.stateDir,
+      });
 
       return {
         ok: true,
         data: {
           query,
-          results: [],
-          message: "Memory search requires memory manager integration",
+          results,
         },
       };
     } catch (err) {
@@ -56,3 +58,147 @@ export default defineTool({
     }
   },
 });
+
+async function searchWorkspaceAndSessions(params: {
+  query: string;
+  maxResults: number;
+  minScore: number;
+  workspaceDir: string;
+  stateDir: string;
+}): Promise<
+  Array<{
+    source: "memory" | "sessions";
+    path: string;
+    startLine: number;
+    endLine: number;
+    score: number;
+    snippet: string;
+  }>
+> {
+  const queryLower = params.query.toLowerCase();
+  const results: Array<{
+    source: "memory" | "sessions";
+    path: string;
+    startLine: number;
+    endLine: number;
+    score: number;
+    snippet: string;
+  }> = [];
+
+  const push = (item: (typeof results)[number]) => {
+    if (item.score < params.minScore) return;
+    results.push(item);
+  };
+
+  // MEMORY.md at workspace root
+  const memoryRoot = path.join(params.workspaceDir, "MEMORY.md");
+  await searchTextFile(memoryRoot, params.workspaceDir, queryLower, (hit) => push({ ...hit, source: "memory" }), params.maxResults - results.length);
+
+  // memory/*.md
+  const memoryDir = path.join(params.workspaceDir, "memory");
+  const memoryFiles = await listMarkdownFiles(memoryDir);
+  for (const filePath of memoryFiles) {
+    if (results.length >= params.maxResults) break;
+    await searchTextFile(filePath, params.workspaceDir, queryLower, (hit) => push({ ...hit, source: "memory" }), params.maxResults - results.length);
+  }
+
+  // session transcripts: .ant/sessions/*.jsonl
+  const sessionsDir = path.join(params.stateDir, "sessions");
+  const sessionFiles = await safeReadDir(sessionsDir);
+  for (const name of sessionFiles) {
+    if (results.length >= params.maxResults) break;
+    if (!name.endsWith(".jsonl")) continue;
+    const filePath = path.join(sessionsDir, name);
+    await searchJsonlSession(filePath, sessionsDir, queryLower, (hit) => push({ ...hit, source: "sessions" }), params.maxResults - results.length);
+  }
+
+  return results.slice(0, params.maxResults);
+}
+
+async function listMarkdownFiles(dir: string): Promise<string[]> {
+  const entries = await safeReadDir(dir);
+  return entries
+    .filter((n) => n.endsWith(".md"))
+    .map((n) => path.join(dir, n));
+}
+
+async function safeReadDir(dir: string): Promise<string[]> {
+  try {
+    return await fs.readdir(dir);
+  } catch {
+    return [];
+  }
+}
+
+async function searchTextFile(
+  filePath: string,
+  workspaceDir: string,
+  queryLower: string,
+  onHit: (hit: { path: string; startLine: number; endLine: number; score: number; snippet: string }) => void,
+  remaining: number
+): Promise<void> {
+  if (remaining <= 0) return;
+  try {
+    const content = await fs.readFile(filePath, "utf-8");
+    const rel = path.relative(workspaceDir, filePath) || path.basename(filePath);
+    const lines = content.split("\n");
+    for (let i = 0; i < lines.length; i += 1) {
+      if (remaining <= 0) return;
+      const line = lines[i] ?? "";
+      if (!line.toLowerCase().includes(queryLower)) continue;
+      const score = 1.0;
+      onHit({
+        path: rel,
+        startLine: i + 1,
+        endLine: i + 1,
+        score,
+        snippet: line.trim().slice(0, 500),
+      });
+      remaining -= 1;
+    }
+  } catch {
+    // ignore missing/unreadable files
+  }
+}
+
+async function searchJsonlSession(
+  filePath: string,
+  sessionsDir: string,
+  queryLower: string,
+  onHit: (hit: { path: string; startLine: number; endLine: number; score: number; snippet: string }) => void,
+  remaining: number
+): Promise<void> {
+  if (remaining <= 0) return;
+  try {
+    const content = await fs.readFile(filePath, "utf-8");
+    const rel = path.relative(sessionsDir, filePath) || path.basename(filePath);
+    const lines = content.split("\n").filter(Boolean);
+    for (let i = 0; i < lines.length; i += 1) {
+      if (remaining <= 0) return;
+      const raw = lines[i] ?? "";
+      let text = "";
+      try {
+        const parsed = JSON.parse(raw) as { content?: unknown; role?: unknown; name?: unknown } | null;
+        const contentValue = parsed && typeof parsed === "object" ? (parsed as any).content : "";
+        const role = parsed && typeof parsed === "object" ? (parsed as any).role : undefined;
+        const name = parsed && typeof parsed === "object" ? (parsed as any).name : undefined;
+        text = typeof contentValue === "string" ? contentValue : String(contentValue ?? "");
+        const prefix = `${typeof role === "string" ? role : "message"}${typeof name === "string" ? `(${name})` : ""}`;
+        const snippetCandidate = `${prefix}: ${text}`.trim();
+        if (!snippetCandidate.toLowerCase().includes(queryLower)) continue;
+        onHit({
+          path: `sessions/${rel}`,
+          startLine: i + 1,
+          endLine: i + 1,
+          score: 0.7,
+          snippet: snippetCandidate.slice(0, 500),
+        });
+        remaining -= 1;
+      } catch {
+        // ignore parse errors
+      }
+    }
+  } catch {
+    // ignore
+  }
+}

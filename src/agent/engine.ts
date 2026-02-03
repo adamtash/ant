@@ -163,31 +163,112 @@ export class AgentEngine {
         agentType,
       }, { sessionKey: input.sessionKey, channel: input.channel });
 
-      // 1. Build enhanced prompt with context
-      const systemPrompt = await this.buildPrompt(input);
+      // 1. Select providers (chat vs tool-runner)
+      const chatProvider = await this.providers.selectBestProvider("chat");
+      let selectedProvider = chatProvider;
 
-      // 2. Build initial messages
+      if (chatProvider.type === "cli") {
+        try {
+          selectedProvider = await this.providers.selectBestProvider("parentForCli");
+        } catch (err) {
+          this.logger.warn(
+            { error: err instanceof Error ? err.message : String(err), chatProvider: chatProvider.id },
+            "No parent provider available for CLI chat provider; continuing without tool execution"
+          );
+          selectedProvider = chatProvider;
+        }
+      } else {
+        try {
+          selectedProvider = await this.providers.selectBestProvider("tools");
+        } catch {
+          selectedProvider = chatProvider;
+        }
+      }
+
+      this.logger.info(
+        {
+          sessionKey: input.sessionKey,
+          chatProviderId: chatProvider.id,
+          chatProviderType: chatProvider.type,
+          chatModel: chatProvider.model,
+          toolProviderId: selectedProvider.id,
+          toolProviderType: selectedProvider.type,
+          toolModel: selectedProvider.model,
+          query: input.query.slice(0, 100),
+        },
+        "Providers selected for execution"
+      );
+
+      // 2. Prepare prompt context (bootstrap + memory)
+      const bootstrapFiles = await loadBootstrapFiles({
+        workspaceDir: this.workspaceDir,
+        isSubagent: input.isSubagent,
+      });
+
+      let memoryContext: MemoryContext | undefined;
+      if (this.memorySearch) {
+        try {
+          const results = await this.memorySearch(input.query, 5);
+          if (results.length > 0) {
+            memoryContext = {
+              recentMemory: [],
+              relevantContext: results,
+            };
+          }
+        } catch (err) {
+          this.logger.debug(
+            { error: err instanceof Error ? err.message : String(err) },
+            "Memory search failed"
+          );
+        }
+      }
+
+      const baseRuntimeInfo = {
+        workspaceDir: this.workspaceDir,
+        currentTime: new Date(),
+        cronContext: input.cronContext,
+      };
+
+      const toolSystemPrompt = buildSystemPrompt({
+        config: this.config,
+        tools: this.tools.getDefinitions(),
+        bootstrapFiles,
+        runtimeInfo: {
+          ...baseRuntimeInfo,
+          model: selectedProvider.model,
+          providerType: selectedProvider.type === "cli" ? "cli" : "openai",
+        },
+        memoryContext,
+        isSubagent: input.isSubagent,
+      });
+
+      const chatSystemPrompt =
+        chatProvider.id === selectedProvider.id
+          ? toolSystemPrompt
+          : buildSystemPrompt({
+              config: this.config,
+              tools: [],
+              bootstrapFiles,
+              runtimeInfo: {
+                ...baseRuntimeInfo,
+                model: chatProvider.model,
+                providerType: chatProvider.type === "cli" ? "cli" : "openai",
+              },
+              memoryContext,
+              isSubagent: input.isSubagent,
+            });
+
+      // 3. Build initial messages (tool-runner loop)
       const messages: Message[] = [
-        { role: "system", content: systemPrompt },
+        { role: "system", content: toolSystemPrompt },
         ...(input.history || []),
         { role: "user", content: input.query },
       ];
 
-      // 3. Trim messages to fit context window
-      const trimmedMessages = trimMessagesForContext(
-        messages,
-        this.config.maxHistoryTokens
-      );
+      // 4. Trim messages to fit context window
+      const trimmedMessages = trimMessagesForContext(messages, this.config.maxHistoryTokens);
 
-      // 4. Get provider and tool definitions (will fallback if needed during execution)
-      let selectedProvider = await this.providers.selectBestProvider();
-      this.logger.info({
-        sessionKey: input.sessionKey,
-        providerId: selectedProvider.id,
-        providerType: selectedProvider.type,
-        model: selectedProvider.model,
-        query: input.query.slice(0, 100),
-      }, "Primary provider selected for execution");
+      // 5. Get tool definitions (policy-aware)
       const toolPolicyName = this.config.toolPolicy;
       const toolPolicy = toolPolicyName ? this.toolPolicies?.[toolPolicyName] : undefined;
       const toolPolicyContext = {
@@ -202,7 +283,7 @@ export class AgentEngine {
         : this.tools.getDefinitions();
       const allowedToolNames = new Set(toolDefs.map((tool) => tool.function.name));
 
-      // 5. Execute tool loop
+      // 6. Execute tool loop
       let currentMessages: Message[] = [...trimmedMessages];
       const maxIterations = this.config.maxToolIterations || 6;
       const toolLoopConfig = this.config.toolLoop ?? {};
@@ -249,6 +330,7 @@ export class AgentEngine {
             sanitizedMessages,
             {
               temperature: this.config.temperature,
+              timeoutMs: iterationTimeoutMs,
               tools: toolDefs,
               toolChoice: "auto",
               thinking: this.config.thinking?.level
@@ -285,9 +367,68 @@ export class AgentEngine {
         // Check if we have tool calls
         if (!response.toolCalls || response.toolCalls.length === 0) {
           // No more tool calls, we're done
-           const finalResponse = this.config.thinking?.level && this.config.thinking.level !== "off"
-             ? response.content
-             : this.stripReasoning(response.content);
+          const toolRunnerResponse =
+            this.config.thinking?.level && this.config.thinking.level !== "off"
+              ? response.content
+              : this.stripReasoning(response.content);
+
+          let finalProvider = selectedProvider;
+          let finalResponse = toolRunnerResponse;
+
+          const providerToolsDisabled =
+            ["1", "true", "yes"].includes((process.env.ANT_DISABLE_PROVIDER_TOOLS || "").trim().toLowerCase()) ||
+            ["1", "true", "yes"].includes((process.env.ANT_EXEC_BLOCK_DELETE || "").trim().toLowerCase());
+
+          if (chatProvider.id !== selectedProvider.id && !(providerToolsDisabled && chatProvider.type === "cli")) {
+            const toolMessages = currentMessages
+              .filter((m) => m.role === "tool")
+              .slice(-12)
+              .map((m) => {
+                const name = m.name || "tool";
+                const content = typeof m.content === "string" ? m.content : String(m.content ?? "");
+                const trimmed = content.length > 4000 ? content.slice(0, 4000) + "…(truncated)" : content;
+                return `- ${name}: ${trimmed}`;
+              });
+
+            const finalUserPrompt = toolMessages.length > 0
+              ? `User request:\n${input.query}\n\nTool outputs:\n${toolMessages.join("\n")}\n\nWrite the final answer for the user. Do not call tools.`
+              : `User request:\n${input.query}\n\nWrite the final answer for the user.`;
+
+            try {
+              const chatResult = await this.callProviderWithFallback(
+                chatProvider,
+                [
+                  { role: "system", content: chatSystemPrompt },
+                  { role: "user", content: finalUserPrompt },
+                ],
+                {
+                  temperature: this.config.temperature,
+                  timeoutMs: iterationTimeoutMs,
+                  thinking: this.config.thinking?.level
+                    ? { level: this.config.thinking.level }
+                    : undefined,
+                },
+                iterationTimeoutMs,
+                input.sessionKey
+              );
+
+              finalProvider = chatResult.provider;
+              finalResponse =
+                this.config.thinking?.level && this.config.thinking.level !== "off"
+                  ? chatResult.response.content
+                  : this.stripReasoning(chatResult.response.content);
+            } catch (err) {
+              this.logger.warn(
+                { error: err instanceof Error ? err.message : String(err), providerId: chatProvider.id },
+                "Final chat provider call failed; falling back to tool-runner response"
+              );
+            }
+          } else if (chatProvider.id !== selectedProvider.id && providerToolsDisabled && chatProvider.type === "cli") {
+            this.logger.info(
+              { sessionKey: input.sessionKey, providerId: chatProvider.id },
+              "Skipping CLI chat provider finalization (provider tools disabled)"
+            );
+          }
 
           this.logger.info(
             {
@@ -300,8 +441,10 @@ export class AgentEngine {
               rawResponsePreview: response.content?.slice(0, 300) || "(empty)",
               finalResponseLength: finalResponse?.length || 0,
               finalResponsePreview: finalResponse?.slice(0, 300) || "(empty)",
-              providerId: selectedProvider.id,
-              model: selectedProvider.model,
+              providerId: finalProvider.id,
+              model: finalProvider.model,
+              toolProviderId: selectedProvider.id,
+              toolModel: selectedProvider.model,
             },
             "Agent execution complete"
           );
@@ -313,8 +456,8 @@ export class AgentEngine {
             success: true,
             responsePreview: finalResponse?.slice(0, 300) || "",
             promptPreview,
-            providerId: selectedProvider.id,
-            model: selectedProvider.model,
+            providerId: finalProvider.id,
+            model: finalProvider.model,
             agentType,
           }, { sessionKey: input.sessionKey, channel: input.channel });
 
@@ -327,8 +470,10 @@ export class AgentEngine {
               iterations,
               toolsUsed,
               duration: Date.now() - startTime,
-              providerId: selectedProvider.id,
-              model: selectedProvider.model,
+              providerId: finalProvider.id,
+              model: finalProvider.model,
+              toolProviderId: selectedProvider.id,
+              toolModel: selectedProvider.model,
               agentType,
             },
             sessionKey: input.sessionKey,
@@ -340,8 +485,8 @@ export class AgentEngine {
             response: finalResponse,
             toolsUsed,
             iterations,
-            providerId: selectedProvider.id,
-            model: selectedProvider.model,
+            providerId: finalProvider.id,
+            model: finalProvider.model,
             runId,
           };
         }
@@ -441,6 +586,8 @@ export class AgentEngine {
               await persistToolResult({
                 sessionManager: this.sessionManager,
                 sessionKey: input.sessionKey,
+                channel: input.channel,
+                chatId: input.chatId,
                 toolCall,
                 result: blockedResult,
                 toolPart: blockedPart,
@@ -546,6 +693,8 @@ export class AgentEngine {
             await persistToolResult({
               sessionManager: this.sessionManager,
               sessionKey: input.sessionKey,
+              channel: input.channel,
+              chatId: input.chatId,
               toolCall,
               result,
               toolPart: completedPart,
@@ -849,10 +998,18 @@ export class AgentEngine {
   }
 
   private async withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+    let timer: NodeJS.Timeout | undefined;
     const timeout = new Promise<never>((_, reject) => {
-      setTimeout(() => reject(new Error(message)), timeoutMs);
+      timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+      timer.unref?.();
     });
-    return Promise.race([promise, timeout]);
+
+    return Promise.race([
+      promise.finally(() => {
+        if (timer) clearTimeout(timer);
+      }),
+      timeout,
+    ]);
   }
 
   private ensureToolResults(messages: Message[]): Message[] {
@@ -1444,7 +1601,9 @@ export async function createAgentEngine(params: {
       chat?: string;
       tools?: string;
       embeddings?: string;
+      summary?: string;
       subagent?: string;
+      parentForCli?: string;
     };
   };
   logger: Logger;

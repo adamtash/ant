@@ -18,6 +18,12 @@ export default defineConfig({
   resolve: {
     alias: {
       "@": "/src",
+      // Vite doesn't yet recognize Node's built-in `node:sqlite` in all environments.
+      // Alias the stripped specifier back to the built-in so tests can import memory modules.
+      sqlite: "node:sqlite",
     },
+  },
+  ssr: {
+    external: ["node:sqlite", "sqlite"],
   },
 });

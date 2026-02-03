@@ -63,7 +63,7 @@ interface SupervisorConfig {
 /**
  * Get default configuration based on command line arguments
  */
-function getDefaultConfig(): SupervisorConfig {
+export function getDefaultConfig(): SupervisorConfig {
   // Pass through all arguments after 'supervisor' command to the child
   const cliArgs = process.argv.slice(2);
 
@@ -97,6 +97,9 @@ class Supervisor {
   private shuttingDown = false;
   private watcher: FSWatcher | null = null;
   private restartFile: string;
+  private readonly sigintHandler = () => this.shutdown("SIGINT");
+  private readonly sigtermHandler = () => this.shutdown("SIGTERM");
+  private signalHandlersRegistered = false;
 
   constructor(config: Partial<SupervisorConfig> = {}) {
     const defaults = getDefaultConfig();
@@ -115,15 +118,17 @@ class Supervisor {
     // Ensure state directory exists
     await fs.mkdir(this.config.stateDir, { recursive: true });
 
-    // Set up signal handlers
-    process.on("SIGINT", () => this.shutdown("SIGINT"));
-    process.on("SIGTERM", () => this.shutdown("SIGTERM"));
+    this.registerSignalHandlers();
 
     // Start watching for restart file
     this.startWatching();
 
     // Start the main loop
-    await this.runLoop();
+    try {
+      await this.runLoop();
+    } finally {
+      this.unregisterSignalHandlers();
+    }
   }
 
   /**
@@ -157,6 +162,20 @@ class Supervisor {
       this.watcher.close();
       this.watcher = null;
     }
+  }
+
+  private registerSignalHandlers(): void {
+    if (this.signalHandlersRegistered) return;
+    process.on("SIGINT", this.sigintHandler);
+    process.on("SIGTERM", this.sigtermHandler);
+    this.signalHandlersRegistered = true;
+  }
+
+  private unregisterSignalHandlers(): void {
+    if (!this.signalHandlersRegistered) return;
+    process.off("SIGINT", this.sigintHandler);
+    process.off("SIGTERM", this.sigtermHandler);
+    this.signalHandlersRegistered = false;
   }
 
   /**
@@ -346,8 +365,8 @@ class Supervisor {
 /**
  * Parse command line arguments for supervisor-specific options
  */
-function parseArgs(): { config: Partial<SupervisorConfig>; help: boolean } {
-  const args = process.argv.slice(2);
+export function parseArgs(argv: string[] = process.argv.slice(2)): { config: Partial<SupervisorConfig>; help: boolean } {
+  const args = argv;
   const config: Partial<SupervisorConfig> = {};
   let help = false;
 
@@ -371,7 +390,7 @@ function parseArgs(): { config: Partial<SupervisorConfig>; help: boolean } {
 /**
  * Print help message
  */
-function printHelp(): void {
+export function printHelp(): void {
   console.log(`
 ANT Supervisor - Process supervisor for graceful restarts
 
@@ -399,16 +418,35 @@ Examples:
 `);
 }
 
-// Run supervisor if this is the main module
-const { config, help } = parseArgs();
+export { Supervisor };
 
-if (help) {
-  printHelp();
-  process.exit(0);
+function isMainModule(): boolean {
+  const entry = process.argv[1];
+  if (!entry) return false;
+  try {
+    return path.resolve(entry) === fileURLToPath(import.meta.url);
+  } catch {
+    return false;
+  }
 }
 
-const supervisor = new Supervisor(config);
-supervisor.start().catch((err) => {
-  console.error("[supervisor] Fatal error:", err);
-  process.exit(1);
-});
+export async function runSupervisorCli(argv: string[] = process.argv): Promise<void> {
+  const { config, help } = parseArgs(argv.slice(2));
+
+  if (help) {
+    printHelp();
+    process.exitCode = 0;
+    return;
+  }
+
+  const supervisor = new Supervisor(config);
+  await supervisor.start();
+}
+
+// Run supervisor only when invoked as an entrypoint script.
+if (isMainModule()) {
+  runSupervisorCli().catch((err) => {
+    console.error("[supervisor] Fatal error:", err);
+    process.exitCode = 1;
+  });
+}

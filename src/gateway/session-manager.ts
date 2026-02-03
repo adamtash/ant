@@ -29,6 +29,8 @@ export interface SessionMessage {
   role: "user" | "assistant" | "tool" | "system";
   content: string;
   timestamp: number;
+  channel?: Channel;
+  chatId?: string;
   toolCallId?: string;
   name?: string;
   providerId?: string;
@@ -41,6 +43,7 @@ export interface SessionMessage {
  */
 export class SessionManager {
   private sessions: Map<string, SessionContext> = new Map();
+  private appendQueue: Map<string, Promise<void>> = new Map();
   private readonly stateDir: string;
   private readonly logger: Logger;
   private readonly storage: StorageBackend;
@@ -172,25 +175,43 @@ export class SessionManager {
    * Append a message to session history
    */
   async appendMessage(sessionKey: string, message: SessionMessage): Promise<void> {
-    const session = this.sessions.get(sessionKey);
-    if (session) {
-      session.messageCount++;
-      session.lastActivityAt = Date.now();
-    }
+    const previous = this.appendQueue.get(sessionKey) ?? Promise.resolve();
 
-    const safeKey = this.getSafeSessionKey(sessionKey);
+    const next = previous
+      .catch(() => {
+        // Ensure a previous write failure doesn't block subsequent appends.
+      })
+      .then(async () => {
+        const session = this.sessions.get(sessionKey);
+        if (session) {
+          session.messageCount++;
+          session.lastActivityAt = Date.now();
+        }
+
+        const safeKey = this.getSafeSessionKey(sessionKey);
+
+        try {
+          await this.storage.appendJsonLine(["sessions", safeKey], {
+            ...message,
+            sessionKey,
+          });
+        } catch (err) {
+          this.logger.error(
+            { error: err instanceof Error ? err.message : String(err), sessionKey },
+            "Failed to append message to session"
+          );
+          throw err;
+        }
+      });
+
+    this.appendQueue.set(sessionKey, next);
 
     try {
-      await this.storage.appendJsonLine(["sessions", safeKey], {
-        ...message,
-        sessionKey,
-      });
-    } catch (err) {
-      this.logger.error(
-        { error: err instanceof Error ? err.message : String(err), sessionKey },
-        "Failed to append message to session"
-      );
-      throw err;
+      await next;
+    } finally {
+      if (this.appendQueue.get(sessionKey) === next) {
+        this.appendQueue.delete(sessionKey);
+      }
     }
   }
 
@@ -206,6 +227,8 @@ export class SessionManager {
         role: (parsed.role as SessionMessage["role"]) ?? "user",
         content: String(parsed.content ?? ""),
         timestamp: (parsed.timestamp as number) || (parsed.ts as number) || Date.now(),
+        channel: (parsed.channel as Channel | undefined) ?? undefined,
+        chatId: (parsed.chatId as string | undefined) ?? undefined,
         toolCallId: parsed.toolCallId as string | undefined,
         name: parsed.name as string | undefined,
         providerId: parsed.providerId as string | undefined,

@@ -233,6 +233,8 @@ export type CLIProviderType = "copilot" | "claude" | "codex" | "kimi";
 export interface ChatOptions {
   temperature?: number;
   maxTokens?: number;
+  /** Best-effort provider-side timeout (also enforced by engine timeouts). */
+  timeoutMs?: number;
   tools?: ToolDefinition[];
   toolChoice?: "auto" | "none" | { type: "function"; function: { name: string } };
   thinking?: {

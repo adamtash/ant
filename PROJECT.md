@@ -40,7 +40,7 @@ npm install
         "model": "zai-org/glm-4.7-flash",
         "embeddingsModel": "text-embedding-nomic-embed-text-v1.5"
       },
-      "codex-cli": {
+      "codex": {
         "type": "cli",
         "cliProvider": "codex",
         "model": "gpt-5.2-codex",
@@ -49,8 +49,8 @@ npm install
     }
   },
   "routing": {
-    "chat": "codex-cli",
-    "tools": "codex-cli",
+    "chat": "codex",
+    "tools": "codex",
     "embeddings": "lmstudio",
     "parentForCli": "lmstudio"
   },
@@ -225,7 +225,7 @@ If `startupRecipients` is empty, ant falls back to `ownerJids` or your own JID w
         "model": "zai-org/glm-4.7-flash",
         "embeddingsModel": "text-embedding-nomic-embed-text-v1.5"
       },
-      "codex-cli": {
+      "codex": {
         "type": "cli",
         "cliProvider": "codex",
         "model": "codex"
@@ -233,7 +233,7 @@ If `startupRecipients` is empty, ant falls back to `ownerJids` or your own JID w
     }
   },
   "routing": {
-    "chat": "codex-cli",
+    "chat": "codex",
     "tools": "lmstudio",
     "embeddings": "lmstudio",
     "parentForCli": "lmstudio"
@@ -450,11 +450,11 @@ If you want Codex/Copilot/Claude as the main model, keep an OpenAI provider for 
   "default": "lmstudio",
   "items": {
     "lmstudio": { "type": "openai", "baseUrl": "http://localhost:1234/v1", "model": "zai-org/glm-4.7-flash" },
-    "codex-cli": { "type": "cli", "cliProvider": "codex", "model": "codex" }
+    "codex": { "type": "cli", "cliProvider": "codex", "model": "codex" }
   }
 },
 "routing": {
-  "chat": "codex-cli",
+  "chat": "codex",
   "tools": "lmstudio",
   "embeddings": "lmstudio",
   "parentForCli": "lmstudio"

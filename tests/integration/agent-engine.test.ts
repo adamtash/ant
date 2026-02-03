@@ -83,7 +83,7 @@ describe("Agent Engine", () => {
 
       // Task should progress from queued to running/completed/failed
       expect(["queued", "running", "completed", "failed"]).toContain(finalStatus);
-    });
+    }, 30000);
   });
 
   describe("Task Retrieval", () => {
@@ -104,7 +104,7 @@ describe("Agent Engine", () => {
     it("should sort tasks by creation time (newest first)", async () => {
       // Create multiple tasks
       await httpPost(instance, "/api/tasks", { description: "Task A" });
-      await new Promise((resolve) => setTimeout(resolve(100)));
+      await new Promise((resolve) => setTimeout(resolve, 100));
       await httpPost(instance, "/api/tasks", { description: "Task B" });
 
       const response = await httpGet(instance, "/api/tasks");

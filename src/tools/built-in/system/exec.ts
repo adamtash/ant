@@ -39,7 +39,61 @@ export default defineTool({
       ? Math.min(args.timeoutMs, 300_000)
       : 60_000;
 
+    ctx.logger.info(
+      {
+        tool: "exec",
+        command,
+        args: argsList,
+        cwd,
+        timeoutMs,
+      },
+      "Exec command started"
+    );
+
+    if (shouldBlockDeletes()) {
+      const fullCommand = [command, ...argsList].join(" ").trim();
+      const violation = detectDeleteCommand(fullCommand);
+      if (violation) {
+        ctx.logger.warn(
+          { tool: "exec", fullCommand, reason: violation },
+          "Blocked potentially destructive exec command"
+        );
+        return { ok: false, error: `Blocked delete command in exec: ${violation}` };
+      }
+    }
+
     const result = await runCommand({ command, args: argsList, cwd, timeoutMs });
+
+    const stdoutPreview = result.stdout.length > 400 ? result.stdout.slice(0, 400) + "…(truncated)" : result.stdout;
+    const stderrPreview = result.stderr.length > 400 ? result.stderr.slice(0, 400) + "…(truncated)" : result.stderr;
+
+    if (result.ok) {
+      ctx.logger.info(
+        {
+          tool: "exec",
+          exitCode: result.exitCode,
+          timedOut: result.timedOut,
+          stdoutLength: result.stdout.length,
+          stderrLength: result.stderr.length,
+          stdoutPreview,
+          stderrPreview,
+        },
+        "Exec command completed"
+      );
+    } else {
+      ctx.logger.warn(
+        {
+          tool: "exec",
+          exitCode: result.exitCode,
+          timedOut: result.timedOut,
+          stdoutLength: result.stdout.length,
+          stderrLength: result.stderr.length,
+          stdoutPreview,
+          stderrPreview,
+        },
+        "Exec command failed"
+      );
+    }
 
     return {
       ok: result.ok,
@@ -48,7 +102,11 @@ export default defineTool({
         stderr: result.stderr,
         exitCode: result.exitCode,
       } : undefined,
-      error: result.ok ? undefined : result.stderr || "Command failed",
+      error: result.ok
+        ? undefined
+        : result.timedOut
+          ? `Command timed out after ${timeoutMs}ms`
+          : result.stderr || "Command failed",
       metadata: {
         timedOut: result.timedOut,
       },
@@ -130,4 +188,67 @@ function resolvePath(value: string, workspaceDir: string): string {
     return trimmed;
   }
   return path.resolve(workspaceDir, trimmed);
+}
+
+function shouldBlockDeletes(): boolean {
+  const value = (process.env.ANT_EXEC_BLOCK_DELETE || "").trim().toLowerCase();
+  return value === "1" || value === "true" || value === "yes";
+}
+
+function detectDeleteCommand(fullCommand: string): string | null {
+  const raw = fullCommand.trim();
+  if (!raw) return null;
+
+  const normalized = raw.toLowerCase();
+
+  // Common delete operations (Unix + Windows + PowerShell)
+  const deleteBins = [
+    /\brm\b/,
+    /\bunlink\b/,
+    /\brmdir\b/,
+    /\bdel\b/,
+    /\berase\b/,
+    /\btrash\b/,
+    /\bremove-item\b/,
+  ];
+  if (deleteBins.some((re) => re.test(normalized))) {
+    return "matched delete binary";
+  }
+
+  // find ... -delete
+  if (/\bfind\b/.test(normalized) && /\s-delete(\s|$)/.test(normalized)) {
+    return "matched find -delete";
+  }
+
+  // git clean (deletes untracked files)
+  if (/\bgit\b/.test(normalized) && /\bclean\b/.test(normalized) && /\s-(?:f|fd|xdf)(\s|$)/.test(normalized)) {
+    return "matched git clean";
+  }
+
+  // Common delete patterns via scripting languages (bypass rm/del)
+  const pythonDelete = [
+    /\bos\.remove\b/,
+    /\bos\.unlink\b/,
+    /\bshutil\.rmtree\b/,
+    /\bpathlib\.path\b.*\bunlink\b/,
+    /\bpathlib\.path\b.*\brmdir\b/,
+  ];
+  if (pythonDelete.some((re) => re.test(normalized))) {
+    return "matched python delete";
+  }
+
+  const nodeDelete = [
+    /\bfs\.\s*unlink\b/,
+    /\bfs\.\s*rm\b/,
+    /\bfs\.\s*rmdir\b/,
+    /\bfs\.\s*unlinksync\b/,
+    /\bfs\.\s*rmsync\b/,
+    /\bfs\.\s*rmdirsync\b/,
+    /\brimraf\b/,
+  ];
+  if (nodeDelete.some((re) => re.test(normalized))) {
+    return "matched node delete";
+  }
+
+  return null;
 }

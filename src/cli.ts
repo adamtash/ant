@@ -3,10 +3,10 @@
  *
  * This is the new unified CLI entry point that brings together all components.
  * It provides a discoverable, user-friendly interface to the ANT agent system.
- *
- * PROOF OF ACCESS: Modified by ANT agent at 2026-02-02T13:59:56.793Z
- * This comment demonstrates the agent has full read/write access to its own source code.
  */
+
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { Command } from "commander";
 import { loadConfig } from "./config.js";
@@ -35,9 +35,6 @@ import { scheduleRun } from "./cli/commands/schedule/run.js";
 import { scheduleRemove } from "./cli/commands/schedule/remove.js";
 
 // Import memory commands
-import { remember } from "./cli/commands/memory/remember.js";
-import { recall } from "./cli/commands/memory/recall.js";
-import { memoryExport } from "./cli/commands/memory/export.js";
 
 // Import monitoring commands
 import { logs } from "./cli/commands/monitoring/logs.js";
@@ -49,9 +46,9 @@ import { sessionsView } from "./cli/commands/sessions/view.js";
 import { sessionsClear } from "./cli/commands/sessions/clear.js";
 
 // Import diagnostics commands
-import { testAll, endpoints, agentHealth, whatsapp } from "./cli/commands/diagnostics/index.js";
+import { testAll, endpoints, agentHealth, whatsapp, harness, e2e } from "./cli/commands/diagnostics/index.js";
 
-const program = new Command();
+export const program = new Command();
 const out = new OutputFormatter();
 
 program
@@ -215,6 +212,7 @@ program
   .option("--category <category>", "Category for the note")
   .action(async (note, options, cmd) => {
     const cfg = await loadConfig(cmd.optsWithGlobals().config);
+    const { remember } = await import("./cli/commands/memory/remember.js");
     await handleError(() => remember(cfg, note, options));
   });
 
@@ -226,6 +224,7 @@ program
   .option("--json", "Output as JSON")
   .action(async (query, options, cmd) => {
     const cfg = await loadConfig(cmd.optsWithGlobals().config);
+    const { recall } = await import("./cli/commands/memory/recall.js");
     await handleError(() => recall(cfg, query, options));
   });
 
@@ -235,6 +234,7 @@ program
   .option("-o, --output <path>", "Output file path")
   .action(async (options, cmd) => {
     const cfg = await loadConfig(cmd.optsWithGlobals().config);
+    const { memoryExport } = await import("./cli/commands/memory/export.js");
     await handleError(() => memoryExport(cfg, options));
   });
 
@@ -481,11 +481,69 @@ diagnostics
     await handleError(() => whatsapp(cfg, options));
   });
 
+diagnostics
+  .command("harness")
+  .description("Run a programmatic harness scenario (WhatsApp simulation)")
+  .requiredOption("-m, --message <text>", "Inbound message text to inject")
+  .option("--mode <mode>", "Harness mode: in_process or child_process", "child_process")
+  .option("--chat-id <jid>", "Inbound chat ID (defaults to self JID)")
+  .option("--self-jid <jid>", "Test self JID (for respondToSelfOnly)")
+  .option("-t, --timeout <ms>", "Wait timeout in milliseconds", "60000")
+  .option("--workspace-dir <path>", "Workspace dir override (defaults to current dir)")
+  .option("--enable-memory", "Enable memory for the run", false)
+  .option("--enable-main-agent", "Enable main agent for the run", false)
+  .option("--enable-scheduler", "Enable scheduler for the run", false)
+  .option("--launch-target <target>", "Runtime target: src (tsx) or dist", "src")
+  .option("--no-block-exec-deletes", "Allow delete-like commands in exec tool")
+  .option("--cleanup", "Remove temp run directory after completion", false)
+  .option("--json", "Output JSON report")
+  .action(async (options, cmd) => {
+    const cfg = await loadConfig(cmd.optsWithGlobals().config);
+    await handleError(() => harness(cfg, options));
+  });
+
+diagnostics
+  .command("e2e")
+  .description("Run a multi-scenario end-to-end harness (WhatsApp simulation)")
+  .option("--mode <mode>", "Harness mode: in_process or child_process", "child_process")
+  .option("--chat-id <jid>", "Inbound chat ID (defaults to self JID)")
+  .option("--self-jid <jid>", "Test self JID (for respondToSelfOnly)")
+  .option("-t, --timeout <ms>", "Wait timeout per scenario in milliseconds", "120000")
+  .option("--workspace-dir <path>", "Workspace dir override (defaults to a temp dir)")
+  .option("--enable-memory", "Enable memory for the run", false)
+  .option("--enable-main-agent", "Enable main agent for the run", false)
+  .option("--enable-scheduler", "Enable scheduler for the run", false)
+  .option("--launch-target <target>", "Runtime target: src (tsx) or dist", "src")
+  .option("--no-block-exec-deletes", "Allow delete-like commands in exec tool")
+  .option("--cleanup", "Remove temp run directory after completion", false)
+  .option("--json", "Output JSON report")
+  .action(async (options, cmd) => {
+    const cfg = await loadConfig(cmd.optsWithGlobals().config);
+    await handleError(() => e2e(cfg, options));
+  });
+
 // =============================================================================
 // PARSE AND RUN
 // =============================================================================
 
-program.parseAsync(process.argv).catch((err) => {
-  out.error(err instanceof Error ? err.message : String(err));
-  process.exitCode = 1;
-});
+function isMainModule(): boolean {
+  const entry = process.argv[1];
+  if (!entry) return false;
+  try {
+    return path.resolve(entry) === fileURLToPath(import.meta.url);
+  } catch {
+    return false;
+  }
+}
+
+export async function runCli(argv: string[] = process.argv): Promise<void> {
+  await program.parseAsync(argv).catch((err) => {
+    out.error(err instanceof Error ? err.message : String(err));
+    process.exitCode = 1;
+  });
+}
+
+// Only parse argv when invoked as an entrypoint script.
+if (isMainModule()) {
+  void runCli();
+}

@@ -49,6 +49,12 @@ export function resetAgentRunContextForTest(): void {
   runContextById.clear();
 }
 
+export function resetAgentEventsForTest(): void {
+  seqByRun.clear();
+  listeners.clear();
+  runContextById.clear();
+}
+
 export function emitAgentEvent(event: Omit<AgentEventPayload, "seq" | "ts">): void {
   const nextSeq = (seqByRun.get(event.runId) ?? 0) + 1;
   seqByRun.set(event.runId, nextSeq);

@@ -98,3 +98,15 @@ function notifyRunEnded(runId: string): void {
     waiter.resolve(true);
   }
 }
+
+export function resetActiveRunsForTest(): void {
+  ACTIVE_RUNS.clear();
+  ACTIVE_RUNS_BY_SESSION.clear();
+  for (const waiters of RUN_WAITERS.values()) {
+    for (const waiter of waiters) {
+      clearTimeout(waiter.timer);
+      waiter.resolve(true);
+    }
+  }
+  RUN_WAITERS.clear();
+}

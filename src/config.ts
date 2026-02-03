@@ -51,18 +51,26 @@ const ProvidersSchema = z.object({
 
 type ProvidersOutput = z.infer<typeof ProvidersSchema>;
 
-const RoutingSchema = z
+const RoutingTierSchema = z
   .object({
-    chat: z.string().optional(),
-    tools: z.string().optional(),
-    embeddings: z.string().optional(),
-    summary: z.string().optional(),
-    subagent: z.string().optional(),
-    parentForCli: z.string().optional(),
+    provider: z.string().min(1),
+    model: z.string().min(1).optional(),
+    maxLatencyMs: z.number().int().positive().optional(),
+    fallbackFromFast: z.boolean().optional(),
+  })
+  .strict();
+
+const RoutingTiersSchema = z
+  .object({
+    fast: RoutingTierSchema.optional(),
+    quality: RoutingTierSchema.optional(),
+    background: RoutingTierSchema.optional(),
+    backgroundImportant: RoutingTierSchema.optional(),
+    embeddings: RoutingTierSchema.optional(),
+    summarizer: RoutingTierSchema.optional(),
+    maintenance: RoutingTierSchema.optional(),
   })
   .default({});
-
-type RoutingOutput = z.infer<typeof RoutingSchema>;
 
 const WhatsAppSchema = z.object({
   sessionDir: z.string().min(1),
@@ -162,6 +170,20 @@ const MemorySchema = z.object({
     })
     .default({}),
 });
+
+const RoutingSchema = z
+  .object({
+    chat: z.string().optional(),
+    tools: z.string().optional(),
+    embeddings: z.string().optional(),
+    summary: z.string().optional(),
+    subagent: z.string().optional(),
+    parentForCli: z.string().optional(),
+    tiers: RoutingTiersSchema.optional(),
+  })
+  .default({});
+
+type RoutingOutput = z.infer<typeof RoutingSchema>;
 
 const AgentSchema = z.object({
   systemPrompt: z.string().optional(),
@@ -270,6 +292,25 @@ const GatewaySchema = z.object({
   port: z.number().int().positive().default(18789),
   host: z.string().min(1).default("127.0.0.1"),
 });
+
+const SchedulerSchema = z
+  .object({
+    enabled: z.boolean().default(false),
+    storePath: z.string().min(1).optional(),
+    timezone: z.string().min(1).default("UTC"),
+  })
+  .default({});
+
+const MonitoringSchema = z
+  .object({
+    enabled: z.boolean().default(true),
+    retentionDays: z.number().int().positive().default(30),
+    alertChannels: z
+      .array(z.enum(["console", "file", "whatsapp", "webhook"]))
+      .default(["console"]),
+    criticalErrorThreshold: z.number().int().positive().default(10),
+  })
+  .default({});
 
 const CliToolProviderSchema = z.object({
   command: z.string().min(1),
@@ -398,6 +439,8 @@ const ConfigSchema = z.object({
   agentExecution: AgentExecutionSchema.default({}),
   gateway: GatewaySchema.default({}),
   cliTools: CliToolsSchema.default({}),
+  scheduler: SchedulerSchema.default({}),
+  monitoring: MonitoringSchema.default({}),
   queue: QueueSchema.default({}),
   logging: LoggingSchema.default({}),
   runtime: RuntimeSchema.default({}),

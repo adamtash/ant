@@ -1,7 +1,7 @@
 {
   "workspaceDir": "~",
   "providers": {
-    "default": "copilot",
+    "default": "codex",
     "items": {
       "lmstudio": {
         "type": "openai",
@@ -10,11 +10,11 @@
         "model": "zai-org/glm-4.7-flash",
         "embeddingsModel": "text-embedding-nomic-embed-text-v1.5"
       },
-      "codex-cli": {
+      "codex": {
         "type": "cli",
         "cliProvider": "codex",
         "model": "gpt-5.2-codex",
-         "args": [
+        "args": [
           "exec",
           "--output-last-message",
           "{output}",
@@ -28,7 +28,7 @@
         "type": "cli",
         "cliProvider": "copilot",
         "model": "gpt-5-mini",
-         "args": [
+        "args": [
           "--yolo",
           "--no-ask-user",
           "--silent",
@@ -41,20 +41,24 @@
         "cliProvider": "kimi",
         "model": "kimi-k2",
         "command": "kimi",
-        "args": ["--yolo"],
+        "args": [
+          "--yolo"
+        ],
         "timeoutMs": 1200000
       }
     },
-    "fallbackChain": ["copilot", "codex-cli"]
+    "fallbackChain": [
+      "copilot",
+      "kimi",
+      "lmstudio"
+    ]
   },
-
   "routing": {
-    "chat": "copilot",
-    "tools": "copilot",
+    "chat": "codex",
+    "tools": "codex",
     "embeddings": "lmstudio",
-    "parentForCli": "copilot"
+    "parentForCli": "codex"
   },
-
   "ui": {
     "enabled": true,
     "host": "127.0.0.1",
@@ -110,7 +114,9 @@
       },
       "kimi": {
         "command": "kimi",
-        "args": ["--yolo"]
+        "args": [
+          "--yolo"
+        ]
       }
     }
   },
@@ -122,7 +128,9 @@
   "monitoring": {
     "enabled": true,
     "retentionDays": 30,
-    "alertChannels": ["whatsapp"],
+    "alertChannels": [
+      "whatsapp"
+    ],
     "criticalErrorThreshold": 5
   },
   "gateway": {

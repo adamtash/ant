@@ -108,6 +108,17 @@ This file tracks recurring issues and their solutions for autonomous fixing by t
 **Fixed**: true (fixed in tests/unit/agent/engine.test.ts)
 **Auto-Fixable**: true
 
+## Issue ID: CODEX-USAGE-LIMIT
+**Description**: Codex CLI fails with usage_limit_reached or HTTP 429.
+**Pattern**: "usage_limit_reached" or "You've hit your usage limit" or "http 429 Too Many Requests"
+**Root Cause**: OpenAI/Codex usage quota exceeded for the configured account.
+**Solution**:
+1. Switch routing to another provider (copilot/kimi/lmstudio) for scheduled jobs.
+2. Wait for quota reset time or request a limit increase from admin.
+3. Consider short-circuiting codex provider when this pattern appears.
+**Fixed**: false
+**Auto-Fixable**: false (requires quota or routing change)
+
 ---
 
 ## Open Issues (Not Yet Fixed)
@@ -143,3 +154,22 @@ This file tracks recurring issues and their solutions for autonomous fixing by t
 2. Optionally downgrade or suppress warnings for system-only sessions.
 **Fixed**: false
 **Auto-Fixable**: false
+
+## Issue ID: CONFIG-ROUTING-DUPLICATE
+**Description**: TypeScript build fails due to duplicate RoutingSchema/RoutingOutput declarations.
+**Pattern**: "Cannot redeclare block-scoped variable 'RoutingSchema'" or "Duplicate identifier 'RoutingOutput'"
+**Root Cause**: Routing schema defined twice in src/config.ts.
+**Solution**:
+1. Remove the earlier duplicate RoutingSchema/RoutingOutput block.
+2. Rebuild to confirm.
+**Fixed**: true
+**Auto-Fixable**: true
+
+## Issue ID: SESSION-NOT-FOUND-SYSTEM-QUIET
+**Description**: Session-not-found warnings for system/cron session keys without channel context.
+**Pattern**: "Session not found and could not be recovered" for sessionKey starting with cron:/agent:/subagent:/system:
+**Root Cause**: System sessions lack channel/type/chatId for recovery.
+**Solution**: Skip send attempts for system-only session keys; avoid warning/error emission.
+**Fixed**: true
+**Auto-Fixable**: true
+
