@@ -778,7 +778,7 @@ export class GatewayServer {
     // ============================================
     
     // GET /api/channels
-    app.get("/api/channels", (req, res) => {
+    app.get("/api/channels", async (_req, res) => {
       const channels: Array<{
         id: string;
         status: {
@@ -824,6 +824,53 @@ export class GatewayServer {
           status: {
             connected: this.connections.size > 0,
             activeUsers: this.connections.size,
+            responseTime: 0,
+            errorRate: 0,
+          },
+        });
+      }
+
+      // Add Telegram placeholder even when adapter isn't running, so the UI can show setup instructions.
+      if (!channels.find((c) => c.id === "telegram")) {
+        let enabled = false;
+        let configured = false;
+        let mode = "polling";
+        let dmPolicy = "pairing";
+        let webhookPath = "/api/telegram/webhook";
+
+        if (this.config.configPath) {
+          try {
+            const cfg = await loadConfig(this.config.configPath);
+            enabled = Boolean(cfg.telegram?.enabled);
+            configured = Boolean(cfg.telegram?.botToken?.trim());
+            mode = (cfg.telegram?.mode ?? "polling") as string;
+            dmPolicy = (cfg.telegram?.dmPolicy ?? "pairing") as string;
+            webhookPath = (cfg.telegram?.webhook?.path ?? "/api/telegram/webhook") as string;
+          } catch {
+            // ignore config read errors for this endpoint
+          }
+        }
+
+        const setupMessage = [
+          "Telegram setup:",
+          "1) Create a bot via @BotFather (/newbot) and copy the token",
+          "2) Add to ant.config.json:",
+          '   \"telegram\": { \"enabled\": true, \"botToken\": \"<token>\", \"dmPolicy\": \"pairing\", \"mode\": \"polling\" }',
+          "3) Restart ant",
+          "4) In Telegram, open the bot and send /pair",
+          "5) Approve the pairing code in the ANT UI: Tunnels -> Telegram -> Pairing",
+        ].join("\n");
+
+        channels.push({
+          id: "telegram",
+          status: {
+            connected: false,
+            enabled,
+            configured,
+            mode,
+            dmPolicy,
+            webhookPath,
+            message: setupMessage,
             responseTime: 0,
             errorRate: 0,
           },
