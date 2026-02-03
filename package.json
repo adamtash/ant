@@ -19,7 +19,14 @@
     "test": "vitest",
     "test:run": "vitest run",
     "ui:dev": "npm --prefix ui run dev",
-    "ui:build": "npm --prefix ui run build"
+    "ui:build": "npm --prefix ui run build",
+    "docker:build": "docker build -t ant-cli:latest -f Dockerfile.prod .",
+    "docker:build:watchdog": "docker build -t ant-watchdog:latest -f Dockerfile.watchdog .",
+    "docker:up": "docker compose up -d",
+    "docker:down": "docker compose down",
+    "docker:logs": "docker compose logs -f",
+    "docker:restart": "docker compose restart ant",
+    "docker:shell": "docker compose exec ant sh"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",

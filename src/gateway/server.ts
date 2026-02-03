@@ -118,6 +118,7 @@ export class GatewayServer {
   private events = createEventPublishers(this.eventStream);
   private providerHealthTracker: ProviderHealthTracker;
   private agentEventUnsubscribe?: () => void;
+  private configReloadHandler?: (params: { changes?: Record<string, unknown>; dryRun?: boolean }) => Promise<Record<string, unknown>>;
   private eventStreamUnsubscribe?: () => void;
 
   /** Status broadcast state */
@@ -153,6 +154,12 @@ export class GatewayServer {
     this.providerHealthTracker.connectToStream(this.eventStream);
     this.setupPersistence();
     this.setupErrorTracking();
+  }
+
+  setConfigReloadHandler(
+    handler: (params: { changes?: Record<string, unknown>; dryRun?: boolean }) => Promise<Record<string, unknown>>
+  ): void {
+    this.configReloadHandler = handler;
   }
 
   private isTestApiEnabled(): boolean {
@@ -448,6 +455,13 @@ export class GatewayServer {
       });
     });
 
+    // Session tool parts
+    app.get("/api/sessions/:key/tool-parts", async (req, res) => {
+      const key = req.params.key;
+      const toolParts = await this.sessions.listToolParts(key);
+      res.json({ ok: true, sessionKey: key, toolParts });
+    });
+
     // Config (Basic)
     app.get("/api/config", async (req, res) => {
       try {
@@ -463,6 +477,37 @@ export class GatewayServer {
     });
 
     app.post("/api/config", async (req, res) => {
+        if (this.configReloadHandler) {
+          try {
+            const body: unknown = req.body;
+            const isObj = body && typeof body === "object" && !Array.isArray(body);
+            const hasReloadDirective =
+              isObj &&
+              ("changes" in (body as Record<string, unknown>) || "dryRun" in (body as Record<string, unknown>));
+            if (!hasReloadDirective) {
+              // Backward compatible behavior: save config but do not apply hot reload automatically.
+              throw new Error("skip_handler");
+            }
+            const dryRun =
+              isObj && "dryRun" in (body as Record<string, unknown>)
+                ? Boolean((body as Record<string, unknown>).dryRun)
+                : false;
+            const changes =
+              isObj && "changes" in (body as Record<string, unknown>) && (body as any).changes && typeof (body as any).changes === "object"
+                ? ((body as any).changes as Record<string, unknown>)
+                : (isObj ? (body as Record<string, unknown>) : undefined);
+            const result = await this.configReloadHandler({ changes, dryRun });
+            res.json(result);
+          } catch (err) {
+            if (err instanceof Error && err.message === "skip_handler") {
+              // Fall through to legacy save behavior below.
+            } else {
+              res.status(400).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
+              return;
+            }
+          }
+        }
+
         try {
             const current = await loadConfig(this.config.configPath);
             const merged: Record<string, unknown> = { ...current, ...req.body };
@@ -474,6 +519,19 @@ export class GatewayServer {
         } catch (err) {
             res.status(400).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
         }
+    });
+
+    app.post("/api/config/reload", async (req, res) => {
+      if (!this.configReloadHandler) {
+        res.status(501).json({ ok: false, error: "Config reload handler not available" });
+        return;
+      }
+      try {
+        const result = await this.configReloadHandler({ dryRun: false });
+        res.json(result);
+      } catch (err) {
+        res.status(500).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
+      }
     });
 
     // ============================================
@@ -1090,6 +1148,46 @@ export class GatewayServer {
     // ============================================
     // Health Endpoint
     // ============================================
+    app.get("/health", (req, res) => {
+      res.status(200).send("OK");
+    });
+
+    app.get("/ready", async (req, res) => {
+      const whatsappAdapter = this.router?.getAdapter("whatsapp") as any;
+      const whatsappReady =
+        whatsappAdapter && typeof whatsappAdapter.isConnected === "function"
+          ? Boolean(whatsappAdapter.isConnected())
+          : true;
+
+      const memoryReady = this.memoryManager ? this.memoryManager.isReady?.() ?? true : true;
+
+      let providersReady = true;
+      if (this.agentEngine) {
+        try {
+          const timeoutMs = 2500;
+          providersReady = await Promise.race([
+            this.agentEngine.hasHealthyProvider(),
+            new Promise<boolean>((resolve) => {
+              const timer = setTimeout(() => resolve(false), timeoutMs);
+              timer.unref?.();
+            }),
+          ]);
+        } catch {
+          providersReady = false;
+        }
+      } else {
+        providersReady = false;
+      }
+
+      const checks = {
+        whatsapp: whatsappReady,
+        memory: memoryReady,
+        providers: providersReady,
+      };
+      const allReady = Object.values(checks).every(Boolean);
+      res.status(allReady ? 200 : 503).json({ ok: allReady, checks });
+    });
+
     app.get("/api/health", (req, res) => {
       const memUsage = process.memoryUsage();
       const totalMem = os.totalmem();
@@ -1225,13 +1323,13 @@ export class GatewayServer {
       }
       
       try {
-        // Get stats from skill registry or estimate from memory system
+        const rawStats = this.memoryManager.getMemoryStats();
         const stats = {
-          enabled: true,
-          fileCount: 0, // Would need to get from SQLite store
+          enabled: rawStats.enabled,
           lastRunAt: Date.now(),
-          categories: {} as Record<string, number>,
-          totalSize: 0,
+          fileCount: rawStats.fileCount,
+          totalSize: rawStats.totalTextBytes,
+          categories: rawStats.categories,
         };
         
         res.json({ ok: true, stats });
@@ -1265,13 +1363,13 @@ export class GatewayServer {
           id: r.chunkId || `${r.path}#${r.startLine}`,
           content: r.snippet,
           type: r.source === "sessions" ? "session" : "indexed" as const,
-          category: r.source,
+          category: r.category ?? r.source,
           tags: [],
           searchScore: r.score,
-          createdAt: Date.now(),
-          updatedAt: Date.now(),
-          accessCount: 0,
-          references: [],
+          createdAt: r.lastAccessedAt ?? Date.now(),
+          updatedAt: r.lastAccessedAt ?? Date.now(),
+          accessCount: r.accessCount ?? 0,
+          references: [`${r.path}:${r.startLine}`],
         }));
         
         res.json({ ok: true, results: memories, query });
@@ -1291,8 +1389,26 @@ export class GatewayServer {
       }
       
       try {
-        // Return empty for now - full index listing would need store support
-        res.json({ ok: true, memories: [], total: 0 });
+        const limit = Math.min(Math.max(parseInt(req.query.limit as string) || 200, 1), 1000);
+        const offset = Math.max(parseInt(req.query.offset as string) || 0, 0);
+        const category = typeof req.query.category === "string" ? req.query.category : undefined;
+        const source = typeof req.query.source === "string" ? req.query.source : undefined;
+
+        const chunks = this.memoryManager.listMemoryChunks({ limit, offset, category, source: source as any });
+
+        const memories = chunks.map((chunk) => ({
+          id: chunk.id,
+          content: chunk.text,
+          type: chunk.source === "sessions" ? "session" : ("indexed" as const),
+          category: (chunk.category as string) ?? chunk.source,
+          tags: chunk.priority ? [`p${chunk.priority}`] : [],
+          createdAt: chunk.indexedAt,
+          updatedAt: chunk.indexedAt,
+          accessCount: chunk.accessCount ?? 0,
+          references: [`${chunk.path}:${chunk.startLine}-${chunk.endLine}`],
+        }));
+
+        res.json({ ok: true, memories, total: memories.length });
       } catch (err) {
         res.status(500).json({ 
           ok: false, 
@@ -1316,7 +1432,11 @@ export class GatewayServer {
       }
       
       try {
-        await this.memoryManager.update(content);
+        const formatted = typeof category === "string" && category.trim()
+          ? `[${category.trim()}]\n${String(content)}`
+          : String(content);
+
+        await this.memoryManager.update(formatted);
         
         res.json({ 
           ok: true, 
@@ -1830,6 +1950,26 @@ export class GatewayServer {
           error: err instanceof Error ? err.message : String(err) 
         });
       }
+    });
+
+    app.post("/api/main-agent/pause", (_req, res) => {
+      if (!this.mainAgent) {
+        res.status(503).json({ ok: false, error: "Main Agent not available" });
+        return;
+      }
+      this.mainAgent.pause();
+      this.setMainAgentRunning(false);
+      res.json({ ok: true });
+    });
+
+    app.post("/api/main-agent/resume", (_req, res) => {
+      if (!this.mainAgent) {
+        res.status(503).json({ ok: false, error: "Main Agent not available" });
+        return;
+      }
+      this.mainAgent.resume();
+      this.setMainAgentRunning(true);
+      res.json({ ok: true });
     });
   }
 

@@ -89,6 +89,8 @@
   },
   "agent": {
     "systemPrompt": "",
+    "maxToolIterations": 500,
+    "maxHistoryTokens": 20000,
     "toolLoop": {
       "timeoutPerIterationMs": 1200000
     }

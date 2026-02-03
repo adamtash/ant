@@ -5,11 +5,13 @@
 
 import React, { useEffect, useState, useCallback } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
+import { useNavigate } from 'react-router-dom';
 import { Card, Badge, Button, Input, Skeleton } from '../components/base';
 import { getStatus, createTask } from '../api/client';
 import type { MainTaskStatus } from '../api/types';
 
 export const ForagingGrounds: React.FC = () => {
+  const navigate = useNavigate();
   const [tasks, setTasks] = useState<MainTaskStatus[]>([]);
   const [loading, setLoading] = useState(true);
   const [newTaskPrompt, setNewTaskPrompt] = useState('');
@@ -67,6 +69,11 @@ export const ForagingGrounds: React.FC = () => {
     if (seconds < 60) return `${seconds}s`;
     const minutes = Math.floor(seconds / 60);
     return `${minutes}m ${seconds % 60}s`;
+  };
+
+  const openTask = (taskId?: string) => {
+    if (!taskId) return;
+    navigate(`/tasks/${encodeURIComponent(taskId)}`);
   };
 
   if (loading) {
@@ -140,7 +147,7 @@ export const ForagingGrounds: React.FC = () => {
                   exit={{ opacity: 0, x: -20 }}
                   transition={{ delay: i * 0.05 }}
                 >
-                  <Card hoverable className="group">
+                  <Card hoverable className="group" onClick={() => openTask(task.chatId)}>
                     <div className="flex items-start justify-between">
                       <div className="flex-1 min-w-0">
                         <div className="flex items-center gap-2 mb-2">
@@ -163,6 +170,20 @@ export const ForagingGrounds: React.FC = () => {
                       </div>
                       <div className="ml-4">
                         {getStatusBadge(task.status)}
+                        {task.chatId && (
+                          <div className="mt-2">
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                openTask(task.chatId);
+                              }}
+                            >
+                              Details
+                            </Button>
+                          </div>
+                        )}
                       </div>
                     </div>
 

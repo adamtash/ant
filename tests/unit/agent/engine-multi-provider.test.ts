@@ -45,9 +45,11 @@ function makeProviderManager(providers: Record<string, any>, routing: Record<str
 
   const getProviderById = vi.fn((id: string) => providers[id]);
   const getPrioritizedProviderIds = vi.fn((primary: string) => [primary]);
+  const getTierConfig = vi.fn(() => undefined);
 
   return {
     selectBestProvider,
+    getTierConfig,
     getProviderById,
     getPrioritizedProviderIds,
     getProviderIds: vi.fn(() => Object.keys(providers)),
@@ -153,8 +155,8 @@ describe("AgentEngine multi-provider behavior", () => {
 
     const result = await engine.execute(input);
 
-    expect(pm.selectBestProvider).toHaveBeenCalledWith("chat");
-    expect(pm.selectBestProvider).toHaveBeenCalledWith("parentForCli");
+    expect(pm.selectBestProvider).toHaveBeenCalledWith("chat", expect.any(Object));
+    expect(pm.selectBestProvider).toHaveBeenCalledWith("parentForCli", expect.any(Object));
     expect(parentOpenai.chat).toHaveBeenCalledTimes(1);
     expect(chatCli.chat).toHaveBeenCalledTimes(0);
     expect(result.response).toBe("TOOL RUNNER ANSWER");

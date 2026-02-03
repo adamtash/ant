@@ -5,6 +5,7 @@
 
 import React, { useEffect, useState } from 'react';
 import { motion } from 'framer-motion';
+import { useNavigate } from 'react-router-dom';
 import { useColonyStore } from '../stores/colonyStore';
 import { useSystemStore } from '../stores/systemStore';
 import { useUIStore } from '../stores/uiStore';
@@ -511,6 +512,7 @@ const SceneControls: React.FC = () => {
 // ============================================
 
 export const RoyalChamber: React.FC = () => {
+  const navigate = useNavigate();
   const [status, setStatus] = useState<StatusResponse | null>(null);
   const [providers, setProviders] = useState<ProviderHealthData[]>([]);
   const [loading, setLoading] = useState(true);
@@ -680,6 +682,37 @@ export const RoyalChamber: React.FC = () => {
           />
 
           <ThreatMeter errorRate={errorRate} recentErrors={totalErrors} />
+
+          <Card>
+            <div className="flex items-center justify-between mb-3">
+              <h3 className="text-lg font-semibold text-white">Active Task</h3>
+              <Badge variant="default">{status?.running?.length ?? 0}</Badge>
+            </div>
+            {status?.running && status.running.length > 0 ? (
+              <div className="space-y-2">
+                <div className="text-sm text-white font-medium line-clamp-2">
+                  {status.running[0]?.text ?? 'Task'}
+                </div>
+                <div className="flex items-center justify-between text-xs text-gray-500">
+                  <span className="truncate">{status.running[0]?.chatId ?? status.running[0]?.sessionKey}</span>
+                  <Badge variant="queen" dot pulse>
+                    {status.running[0]?.status ?? 'running'}
+                  </Badge>
+                </div>
+                {status.running[0]?.chatId && (
+                  <Button
+                    variant="secondary"
+                    size="sm"
+                    onClick={() => navigate(`/tasks/${encodeURIComponent(status.running[0]!.chatId!)}`)}
+                  >
+                    View Details
+                  </Button>
+                )}
+              </div>
+            ) : (
+              <div className="text-sm text-gray-500">No active tasks.</div>
+            )}
+          </Card>
 
           <WorkerGrid workers={status?.subagents ?? []} />
 

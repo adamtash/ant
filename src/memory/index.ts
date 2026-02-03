@@ -13,6 +13,8 @@ export { MemoryManager, type MemorySearchResult } from "./manager.js";
 
 // SQLite store
 export { SqliteStore } from "./sqlite-store.js";
+export { categorizeMemoryText } from "./categorizer.js";
+export { pruneMemory } from "./pruner.js";
 
 // Embeddings
 export {
@@ -49,6 +51,7 @@ export type {
   EmbeddingProviderConfig,
   FileSyncState,
   FileWatcherEvent,
+  MemoryCategory,
   MemoryChunk,
   MemoryConfig,
   MemorySource,

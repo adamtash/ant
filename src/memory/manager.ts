@@ -60,6 +60,7 @@ export class MemoryManager {
   private fileWatcher?: FileWatcher;
   private sessionUpdateTimer?: NodeJS.Timeout;
   private progressCallback?: MemoryProgressCallback;
+  private started = false;
 
   // Session delta tracking for incremental indexing
   private sessionDeltas = new Map<
@@ -129,7 +130,10 @@ export class MemoryManager {
    * Start the memory system
    */
   async start(): Promise<void> {
-    if (!this.cfg.memory.enabled) return;
+    if (!this.cfg.memory.enabled) {
+      this.started = true;
+      return;
+    }
 
     try {
       // Start file watcher if enabled
@@ -148,8 +152,10 @@ export class MemoryManager {
       if (this.cfg.memory.sync.onSessionStart) {
         await this.indexAll();
       }
+      this.started = true;
     } catch (err) {
       console.warn("Memory system startup warning:", err);
+      this.started = false;
       // Don't fail - memory is optional
     }
   }
@@ -163,6 +169,16 @@ export class MemoryManager {
       clearTimeout(this.sessionUpdateTimer);
     }
     this.store.close();
+    this.started = false;
+  }
+
+  applyQueryHotReload(next: AntConfig["memory"]["query"]): void {
+    this.cfg.memory.query = next;
+  }
+
+  isReady(): boolean {
+    if (!this.cfg.memory.enabled) return true;
+    return this.started;
   }
 
   /**
@@ -234,7 +250,7 @@ export class MemoryManager {
         score: r.score,
         snippet: r.snippet,
         source: r.source as "memory" | "sessions",
-        chunkId: `${r.path}#${r.startLine}`,
+        chunkId: r.id,
       }));
   }
 
@@ -261,6 +277,8 @@ export class MemoryManager {
         sources
       );
 
+      this.store.markChunksAccessed(storeResults.map((r) => r.chunk.id));
+
       return storeResults.map((r) => ({
         path: r.chunk.path,
         startLine: r.chunk.startLine,
@@ -269,6 +287,10 @@ export class MemoryManager {
         snippet: r.chunk.text.slice(0, 700),
         source: r.chunk.source,
         chunkId: r.chunk.id,
+        category: r.chunk.category,
+        priority: r.chunk.priority,
+        accessCount: r.chunk.accessCount,
+        lastAccessedAt: r.chunk.lastAccessedAt,
       }));
     } catch (err) {
       console.warn("Vector search failed:", err);
@@ -310,6 +332,8 @@ export class MemoryManager {
             sources.includes(r.source as "memory" | "sessions")
           )
         : results;
+
+      this.store.markChunksAccessed(filtered.map((r) => r.id));
 
       return filtered;
     } catch (err) {
@@ -533,6 +557,30 @@ export class MemoryManager {
   private async syncIfNeeded(reason: string): Promise<void> {
     // This would check timestamps and sync only if needed
     // For now, minimal implementation
+  }
+
+  getMemoryStats(): {
+    enabled: boolean;
+    fileCount: number;
+    chunkCount: number;
+    totalTextBytes: number;
+    categories: Record<string, number>;
+  } {
+    if (!this.cfg.memory.enabled) {
+      return { enabled: false, fileCount: 0, chunkCount: 0, totalTextBytes: 0, categories: {} };
+    }
+    const stats = this.store.getMemoryStats();
+    return { enabled: true, ...stats };
+  }
+
+  listMemoryChunks(params?: {
+    limit?: number;
+    offset?: number;
+    category?: string;
+    source?: "memory" | "sessions" | "short-term";
+  }) {
+    if (!this.cfg.memory.enabled) return [];
+    return this.store.listChunks(params);
   }
 
   /**

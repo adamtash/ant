@@ -25,6 +25,8 @@ import type {
   ProviderConfig,
 } from "./types.js";
 import type { Logger } from "../log.js";
+import type { RoutingTierName } from "../routing/tier-resolver.js";
+import { prioritizeProviderCandidates, type ProviderPriorityGroup } from "../routing/provider-priority.js";
 
 // ============================================================================
 // Failover Error Handling
@@ -142,6 +144,29 @@ function shouldDisableProviderTools(): boolean {
   return false;
 }
 
+function parseEnvVarReference(value: string): string | null {
+  const raw = value.trim();
+  if (!raw) return null;
+  if (/^\$[A-Z0-9_]+$/.test(raw)) return raw.slice(1);
+  const braced = raw.match(/^\$\{([A-Z0-9_]+)\}$/);
+  if (braced?.[1]) return braced[1];
+  const bracedEnv = raw.match(/^\$\{ENV:([A-Z0-9_]+)\}$/);
+  if (bracedEnv?.[1]) return bracedEnv[1];
+  const envPrefix = raw.match(/^env:([A-Z0-9_]+)$/i);
+  if (envPrefix?.[1]) return envPrefix[1].toUpperCase();
+  return null;
+}
+
+function resolveApiKeyMaybeFromEnv(value: string): string {
+  const ref = parseEnvVarReference(value);
+  if (!ref) return value;
+  const resolved = (process.env[ref] || "").trim();
+  if (!resolved) {
+    throw new Error(`Missing API key: env var ${ref} is not set`);
+  }
+  return resolved;
+}
+
 type ErrorPattern = RegExp | string;
 const ERROR_PATTERNS = {
   rateLimit: [
@@ -249,6 +274,7 @@ export interface ProviderManagerConfig {
     summary?: string;
     subagent?: string;
     parentForCli?: string;
+    tiers?: Record<string, RoutingTierConfig>;
   };
   healthCheck?: {
     timeoutMs?: number;
@@ -256,11 +282,19 @@ export interface ProviderManagerConfig {
   };
 }
 
+export type RoutingTierConfig = {
+  provider: string;
+  model?: string;
+  maxLatencyMs?: number;
+  fallbackFromFast?: boolean;
+};
+
 /**
  * Provider Manager - Routes requests to appropriate providers
  */
 export class ProviderManager {
   private readonly providers: Map<string, LLMProvider> = new Map();
+  private readonly discoveredProviderIds: Set<string> = new Set();
   private readonly config: ProviderManagerConfig;
   private readonly logger: Logger;
   private readonly healthCache: Map<string, { ok: boolean; checkedAt: number }> = new Map();
@@ -272,6 +306,126 @@ export class ProviderManager {
   constructor(config: ProviderManagerConfig, logger: Logger) {
     this.config = config;
     this.logger = logger;
+  }
+
+  private classifyPriorityGroup(id: string): ProviderPriorityGroup {
+    if (id.startsWith("local:")) return "local";
+    if (id.startsWith("backup:") || id.startsWith("discovered:")) return "discovered";
+    if (this.discoveredProviderIds.has(id)) return "discovered";
+    return "configured";
+  }
+
+  private sortProviderIdsByPriority(ids: string[]): string[] {
+    return prioritizeProviderCandidates(
+      ids.map((id) => ({
+        id,
+        group: this.classifyPriorityGroup(id),
+        coolingDown: this.isProviderCoolingDown(id),
+        failures: this.failureCounts.get(id) ?? 0,
+      }))
+    );
+  }
+
+  getTierConfig(tier: RoutingTierName): RoutingTierConfig | undefined {
+    return this.config.routing?.tiers?.[tier];
+  }
+
+  updateRouting(next: ProviderManagerConfig["routing"] | undefined): void {
+    this.config.routing = next;
+    // Reset routing-only caches
+    this.healthCache.clear();
+    this.logger.info(
+      {
+        chat: next?.chat,
+        tools: next?.tools,
+        tiers: next?.tiers ? Object.keys(next.tiers) : [],
+      },
+      "Provider routing hot-reloaded"
+    );
+  }
+
+  updateFallbackChain(next: string[] | undefined): void {
+    this.config.fallbackChain = next;
+    this.healthCache.clear();
+    this.logger.info({ count: next?.length ?? 0 }, "Provider fallback chain updated");
+  }
+
+  async registerDiscoveredProvider(
+    id: string,
+    providerConfig: ProviderConfig,
+    opts?: { ensureFallbackChain?: boolean }
+  ): Promise<{ ok: true; created: boolean } | { ok: false; error: string }> {
+    try {
+      const existed = this.providers.has(id);
+      const provider = await this.createProvider(id, providerConfig);
+      this.providers.set(id, provider);
+      this.config.providers[id] = providerConfig;
+      this.discoveredProviderIds.add(id);
+      this.healthCache.delete(id);
+      this.failureCounts.delete(id);
+      this.cooldownUntil.delete(id);
+
+      const ensureFallback = opts?.ensureFallbackChain ?? true;
+      if (ensureFallback) {
+        const chain = this.config.fallbackChain ?? [];
+        if (!chain.includes(id)) {
+          chain.push(id);
+          this.config.fallbackChain = chain;
+        }
+      }
+
+      this.logger.info(
+        { id, type: provider.type, model: provider.model, created: !existed },
+        existed ? "Discovered provider updated" : "Discovered provider registered"
+      );
+      return { ok: true, created: !existed };
+    } catch (err) {
+      const error = err instanceof Error ? err.message : String(err);
+      this.logger.warn({ id, error }, "Failed to register discovered provider");
+      return { ok: false, error };
+    }
+  }
+
+  unregisterProvider(id: string): boolean {
+    const existed = this.providers.delete(id);
+    this.discoveredProviderIds.delete(id);
+    delete (this.config.providers as Record<string, ProviderConfig>)[id];
+    this.healthCache.delete(id);
+    this.failureCounts.delete(id);
+    this.cooldownUntil.delete(id);
+
+    if (this.config.fallbackChain) {
+      const next = this.config.fallbackChain.filter((p) => p !== id);
+      this.config.fallbackChain = next;
+    }
+
+    if (existed) {
+      this.logger.info({ id }, "Provider unregistered");
+    }
+    return existed;
+  }
+
+  getProvidersByReliability(opts?: { requireTools?: boolean }): Array<{ id: string; failures: number; coolingDown: boolean }> {
+    const rows = this.getProviderIds().map((id) => {
+      const provider = this.providers.get(id);
+      const failures = this.failureCounts.get(id) ?? 0;
+      const coolingDown = this.isProviderCoolingDown(id);
+      const toolCapable = provider ? this.isToolCapable(provider) : false;
+      return { id, failures, coolingDown, toolCapable };
+    });
+
+    const filtered = opts?.requireTools ? rows.filter((r) => r.toolCapable) : rows;
+    filtered.sort((a, b) => {
+      if (a.coolingDown !== b.coolingDown) return a.coolingDown ? 1 : -1;
+      if (a.failures !== b.failures) return a.failures - b.failures;
+      return a.id.localeCompare(b.id);
+    });
+
+    return filtered.map((r) => ({ id: r.id, failures: r.failures, coolingDown: r.coolingDown }));
+  }
+
+  private isToolCapable(provider: LLMProvider): boolean {
+    return provider.type !== "cli";
   }
 
   /**
@@ -372,18 +526,37 @@ export class ProviderManager {
    */
   async selectBestProvider(
     action: "chat" | "tools" | "embeddings" | "summary" | "subagent" | "parentForCli" = "chat"
+    ,
+    opts?: { tier?: RoutingTierName; requireTools?: boolean }
   ): Promise<LLMProvider> {
-    // Check providers in order: routing preference, then fallback chain
-    const preferredOrder = [
-      this.config.routing?.[action] || this.config.defaultProvider,
-      ...(this.config.fallbackChain || []),
-    ];
+    const tierProviderId = opts?.tier ? this.config.routing?.tiers?.[opts.tier]?.provider : undefined;
+    const qualityProviderId = this.config.routing?.tiers?.quality?.provider;
+    const qualityFallbackFromFast = this.config.routing?.tiers?.quality?.fallbackFromFast ?? true;
+
+    const preferredOrder: string[] = [];
+    preferredOrder.push(tierProviderId || this.config.routing?.[action] || this.config.defaultProvider);
+
+    if (opts?.tier === "fast" && qualityFallbackFromFast && qualityProviderId) {
+      if (!preferredOrder.includes(qualityProviderId)) preferredOrder.push(qualityProviderId);
+    }
+
+    for (const fallbackId of this.config.fallbackChain || []) {
+      if (!preferredOrder.includes(fallbackId)) preferredOrder.push(fallbackId);
+    }
+
+    // Ensure we always have a chance to recover, even if fallbackChain is empty.
+    const remaining = this.getProviderIds().filter((id) => !preferredOrder.includes(id));
+    preferredOrder.push(...this.sortProviderIdsByPriority(remaining));
 
     this.logger.debug({ action, preferredOrder }, "Selecting best provider");
 
     for (const id of preferredOrder) {
       const provider = this.providers.get(id);
       if (provider) {
+        if (opts?.requireTools && !this.isToolCapable(provider)) {
+          this.logger.debug({ id, action }, "Provider not tool-capable, skipping");
+          continue;
+        }
         if (this.isProviderCoolingDown(id)) {
           this.logger.warn({ id, until: this.cooldownUntil.get(id) }, "Provider in cooldown, skipping");
           continue;
@@ -418,13 +591,25 @@ export class ProviderManager {
   /**
    * Get provider IDs with primary provider first, then fallback chain
    */
-  getPrioritizedProviderIds(primaryProviderId: string): string[] {
+  getPrioritizedProviderIds(
+    primaryProviderId: string,
+    opts?: { tier?: RoutingTierName; requireTools?: boolean }
+  ): string[] {
     const all = this.getProviderIds();
     const prioritized: string[] = [];
     
     // Add primary first
     if (all.includes(primaryProviderId)) {
       prioritized.push(primaryProviderId);
+    }
+
+    // Tier escalation: fast -> quality
+    const qualityProviderId = this.config.routing?.tiers?.quality?.provider;
+    const qualityFallbackFromFast = this.config.routing?.tiers?.quality?.fallbackFromFast ?? true;
+    if (opts?.tier === "fast" && qualityFallbackFromFast && qualityProviderId) {
+      if (all.includes(qualityProviderId) && !prioritized.includes(qualityProviderId)) {
+        prioritized.push(qualityProviderId);
+      }
     }
     
     // Add fallback chain next (in order)
@@ -437,13 +622,14 @@ export class ProviderManager {
     }
     
     // Add remaining providers (shouldn't really get here)
-    for (const id of all) {
-      if (!prioritized.includes(id)) {
-        prioritized.push(id);
-      }
-    }
-    
-    return prioritized;
+    const remaining = all.filter((id) => !prioritized.includes(id));
+    prioritized.push(...this.sortProviderIdsByPriority(remaining));
+
+    if (!opts?.requireTools) return prioritized;
+    return prioritized.filter((id) => {
+      const provider = this.providers.get(id);
+      return provider ? this.isToolCapable(provider) : false;
+    });
   }
 
   private async checkProviderHealth(id: string, provider: LLMProvider): Promise<boolean> {
@@ -575,11 +761,12 @@ export class OpenAIProvider implements LLMProvider {
   }
 
   async chat(messages: Message[], options?: ChatOptions): Promise<ChatResponse> {
+    const model = options?.model ?? this.model;
     const url = `${this.baseUrl}/chat/completions`;
     const signal = options?.timeoutMs && options.timeoutMs > 0 ? AbortSignal.timeout(options.timeoutMs) : undefined;
 
     const body: Record<string, unknown> = {
-      model: this.model,
+      model,
       messages: messages.map(m => ({
         role: m.role,
         content: m.content,
@@ -616,7 +803,7 @@ export class OpenAIProvider implements LLMProvider {
     this.logger.info({
       providerId: this.id,
       providerType: "openai",
-      model: this.model,
+      model,
       baseUrl: this.baseUrl,
       messageCount: messages.length,
       hasTools: !!options?.tools && options.tools.length > 0,
@@ -669,7 +856,7 @@ export class OpenAIProvider implements LLMProvider {
     this.logger.info({
       providerId: this.id,
       providerType: "openai",
-      model: this.model,
+      model,
       success: true,
       finishReason: choice.finish_reason,
       hasToolCalls: !!toolCalls && toolCalls.length > 0,
@@ -765,9 +952,9 @@ export class OpenAIProvider implements LLMProvider {
 
   private resolveApiKey(): string {
     const profile = this.getActiveProfile();
-    if (!profile) return this.apiKey;
-    profile.lastUsedAt = Date.now();
-    return profile.apiKey;
+    const raw = profile ? profile.apiKey : this.apiKey;
+    if (profile) profile.lastUsedAt = Date.now();
+    return resolveApiKeyMaybeFromEnv(raw);
   }
 
   private getActiveProfile() {
@@ -1369,11 +1556,12 @@ export class OllamaProvider implements LLMProvider {
   }
 
   async chat(messages: Message[], options?: ChatOptions): Promise<ChatResponse> {
+    const model = options?.model ?? this.model;
     const url = `${this.baseUrl}/api/chat`;
     const signal = options?.timeoutMs && options.timeoutMs > 0 ? AbortSignal.timeout(options.timeoutMs) : undefined;
 
     const body = {
-      model: this.model,
+      model,
       messages: messages.map(m => ({
         role: m.role,
         content: m.content,

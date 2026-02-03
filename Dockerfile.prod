@@ -1,0 +1,54 @@
+# Multi-stage production build for ANT
+
+FROM node:22-alpine AS builder
+
+RUN apk add --no-cache python3 make g++ git
+
+WORKDIR /app
+
+COPY package.json package-lock.json ./
+COPY ui/package.json ui/package-lock.json* ./ui/
+
+RUN npm ci
+
+WORKDIR /app/ui
+RUN npm ci
+
+WORKDIR /app
+COPY . .
+
+RUN npm run build && npm run ui:build && npm prune --omit=dev
+
+FROM node:22-alpine AS runtime
+
+RUN apk add --no-cache tini
+
+WORKDIR /app
+
+COPY --from=builder /app/dist ./dist
+COPY --from=builder /app/ui/dist ./ui/dist
+COPY --from=builder /app/node_modules ./node_modules
+COPY --from=builder /app/package.json ./package.json
+
+COPY ant.config.prod.json ./ant.config.json
+
+RUN addgroup -g 1001 -S ant && adduser -S ant -u 1001 -G ant
+RUN mkdir -p /app/.ant && chown -R ant:ant /app
+USER ant
+
+ENV NODE_ENV=production
+ENV ANT_CONFIG_PATH=/app/ant.config.json
+ENV ANT_GATEWAY_HOST=0.0.0.0
+ENV ANT_GATEWAY_PORT=5117
+ENV ANT_UI_HOST=0.0.0.0
+ENV ANT_UI_PORT=5117
+ENV ANT_WHATSAPP_ENABLED=false
+
+EXPOSE 5117
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3 \
+  CMD wget -q --spider http://127.0.0.1:5117/health || exit 1
+
+ENTRYPOINT ["/sbin/tini", "--"]
+CMD ["node", "dist/cli.js", "start", "-c", "/app/ant.config.json"]
+

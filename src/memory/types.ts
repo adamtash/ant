@@ -21,6 +21,14 @@ export type MemorySearchResult = {
   source: MemorySource;
   /** Chunk ID for reference */
   chunkId: string;
+  /** Memory category (if available) */
+  category?: MemoryCategory;
+  /** Priority (1-10) within category */
+  priority?: number;
+  /** Access count for the chunk */
+  accessCount?: number;
+  /** Last accessed timestamp */
+  lastAccessedAt?: number;
 };
 
 /**
@@ -32,6 +40,11 @@ export type MemorySource = "memory" | "sessions" | "short-term";
  * Memory tier levels
  */
 export type MemoryTier = "short-term" | "medium-term" | "long-term";
+
+/**
+ * Memory importance category used for pruning and surfacing.
+ */
+export type MemoryCategory = "critical" | "important" | "contextual" | "ephemeral" | "diagnostic";
 
 /**
  * A chunk of text with metadata
@@ -53,6 +66,16 @@ export type MemoryChunk = {
   indexedAt: number;
   /** Hash of the source file at index time */
   fileHash?: string;
+  /** Memory category for pruning/surfacing */
+  category?: MemoryCategory;
+  /** Priority (1-10) within category */
+  priority?: number;
+  /** Access count for relevance */
+  accessCount?: number;
+  /** Last accessed timestamp */
+  lastAccessedAt?: number;
+  /** Soft-delete timestamp when pruned */
+  prunedAt?: number;
 };
 
 /**

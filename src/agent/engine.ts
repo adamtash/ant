@@ -37,6 +37,7 @@ import {
   isFailoverError,
   resolveFailoverReasonFromError,
   type FailoverReason,
+  type ProviderManagerConfig,
 } from "./providers.js";
 import { getEventStream, createEventPublishers } from "../monitor/event-stream.js";
 import { emitAgentEvent, registerAgentRunContext, clearAgentRunContext } from "../monitor/agent-events.js";
@@ -52,6 +53,8 @@ import {
   type MemoryContext,
 } from "./prompt-builder.js";
 import { persistToolResult } from "./tool-result-guard.js";
+import { resolveTierForIntent, type RoutingTierName } from "../routing/tier-resolver.js";
+import { parseToolCallsFromText } from "./tool-call-parser.js";
 
 /**
  * Agent Engine configuration
@@ -78,14 +81,14 @@ export interface AgentEngineConfig {
  * Agent Engine - Main execution class
  */
 export class AgentEngine {
-  private readonly config: AgentConfig;
+  private config: AgentConfig;
   private readonly logger: Logger;
   private readonly providers: ProviderManager;
   private readonly tools: ToolRegistry;
   private readonly workspaceDir: string;
   private readonly stateDir: string;
   private readonly memorySearch?: (query: string, maxResults?: number) => Promise<string[]>;
-  private readonly toolPolicies?: Record<string, ToolPolicy>;
+  private toolPolicies?: Record<string, ToolPolicy>;
   private readonly sessionManager?: SessionManager;
   private readonly onProviderError?: (params: {
     sessionKey: string;
@@ -114,6 +117,7 @@ export class AgentEngine {
     const startTime = Date.now();
     const toolsUsed: string[] = [];
     let iterations = 0;
+    const cfg = this.config;
     const events = createEventPublishers(getEventStream());
     const toolParts = new Map<string, ToolPart>();
     const blockedTools = new Map<string, number>();
@@ -163,13 +167,21 @@ export class AgentEngine {
         agentType,
       }, { sessionKey: input.sessionKey, channel: input.channel });
 
+      const tier = resolveTierForIntent({
+        query: input.query,
+        channel: input.channel,
+        isSubagent: input.isSubagent,
+        cronContext: input.cronContext,
+      });
+      const tierModel = this.providers.getTierConfig(tier)?.model;
+
       // 1. Select providers (chat vs tool-runner)
-      const chatProvider = await this.providers.selectBestProvider("chat");
+      const chatProvider = await this.providers.selectBestProvider("chat", { tier });
       let selectedProvider = chatProvider;
 
       if (chatProvider.type === "cli") {
         try {
-          selectedProvider = await this.providers.selectBestProvider("parentForCli");
+          selectedProvider = await this.providers.selectBestProvider("parentForCli", { tier, requireTools: true });
         } catch (err) {
           this.logger.warn(
             { error: err instanceof Error ? err.message : String(err), chatProvider: chatProvider.id },
@@ -179,7 +191,7 @@ export class AgentEngine {
         }
       } else {
         try {
-          selectedProvider = await this.providers.selectBestProvider("tools");
+          selectedProvider = await this.providers.selectBestProvider("tools", { tier, requireTools: true });
         } catch {
           selectedProvider = chatProvider;
         }
@@ -188,12 +200,14 @@ export class AgentEngine {
       this.logger.info(
         {
           sessionKey: input.sessionKey,
+          tier,
           chatProviderId: chatProvider.id,
           chatProviderType: chatProvider.type,
           chatModel: chatProvider.model,
           toolProviderId: selectedProvider.id,
           toolProviderType: selectedProvider.type,
           toolModel: selectedProvider.model,
+          ...(tierModel ? { tierModel } : {}),
           query: input.query.slice(0, 100),
         },
         "Providers selected for execution"
@@ -230,7 +244,7 @@ export class AgentEngine {
       };
 
       const toolSystemPrompt = buildSystemPrompt({
-        config: this.config,
+        config: cfg,
         tools: this.tools.getDefinitions(),
         bootstrapFiles,
         runtimeInfo: {
@@ -246,7 +260,7 @@ export class AgentEngine {
         chatProvider.id === selectedProvider.id
           ? toolSystemPrompt
           : buildSystemPrompt({
-              config: this.config,
+              config: cfg,
               tools: [],
               bootstrapFiles,
               runtimeInfo: {
@@ -266,10 +280,10 @@ export class AgentEngine {
       ];
 
       // 4. Trim messages to fit context window
-      const trimmedMessages = trimMessagesForContext(messages, this.config.maxHistoryTokens);
+      const trimmedMessages = trimMessagesForContext(messages, cfg.maxHistoryTokens);
 
       // 5. Get tool definitions (policy-aware)
-      const toolPolicyName = this.config.toolPolicy;
+      const toolPolicyName = input.toolPolicy ?? cfg.toolPolicy;
       const toolPolicy = toolPolicyName ? this.toolPolicies?.[toolPolicyName] : undefined;
       const toolPolicyContext = {
         channel: input.channel,
@@ -285,12 +299,12 @@ export class AgentEngine {
 
       // 6. Execute tool loop
       let currentMessages: Message[] = [...trimmedMessages];
-      const maxIterations = this.config.maxToolIterations || 6;
-      const toolLoopConfig = this.config.toolLoop ?? {};
+      const maxIterations = cfg.maxToolIterations || 6;
+      const toolLoopConfig = cfg.toolLoop ?? {};
       const iterationTimeoutMs = toolLoopConfig.timeoutPerIterationMs ?? 30_000;
       const toolTimeoutMs = toolLoopConfig.timeoutPerToolMs ?? 30_000;
       const contextThresholdPercent = toolLoopConfig.contextWindowThresholdPercent ?? 50; // Lower default to trigger compaction earlier
-      const maxHistoryTokens = this.config.maxHistoryTokens;
+      const maxHistoryTokens = cfg.maxHistoryTokens;
 
       while (iterations < maxIterations) {
         iterations++;
@@ -304,8 +318,8 @@ export class AgentEngine {
           toolsUsed
         }, { sessionKey: input.sessionKey, channel: input.channel });
 
-        if (this.config.compaction?.enabled !== false) {
-          const compacted = this.compactSessionHistory(currentMessages, maxHistoryTokens);
+        if (cfg.compaction?.enabled !== false) {
+          const compacted = this.compactSessionHistory(currentMessages, maxHistoryTokens, cfg);
           if (compacted.messages !== currentMessages) {
             currentMessages = compacted.messages;
             if (compacted.didCompact) {
@@ -329,16 +343,18 @@ export class AgentEngine {
             selectedProvider,
             sanitizedMessages,
             {
-              temperature: this.config.temperature,
+              temperature: cfg.temperature,
+              model: tierModel,
               timeoutMs: iterationTimeoutMs,
               tools: toolDefs,
               toolChoice: "auto",
-              thinking: this.config.thinking?.level
-                ? { level: this.config.thinking.level }
+              thinking: cfg.thinking?.level
+                ? { level: cfg.thinking.level }
                 : undefined,
             },
             iterationTimeoutMs,
-            input.sessionKey
+            input.sessionKey,
+            { tier }
           );
           response = callResult.response;
           // Update selectedProvider in case fallback was used
@@ -368,7 +384,7 @@ export class AgentEngine {
         if (!response.toolCalls || response.toolCalls.length === 0) {
           // No more tool calls, we're done
           const toolRunnerResponse =
-            this.config.thinking?.level && this.config.thinking.level !== "off"
+            cfg.thinking?.level && cfg.thinking.level !== "off"
               ? response.content
               : this.stripReasoning(response.content);
 
@@ -402,19 +418,21 @@ export class AgentEngine {
                   { role: "user", content: finalUserPrompt },
                 ],
                 {
-                  temperature: this.config.temperature,
+                  temperature: cfg.temperature,
+                  model: tierModel,
                   timeoutMs: iterationTimeoutMs,
-                  thinking: this.config.thinking?.level
-                    ? { level: this.config.thinking.level }
+                  thinking: cfg.thinking?.level
+                    ? { level: cfg.thinking.level }
                     : undefined,
                 },
                 iterationTimeoutMs,
-                input.sessionKey
+                input.sessionKey,
+                { tier }
               );
 
               finalProvider = chatResult.provider;
               finalResponse =
-                this.config.thinking?.level && this.config.thinking.level !== "off"
+                cfg.thinking?.level && cfg.thinking.level !== "off"
                   ? chatResult.response.content
                   : this.stripReasoning(chatResult.response.content);
             } catch (err) {
@@ -520,7 +538,8 @@ export class AgentEngine {
             currentMessages,
             maxHistoryTokens,
             selectedProvider,
-            input.sessionKey
+            input.sessionKey,
+            cfg
           );
 
           if (this.estimateMessageTokens(emergencyCompacted) < this.estimateMessageTokens(currentMessages)) {
@@ -582,7 +601,7 @@ export class AgentEngine {
             toolParts.set(toolCall.id, blockedPart);
             await this.emitToolPartUpdate(blockedPart, input, events);
 
-            if (this.config.toolResultGuard?.enabled !== false) {
+            if (cfg.toolResultGuard?.enabled !== false) {
               await persistToolResult({
                 sessionManager: this.sessionManager,
                 sessionKey: input.sessionKey,
@@ -672,7 +691,7 @@ export class AgentEngine {
           toolParts.set(toolCall.id, runningPart);
           await this.emitToolPartUpdate(runningPart, input, events);
 
-          const toolContext = this.createToolContext(input);
+          const toolContext = this.createToolContext(input, cfg);
           const result = await this.executeToolWithRecovery(toolCall, toolContext, toolTimeoutMs);
 
           const completedPart = result.ok
@@ -689,7 +708,7 @@ export class AgentEngine {
           toolParts.set(toolCall.id, completedPart);
           await this.emitToolPartUpdate(completedPart, input, events);
 
-          if (this.config.toolResultGuard?.enabled !== false) {
+          if (cfg.toolResultGuard?.enabled !== false) {
             await persistToolResult({
               sessionManager: this.sessionManager,
               sessionKey: input.sessionKey,
@@ -748,7 +767,8 @@ export class AgentEngine {
               currentMessages,
               maxHistoryTokens,
               selectedProvider,
-              input.sessionKey
+              input.sessionKey,
+              cfg
             );
             if (aggressivelyCompacted !== currentMessages) {
               currentMessages = aggressivelyCompacted;
@@ -900,14 +920,14 @@ export class AgentEngine {
   /**
    * Create tool context for execution
    */
-  private createToolContext(input: AgentInput): ToolContext {
+  private createToolContext(input: AgentInput, config: AgentConfig): ToolContext {
     return {
       workspaceDir: this.workspaceDir,
       stateDir: this.stateDir,
       sessionKey: input.sessionKey,
       chatId: input.chatId,
       logger: this.logger.child({ component: "tool" }),
-      config: this.config,
+      config,
     };
   }
 
@@ -1163,13 +1183,13 @@ export class AgentEngine {
     }
   }
 
-  private compactSessionHistory(messages: Message[], maxHistoryTokens: number): {
+  private compactSessionHistory(messages: Message[], maxHistoryTokens: number, agentConfig: AgentConfig): {
     messages: Message[];
     didCompact: boolean;
     dropped: number;
     summaryTokens: number;
   } {
-    const config = this.config.compaction ?? {};
+    const config = agentConfig.compaction ?? {};
     const thresholdPercent = config.thresholdPercent ?? 75;
     const maxSummaryTokens = config.maxSummaryTokens ?? 600;
     const minRecentMessages = config.minRecentMessages ?? 8;
@@ -1233,9 +1253,10 @@ export class AgentEngine {
     messages: Message[],
     maxHistoryTokens: number,
     provider: LLMProvider,
-    sessionKey: string
+    sessionKey: string,
+    agentConfig: AgentConfig
   ): Promise<Message[]> {
-    const config = this.config.compaction ?? {};
+    const config = agentConfig.compaction ?? {};
     const targetTokens = Math.floor((maxHistoryTokens * 50) / 100); // Aim for 50% of max
 
     this.logger.info(
@@ -1361,6 +1382,55 @@ export class AgentEngine {
     return this.tools;
   }
 
+  async hasHealthyProvider(opts?: { requireTools?: boolean }): Promise<boolean> {
+    try {
+      await this.providers.selectBestProvider("chat", { requireTools: opts?.requireTools });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  applyProviderRoutingHotReload(routing: ProviderManagerConfig["routing"] | undefined): void {
+    this.providers.updateRouting(routing);
+  }
+
+  applyProviderFallbackChainHotReload(fallbackChain: string[] | undefined): void {
+    this.providers.updateFallbackChain(fallbackChain);
+  }
+
+  async registerDiscoveredProvider(params: {
+    id: string;
+    config: ProviderManagerConfig["providers"][string];
+    ensureFallbackChain?: boolean;
+  }): Promise<{ ok: true; created: boolean } | { ok: false; error: string }> {
+    return this.providers.registerDiscoveredProvider(params.id, params.config as any, {
+      ensureFallbackChain: params.ensureFallbackChain,
+    });
+  }
+
+  unregisterProvider(id: string): boolean {
+    return this.providers.unregisterProvider(id);
+  }
+
+  applyToolPoliciesHotReload(next: Record<string, ToolPolicy> | undefined): void {
+    this.toolPolicies = next;
+  }
+
+  applyHotReload(next: Partial<AgentConfig>): void {
+    const merged: AgentConfig = {
+      ...this.config,
+      ...next,
+      ...(next.thinking ? { thinking: { ...(this.config.thinking ?? {}), ...next.thinking } } : {}),
+      ...(next.toolLoop ? { toolLoop: { ...(this.config.toolLoop ?? {}), ...next.toolLoop } } : {}),
+      ...(next.compaction ? { compaction: { ...(this.config.compaction ?? {}), ...next.compaction } } : {}),
+      ...(next.toolResultGuard
+        ? { toolResultGuard: { ...(this.config.toolResultGuard ?? {}), ...next.toolResultGuard } }
+        : {}),
+    };
+    this.config = merged;
+  }
+
   /**
    * Call a provider with fallback to other providers on failure
    * Tries providers in order: first the given provider, then others from fallback chain
@@ -1370,7 +1440,8 @@ export class AgentEngine {
     messages: Message[],
     options: ChatOptions,
     iterationTimeoutMs: number,
-    sessionKey: string
+    sessionKey: string,
+    opts?: { tier?: RoutingTierName }
   ): Promise<{ response: ChatResponse; provider: LLMProvider }> {
     const events = createEventPublishers(getEventStream());
     const mapCooldownReason = (reason?: FailoverReason | null): "rate_limit" | "quota" | "auth" | "maintenance" | "error" => {
@@ -1385,8 +1456,12 @@ export class AgentEngine {
           return "error";
       }
     };
-    // Prioritize the primary provider first, then fallback chain
-    const providerIds = this.providers.getPrioritizedProviderIds(provider.id);
+    const requireTools = Boolean(options.tools && options.tools.length > 0);
+    // Prioritize the primary provider first, then tier escalation, then fallback chain
+    const providerIds = this.providers.getPrioritizedProviderIds(provider.id, {
+      tier: opts?.tier,
+      requireTools,
+    });
     
     this.logger.debug(
       { primaryProvider: provider.id, providerOrder: providerIds },
@@ -1414,7 +1489,7 @@ export class AgentEngine {
       );
 
       try {
-        const response = await withRetry(
+        let response = await withRetry(
           () =>
             this.callProviderWithTimeout(
               attemptedProvider,
@@ -1432,6 +1507,66 @@ export class AgentEngine {
             },
           }
         );
+
+        if (requireTools && (!response.toolCalls || response.toolCalls.length === 0)) {
+          const parsed = parseToolCallsFromText(response.content);
+          if (parsed.ok) {
+            response = {
+              ...response,
+              content: parsed.cleanedContent,
+              toolCalls: parsed.toolCalls,
+              finishReason: "tool_calls",
+            };
+          } else if (parsed.hadMarkup || parsed.truncated || response.finishReason === "length") {
+            this.logger.warn(
+              {
+                sessionKey,
+                providerId: attemptedProvider.id,
+                model: attemptedProvider.model,
+                error: parsed.error,
+                truncated: parsed.truncated,
+                finishReason: response.finishReason,
+              },
+              "Tool call parsing failed; retrying once with strict JSON tool call prompt"
+            );
+
+            const repairPrompt = [
+              "Your previous response attempted a tool call but was invalid/truncated.",
+              "Return ONLY valid JSON (no markdown, no xml) in this exact shape:",
+              '{"toolCalls":[{"name":"tool_name","arguments":{}}]}',
+              "Choose tool_name from the available tools and include all required arguments.",
+            ].join("\n");
+
+            const repairResponse = await this.callProviderWithTimeout(
+              attemptedProvider,
+              [...messages, { role: "user", content: repairPrompt }],
+              {
+                ...options,
+                tools: options.tools,
+                toolChoice: "none",
+                temperature: 0,
+                maxTokens: Math.max(options.maxTokens ?? 0, 1200),
+              },
+              iterationTimeoutMs
+            );
+
+            if (repairResponse.toolCalls && repairResponse.toolCalls.length > 0) {
+              response = repairResponse;
+            } else {
+              const repairedParsed = parseToolCallsFromText(repairResponse.content);
+              if (repairedParsed.ok) {
+                response = {
+                  ...repairResponse,
+                  content: repairedParsed.cleanedContent,
+                  toolCalls: repairedParsed.toolCalls,
+                  finishReason: "tool_calls",
+                };
+              } else {
+                throw new Error("Tool call parsing failed after repair attempt");
+              }
+            }
+          }
+        }
 
         this.logger.info(
           {
@@ -1604,6 +1739,15 @@ export async function createAgentEngine(params: {
       summary?: string;
       subagent?: string;
       parentForCli?: string;
+      tiers?: Record<
+        string,
+        {
+          provider: string;
+          model?: string;
+          maxLatencyMs?: number;
+          fallbackFromFast?: boolean;
+        }
+      >;
     };
   };
   logger: Logger;

@@ -13,4 +13,4 @@ export { PheromonTrails } from './PheromonTrails';
 export { GeneticCode } from './GeneticCode';
 export { Logs } from './Logs';
 export { Tunnels } from './Tunnels';
-
+export { TaskDetail } from './TaskDetail';

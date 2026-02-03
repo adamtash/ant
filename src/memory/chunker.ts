@@ -6,6 +6,7 @@
  * Adapted from OpenClaw: maintains precise line numbers and overlap windows.
  */
 
+import { categorizeMemoryText } from "./categorizer.js";
 import type { ChunkOptions, MemoryChunk } from "./types.js";
 
 /**
@@ -329,16 +330,24 @@ export function createMemoryChunks(
 ): MemoryChunk[] {
   const now = Date.now();
 
-  return textChunks.map((chunk, index) => ({
-    id: `${path}#${index}`,
-    path,
-    source,
-    startLine: chunk.startLine,
-    endLine: chunk.endLine,
-    text: chunk.text,
-    indexedAt: now,
-    fileHash,
-  }));
+  return textChunks.map((chunk, index) => {
+    const categorized = categorizeMemoryText({ text: chunk.text, source, path });
+    const text = categorized.cleanedText ?? chunk.text;
+    return {
+      id: `${path}#${index}`,
+      path,
+      source,
+      startLine: chunk.startLine,
+      endLine: chunk.endLine,
+      text,
+      indexedAt: now,
+      fileHash,
+      category: categorized.category,
+      priority: categorized.priority,
+      accessCount: 0,
+      lastAccessedAt: 0,
+    };
+  });
 }
 
 /**

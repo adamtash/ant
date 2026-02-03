@@ -1,0 +1,57 @@
+version: "3.8"
+
+services:
+  ant:
+    build:
+      context: .
+      dockerfile: Dockerfile.prod
+    container_name: ant-main
+    restart: unless-stopped
+    ports:
+      - "5117:5117"
+    volumes:
+      - ./ant.config.prod.json:/app/ant.config.json:ro
+      - ant-data:/app/.ant
+    environment:
+      - NODE_ENV=production
+      - ANT_CONFIG_PATH=/app/ant.config.json
+      - ANT_GATEWAY_HOST=0.0.0.0
+      - ANT_GATEWAY_PORT=5117
+      - ANT_UI_HOST=0.0.0.0
+      - ANT_UI_PORT=5117
+      - ANT_WHATSAPP_ENABLED=false
+    depends_on:
+      - ollama
+
+  watchdog:
+    build:
+      context: .
+      dockerfile: Dockerfile.watchdog
+    container_name: ant-watchdog
+    restart: always
+    depends_on:
+      - ant
+    environment:
+      - MAIN_ANT_HEALTH_URL=http://ant:5117/api/health
+      - MAIN_ANT_CONTAINER=ant-main
+      - MAIN_ANT_HEARTBEAT_PATH=/app/.ant/heartbeat
+      - HEALTH_CHECK_INTERVAL_MS=10000
+      - MAX_CONSECUTIVE_FAILURES=3
+      - RESTART_COOLDOWN_MS=30000
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:rw
+      - ant-data:/app/.ant
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ant-ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-models:/root/.ollama
+
+volumes:
+  ant-data:
+  ollama-models:
+

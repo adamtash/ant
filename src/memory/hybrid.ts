@@ -29,6 +29,7 @@ export type HybridKeywordResult = {
 };
 
 export type HybridSearchResult = {
+  id: string;
   path: string;
   startLine: number;
   endLine: number;
@@ -140,6 +141,7 @@ export function mergeHybridResults(params: {
         params.textWeight * entry.textScore;
       
       return {
+        id: entry.id,
         path: entry.path,
         startLine: entry.startLine,
         endLine: entry.endLine,

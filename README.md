@@ -11,7 +11,9 @@ A modular, autonomous AI agent runtime that runs locally on your machine. Connec
 - **Subagents** - Spawn parallel workers for complex tasks
 - **Local Tools** - File operations, shell commands, screenshots, browser automation (Playwright)
 - **Pluggable Providers** - OpenAI-compatible APIs (LM Studio) or CLI tools (Codex, Claude, Copilot)
+- **Provider Discovery & Survival Mode** - Auto-discover local backups (Ollama/LM Studio) and recover when providers fail
 - **Web Dashboard** - Real-time monitoring, session history, memory search, and system health
+- **Health + Watchdog** - `/health` liveness, `/ready` dependency readiness, optional watchdog supervisor
 
 ## Installation
 
@@ -76,7 +78,7 @@ Copy and customize `ant.config.json` in the project root:
   },
   "mainAgent": {
     "enabled": true,
-    "iterationDelayMinutes": 5
+    "intervalMs": 300000
   }
 }
 ```
@@ -108,6 +110,56 @@ Open **http://localhost:5117** in your browser to access:
 Scan the QR code in the terminal to pair with WhatsApp and start chatting!
 
 ---
+
+## Provider Discovery (Backups)
+
+Enable automatic backup discovery in `ant.config.json`:
+
+```json
+{
+  "providers": {
+    "discovery": {
+      "enabled": true,
+      "researchIntervalHours": 24,
+      "healthCheckIntervalMinutes": 15,
+      "minBackupProviders": 2
+    },
+    "local": {
+      "enabled": true,
+      "preferFastModels": true,
+      "autoDownloadModels": false,
+      "ollama": { "enabled": true, "endpoint": "http://localhost:11434" },
+      "lmstudio": { "enabled": true, "endpoint": "http://localhost:1234/v1" }
+    }
+  }
+}
+```
+
+Optional env vars for remote backups (only used if set):
+- `OPENROUTER_API_KEY`, `OPENROUTER_MODEL`
+- `GROQ_API_KEY`, `GROQ_MODEL`
+- `TOGETHER_API_KEY`, `TOGETHER_MODEL`
+- `MISTRAL_API_KEY`, `MISTRAL_MODEL`
+
+Discovered providers are stored in `.ant/providers.discovered.json` and merged at runtime (no changes to `ant.config.json`).
+
+## Health Endpoints
+
+- `GET /health` → liveness (fast OK)
+- `GET /ready` → readiness (providers + memory + whatsapp)
+
+## Docker (Production)
+
+```bash
+docker build -t ant-cli:latest -f Dockerfile.prod .
+docker compose up -d
+```
+
+## Watchdog (Optional)
+
+```bash
+docker build -t ant-watchdog:latest -f Dockerfile.watchdog .
+```
 
 ## CLI Commands Reference
 

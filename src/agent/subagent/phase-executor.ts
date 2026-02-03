@@ -56,6 +56,7 @@ export class PhaseExecutor {
         channel: task.metadata.channel,
         chatId: task.sessionKey,
         isSubagent: true,
+        toolPolicy: task.lane === "maintenance" ? "investigation" : undefined,
       });
 
       lastOutput = result.response;

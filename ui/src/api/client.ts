@@ -167,10 +167,16 @@ export const getProviderHealthById = (id: string) =>
 
 export const getTasks = () => apiGet<TasksResponse>('/tasks');
 export const getTask = (id: string) => apiGet<TaskDetailResponse>(`/tasks/${id}`);
+export const getTaskRaw = (id: string) => apiGet<unknown>(`/tasks/${encodeURIComponent(id)}`);
 export const createTask = (prompt: string) =>
   apiPost<ActionResponse>('/tasks', { prompt });
 export const cancelTask = (id: string) =>
   apiDelete<ActionResponse>(`/tasks/${id}`);
+
+export const getSessionToolParts = (sessionKey: string) =>
+  apiGet<{ ok: boolean; sessionKey: string; toolParts: unknown[] }>(
+    `/sessions/${encodeURIComponent(sessionKey)}/tool-parts`
+  );
 
 // ============================================
 // Agents

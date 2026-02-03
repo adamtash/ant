@@ -61,6 +61,11 @@ export class SqliteStore {
         end_line INTEGER NOT NULL,
         text TEXT NOT NULL,
         indexed_at INTEGER NOT NULL,
+        category TEXT NOT NULL DEFAULT 'contextual',
+        priority INTEGER NOT NULL DEFAULT 5,
+        access_count INTEGER NOT NULL DEFAULT 0,
+        last_accessed_at INTEGER NOT NULL DEFAULT 0,
+        pruned_at INTEGER,
         FOREIGN KEY (path) REFERENCES files(path) ON DELETE CASCADE
       );
 
@@ -86,12 +91,43 @@ export class SqliteStore {
       -- Indexes for efficient queries
       CREATE INDEX IF NOT EXISTS idx_chunks_path ON chunks(path);
       CREATE INDEX IF NOT EXISTS idx_chunks_source ON chunks(source);
+      CREATE INDEX IF NOT EXISTS idx_chunks_category ON chunks(category);
+      CREATE INDEX IF NOT EXISTS idx_chunks_pruned ON chunks(pruned_at);
       CREATE INDEX IF NOT EXISTS idx_files_source ON files(source);
       CREATE INDEX IF NOT EXISTS idx_files_updated ON files(updated_at);
     `);
 
+    this.ensureChunkColumns();
+
     // Create FTS5 virtual table for keyword search
     this.ensureFtsTable();
+  }
+
+  private ensureChunkColumns(): void {
+    this.ensureColumns("chunks", {
+      category: "TEXT NOT NULL DEFAULT 'contextual'",
+      priority: "INTEGER NOT NULL DEFAULT 5",
+      access_count: "INTEGER NOT NULL DEFAULT 0",
+      last_accessed_at: "INTEGER NOT NULL DEFAULT 0",
+      pruned_at: "INTEGER",
+    });
+  }
+
+  private ensureColumns(table: string, columns: Record<string, string>): void {
+    try {
+      const existing = new Set(
+        (this.db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map(
+          (row) => row.name
+        )
+      );
+
+      for (const [name, definition] of Object.entries(columns)) {
+        if (existing.has(name)) continue;
+        this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${name} ${definition}`);
+      }
+    } catch {
+      // Ignore migrations if table/pragma isn't available in this SQLite build.
+    }
   }
 
   /**
@@ -190,6 +226,13 @@ export class SqliteStore {
     this.db.prepare("DELETE FROM embeddings WHERE chunk_id IN (SELECT id FROM chunks WHERE path = ?)").run(path);
     this.db.prepare("DELETE FROM chunks WHERE path = ?").run(path);
     this.db.prepare("DELETE FROM files WHERE path = ?").run(path);
+    if (this.ftsAvailable) {
+      try {
+        this.db.prepare("DELETE FROM chunks_fts WHERE path = ?").run(path);
+      } catch {
+        // Ignore FTS deletion errors
+      }
+    }
   }
 
   /**
@@ -199,11 +242,18 @@ export class SqliteStore {
     // Delete existing chunks for this path
     this.db.prepare("DELETE FROM embeddings WHERE chunk_id IN (SELECT id FROM chunks WHERE path = ?)").run(path);
     this.db.prepare("DELETE FROM chunks WHERE path = ?").run(path);
+    if (this.ftsAvailable) {
+      try {
+        this.db.prepare("DELETE FROM chunks_fts WHERE path = ?").run(path);
+      } catch {
+        // Ignore FTS deletion errors
+      }
+    }
 
     // Insert new chunks
     const stmt = this.db.prepare(
-      `INSERT INTO chunks (id, path, source, start_line, end_line, text, indexed_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO chunks (id, path, source, start_line, end_line, text, indexed_at, category, priority, access_count, last_accessed_at, pruned_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     );
 
     for (const chunk of chunks) {
@@ -215,6 +265,11 @@ export class SqliteStore {
         chunk.endLine,
         chunk.text,
         chunk.indexedAt,
+        chunk.category ?? "contextual",
+        chunk.priority ?? 5,
+        chunk.accessCount ?? 0,
+        chunk.lastAccessedAt ?? 0,
+        chunk.prunedAt ?? null,
       );
     }
   }
@@ -249,9 +304,11 @@ export class SqliteStore {
     const rows = this.db
       .prepare(
         `SELECT c.id, c.path, c.source, c.start_line, c.end_line, c.text, c.indexed_at,
+                c.category, c.priority, c.access_count, c.last_accessed_at, c.pruned_at,
                 e.embedding, e.dimension
          FROM chunks c
-         JOIN embeddings e ON c.id = e.chunk_id`,
+         JOIN embeddings e ON c.id = e.chunk_id
+         WHERE c.pruned_at IS NULL`,
       )
       .all() as Array<{
       id: string;
@@ -261,6 +318,11 @@ export class SqliteStore {
       end_line: number;
       text: string;
       indexed_at: number;
+      category?: string;
+      priority?: number;
+      access_count?: number;
+      last_accessed_at?: number;
+      pruned_at?: number | null;
       embedding: Buffer;
       dimension: number;
     }>;
@@ -274,6 +336,11 @@ export class SqliteStore {
         endLine: row.end_line,
         text: row.text,
         indexedAt: row.indexed_at,
+        category: (row.category as any) ?? "contextual",
+        priority: row.priority ?? 5,
+        accessCount: row.access_count ?? 0,
+        lastAccessedAt: row.last_accessed_at ?? 0,
+        prunedAt: row.pruned_at ?? undefined,
       },
       embedding: bufferToFloat32Array(row.embedding, row.dimension),
     }));
@@ -315,7 +382,7 @@ export class SqliteStore {
   getChunk(id: string): MemoryChunk | null {
     const row = this.db
       .prepare(
-        "SELECT id, path, source, start_line, end_line, text, indexed_at FROM chunks WHERE id = ?",
+        "SELECT id, path, source, start_line, end_line, text, indexed_at, category, priority, access_count, last_accessed_at, pruned_at FROM chunks WHERE id = ?",
       )
       .get(id) as
       | {
@@ -326,6 +393,11 @@ export class SqliteStore {
           end_line: number;
           text: string;
           indexed_at: number;
+          category?: string;
+          priority?: number;
+          access_count?: number;
+          last_accessed_at?: number;
+          pruned_at?: number | null;
         }
       | undefined;
 
@@ -339,6 +411,11 @@ export class SqliteStore {
       endLine: row.end_line,
       text: row.text,
       indexedAt: row.indexed_at,
+      category: (row.category as any) ?? "contextual",
+      priority: row.priority ?? 5,
+      accessCount: row.access_count ?? 0,
+      lastAccessedAt: row.last_accessed_at ?? 0,
+      prunedAt: row.pruned_at ?? undefined,
     };
   }
 
@@ -348,7 +425,7 @@ export class SqliteStore {
   getChunksForFile(path: string): MemoryChunk[] {
     const rows = this.db
       .prepare(
-        "SELECT id, path, source, start_line, end_line, text, indexed_at FROM chunks WHERE path = ? ORDER BY start_line",
+        "SELECT id, path, source, start_line, end_line, text, indexed_at, category, priority, access_count, last_accessed_at, pruned_at FROM chunks WHERE path = ? AND pruned_at IS NULL ORDER BY start_line",
       )
       .all(path) as Array<{
       id: string;
@@ -358,6 +435,11 @@ export class SqliteStore {
       end_line: number;
       text: string;
       indexed_at: number;
+      category?: string;
+      priority?: number;
+      access_count?: number;
+      last_accessed_at?: number;
+      pruned_at?: number | null;
     }>;
 
     return rows.map((row) => ({
@@ -368,6 +450,11 @@ export class SqliteStore {
       endLine: row.end_line,
       text: row.text,
       indexedAt: row.indexed_at,
+      category: (row.category as any) ?? "contextual",
+      priority: row.priority ?? 5,
+      accessCount: row.access_count ?? 0,
+      lastAccessedAt: row.last_accessed_at ?? 0,
+      prunedAt: row.pruned_at ?? undefined,
     }));
   }
 
@@ -444,6 +531,170 @@ export class SqliteStore {
     };
   }
 
+  markChunksAccessed(chunkIds: string[]): void {
+    if (chunkIds.length === 0) return;
+    const now = Date.now();
+    const stmt = this.db.prepare(
+      "UPDATE chunks SET access_count = access_count + 1, last_accessed_at = ? WHERE id = ? AND pruned_at IS NULL"
+    );
+    for (const id of chunkIds) {
+      try {
+        stmt.run(now, id);
+      } catch {
+        // Ignore per-row update errors
+      }
+    }
+  }
+
+  listChunks(params?: {
+    limit?: number;
+    offset?: number;
+    category?: string;
+    source?: MemorySource;
+  }): MemoryChunk[] {
+    const limit = Math.min(Math.max(params?.limit ?? 100, 1), 1000);
+    const offset = Math.max(params?.offset ?? 0, 0);
+
+    const where: string[] = ["pruned_at IS NULL"];
+    const values: Array<string | number> = [];
+
+    if (params?.category) {
+      where.push("category = ?");
+      values.push(params.category);
+    }
+    if (params?.source) {
+      where.push("source = ?");
+      values.push(params.source);
+    }
+
+    const sql = `SELECT id, path, source, start_line, end_line, text, indexed_at,
+                       category, priority, access_count, last_accessed_at, pruned_at
+                FROM chunks
+                WHERE ${where.join(" AND ")}
+                ORDER BY indexed_at DESC
+                LIMIT ? OFFSET ?`;
+
+    const rows = this.db.prepare(sql).all(...values, limit, offset) as Array<{
+      id: string;
+      path: string;
+      source: MemorySource;
+      start_line: number;
+      end_line: number;
+      text: string;
+      indexed_at: number;
+      category?: string;
+      priority?: number;
+      access_count?: number;
+      last_accessed_at?: number;
+      pruned_at?: number | null;
+    }>;
+
+    return rows.map((row) => ({
+      id: row.id,
+      path: row.path,
+      source: row.source,
+      startLine: row.start_line,
+      endLine: row.end_line,
+      text: row.text,
+      indexedAt: row.indexed_at,
+      category: (row.category as any) ?? "contextual",
+      priority: row.priority ?? 5,
+      accessCount: row.access_count ?? 0,
+      lastAccessedAt: row.last_accessed_at ?? 0,
+      prunedAt: row.pruned_at ?? undefined,
+    }));
+  }
+
+  getMemoryStats(): {
+    fileCount: number;
+    chunkCount: number;
+    totalTextBytes: number;
+    categories: Record<string, number>;
+  } {
+    const fileCount = (
+      this.db.prepare("SELECT COUNT(*) as count FROM files").get() as { count: number }
+    ).count;
+
+    const chunkCount = (
+      this.db.prepare("SELECT COUNT(*) as count FROM chunks WHERE pruned_at IS NULL").get() as {
+        count: number;
+      }
+    ).count;
+
+    const totalTextBytes = (
+      this.db.prepare("SELECT COALESCE(SUM(LENGTH(text)), 0) as total FROM chunks WHERE pruned_at IS NULL").get() as {
+        total: number;
+      }
+    ).total;
+
+    const rows = this.db
+      .prepare("SELECT category, COUNT(*) as count FROM chunks WHERE pruned_at IS NULL GROUP BY category")
+      .all() as Array<{ category: string; count: number }>;
+
+    const categories: Record<string, number> = {};
+    for (const row of rows) {
+      if (row.category) categories[row.category] = row.count;
+    }
+
+    return { fileCount, chunkCount, totalTextBytes, categories };
+  }
+
+  softPrune(params: {
+    targetTextBytes: number;
+    preserveCategories?: string[];
+  }): { pruned: number; beforeTextBytes: number; afterTextBytes: number } {
+    const targetTextBytes = Math.max(0, params.targetTextBytes);
+    const preserve = new Set((params.preserveCategories ?? ["critical", "important"]).map((c) => c.trim()));
+
+    const { totalTextBytes: beforeTextBytes } = this.getMemoryStats();
+    if (beforeTextBytes <= targetTextBytes) {
+      return { pruned: 0, beforeTextBytes, afterTextBytes: beforeTextBytes };
+    }
+
+    const prunableOrder = ["ephemeral", "diagnostic", "contextual", "important", "critical"].filter(
+      (c) => !preserve.has(c)
+    );
+
+    let remainingBytes = beforeTextBytes;
+    let pruned = 0;
+    const now = Date.now();
+
+    const updateStmt = this.db.prepare("UPDATE chunks SET pruned_at = ? WHERE id = ? AND pruned_at IS NULL");
+
+    for (const category of prunableOrder) {
+      if (remainingBytes <= targetTextBytes) break;
+
+      while (remainingBytes > targetTextBytes) {
+        const rows = this.db
+          .prepare(
+            `SELECT id, LENGTH(text) as bytes
+             FROM chunks
+             WHERE pruned_at IS NULL AND category = ?
+             ORDER BY priority ASC, access_count ASC, indexed_at ASC
+             LIMIT 200`,
+          )
+          .all(category) as Array<{ id: string; bytes: number }>;
+
+        if (rows.length === 0) break;
+
+        for (const row of rows) {
+          try {
+            updateStmt.run(now, row.id);
+            pruned += 1;
+            remainingBytes -= Math.max(0, row.bytes || 0);
+            if (remainingBytes <= targetTextBytes) break;
+          } catch {
+            // ignore
+          }
+        }
+
+        if (rows.length < 200) break;
+      }
+    }
+
+    return { pruned, beforeTextBytes, afterTextBytes: Math.max(0, remainingBytes) };
+  }
+
   /**
    * Search using FTS5 (keyword search)
    * 
@@ -460,6 +711,10 @@ export class SqliteStore {
     endLine: number;
     snippet: string;
     textScore: number;
+    category?: string;
+    priority?: number;
+    accessCount?: number;
+    lastAccessedAt?: number;
   }> {
     if (!this.ftsAvailable) return [];
 
@@ -467,11 +722,13 @@ export class SqliteStore {
       const rows = this.db
         .prepare(
           `SELECT 
-             id, path, source, start_line, end_line, text,
-             rank as bm25Rank
-           FROM chunks_fts
-           WHERE chunks_fts MATCH ?
-           ORDER BY rank
+             f.id, f.path, f.source, f.start_line, f.end_line, f.text,
+             c.category, c.priority, c.access_count, c.last_accessed_at,
+             f.rank as bm25Rank
+           FROM chunks_fts f
+           JOIN chunks c ON c.id = f.id
+           WHERE c.pruned_at IS NULL AND f MATCH ?
+           ORDER BY f.rank
            LIMIT ?`,
         )
         .all(ftsQuery, maxResults) as Array<{
@@ -481,6 +738,10 @@ export class SqliteStore {
         start_line: number;
         end_line: number;
         text: string;
+        category?: string;
+        priority?: number;
+        access_count?: number;
+        last_accessed_at?: number;
         bm25Rank: number;
       }>;
 
@@ -499,6 +760,10 @@ export class SqliteStore {
           endLine: row.end_line,
           snippet,
           textScore,
+          category: row.category,
+          priority: row.priority,
+          accessCount: row.access_count ?? 0,
+          lastAccessedAt: row.last_accessed_at ?? 0,
         };
       });
     } catch {

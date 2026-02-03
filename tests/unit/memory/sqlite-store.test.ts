@@ -139,7 +139,12 @@ describe("SqliteStore (mocked node:sqlite)", () => {
       1,
       2,
       "hello",
-      123
+      123,
+      "contextual",
+      5,
+      0,
+      0,
+      null
     );
   });
 

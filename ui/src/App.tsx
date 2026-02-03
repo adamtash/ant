@@ -21,6 +21,7 @@ import {
   GeneticCode,
   Logs,
   Tunnels,
+  TaskDetail,
 } from './pages';
 
 
@@ -200,6 +201,7 @@ const MainContent: React.FC = () => {
       <Routes>
         <Route path="/" element={<RoyalChamber />} />
         <Route path="/foraging" element={<ForagingGrounds />} />
+        <Route path="/tasks/:id" element={<TaskDetail />} />
         <Route path="/archive" element={<ArchiveChambers />} />
         <Route path="/nursery" element={<Nursery />} />
         <Route path="/builders" element={<BuildersWorkshop />} />

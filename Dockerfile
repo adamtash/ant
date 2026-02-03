@@ -53,7 +53,8 @@ RUN apk add --no-cache \
     freetype \
     harfbuzz \
     ca-certificates \
-    ttf-freefont
+    ttf-freefont \
+    tini
 
 # Set Playwright to use system Chromium
 ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
@@ -88,22 +89,23 @@ USER antuser
 
 # Environment variables
 ENV NODE_ENV=production
+ENV ANT_CONFIG_PATH=/app/ant.config.json
+ENV ANT_UI_HOST=0.0.0.0
 ENV ANT_UI_PORT=5117
-ENV ANT_GATEWAY_PORT=18789
+ENV ANT_GATEWAY_HOST=0.0.0.0
+ENV ANT_GATEWAY_PORT=5117
+ENV ANT_WHATSAPP_ENABLED=false
 ENV ANT_DATA_DIR=/app/data
 
 # Expose ports
-# UI Server
 EXPOSE 5117
-# Gateway Server
-EXPOSE 18789
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD node -e "require('http').get('http://localhost:5117/health', (r) => process.exit(r.statusCode === 200 ? 0 : 1))" || exit 1
 
 # Entry point - run the CLI
-ENTRYPOINT ["node", "dist/cli-new.js"]
+ENTRYPOINT ["/sbin/tini", "--", "node", "dist/cli.js"]
 
 # Default command (can be overridden)
-CMD ["run"]
+CMD ["start"]

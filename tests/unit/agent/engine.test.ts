@@ -35,6 +35,7 @@ const mockProvider = {
 // Mock provider manager
 const mockProviderManager = {
   selectBestProvider: vi.fn(async () => mockProvider),
+  getTierConfig: vi.fn(() => undefined),
   getPrioritizedProviderIds: vi.fn((id: string) => [id, "fallback-provider"]),
   getProviderById: vi.fn((id: string) => id === "test-provider" ? mockProvider : null),
   getProviderIds: vi.fn(() => ["test-provider", "fallback-provider"]),

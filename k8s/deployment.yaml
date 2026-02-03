@@ -1,0 +1,39 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ant-cli
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ant-cli
+  template:
+    metadata:
+      labels:
+        app: ant-cli
+    spec:
+      containers:
+        - name: ant
+          image: ant-cli:latest
+          ports:
+            - containerPort: 5117
+          env:
+            - name: ANT_GATEWAY_HOST
+              value: "0.0.0.0"
+            - name: ANT_GATEWAY_PORT
+              value: "5117"
+            - name: ANT_WHATSAPP_ENABLED
+              value: "false"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 5117
+            initialDelaySeconds: 20
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 5117
+            initialDelaySeconds: 10
+            periodSeconds: 5
+

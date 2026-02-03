@@ -18,6 +18,7 @@ import { TaskLane } from "./concurrency/lanes.js";
 import { TimeoutMonitor } from "./concurrency/timeout-monitor.js";
 import { PhaseExecutor } from "./subagent/phase-executor.js";
 import { DEFAULT_SUBAGENT_PHASES } from "./subagent/execution-phases.js";
+import { ProviderDiscoveryService } from "./duties/provider-discovery-service.js";
 import {
   DEFAULT_AGENT_ID,
   buildAgentScopedSessionKey,
@@ -32,12 +33,13 @@ export interface MainAgentSendMessage {
 }
 
 export class MainAgent {
-  public config: AntConfig;
+  private _config: AntConfig;
   private agentEngine: AgentEngine;
   private logger: Logger;
   private sendMessage?: MainAgentSendMessage;
   private sessionManager?: SessionManager;
   private running = false;
+  private paused = false;
   private timer: NodeJS.Timeout | null = null;
   private startupHealthCheckDone = false;
   private taskStore: TaskStore;
@@ -46,6 +48,15 @@ export class MainAgent {
   private phaseExecutor: PhaseExecutor;
   private autonomousRunning = false;
   private readonly agentId: string;
+  private lastErrorScanAt = Date.now();
+  private readonly errorInvestigationCooldownMs = 15 * 60 * 1000;
+  private readonly investigatedErrors = new Map<string, number>();
+  private readonly providerDiscovery: ProviderDiscoveryService;
+  private survivalMode = false;
+  private lastSurvivalAttemptAt = 0;
+  private lastProviderDiscoveryAt = 0;
+  private lastProviderHealthCheckAt = 0;
+  private readonly survivalAttemptCooldownMs = 5 * 60 * 1000;
 
   constructor(params: {
     config: AntConfig;
@@ -54,7 +65,7 @@ export class MainAgent {
     sendMessage?: MainAgentSendMessage;
     sessionManager?: SessionManager;
   }) {
-    this.config = params.config;
+    this._config = params.config;
     this.agentEngine = params.agentEngine;
     this.sendMessage = params.sendMessage;
     this.sessionManager = params.sessionManager;
@@ -107,6 +118,21 @@ export class MainAgent {
         await this.handleTimeout(task, reason);
       },
     });
+
+    this.providerDiscovery = new ProviderDiscoveryService({
+      cfg: this.config,
+      agentEngine: this.agentEngine,
+      logger: this.logger,
+    });
+  }
+
+  get config(): AntConfig {
+    return this._config;
+  }
+
+  set config(next: AntConfig) {
+    this._config = next;
+    this.providerDiscovery.setConfig(next);
   }
 
   async start(): Promise<void> {
@@ -119,8 +145,13 @@ export class MainAgent {
     this.timeoutMonitor.start();
 
     this.running = true;
+    this.paused = false;
+    this.lastErrorScanAt = Date.now();
+    this.lastProviderDiscoveryAt = 0;
+    this.lastProviderHealthCheckAt = 0;
     this.logger.info("Main Agent loop started - Autonomous mode enabled");
 
+    await this.restoreActiveTasksOnStartup();
     await this.sendStartupMessage();
     await this.runStartupHealthCheck();
 
@@ -129,9 +160,25 @@ export class MainAgent {
 
   stop(): void {
     this.running = false;
+    this.paused = false;
     this.timeoutMonitor.stop();
     if (this.timer) clearTimeout(this.timer);
     this.logger.info("Main Agent loop stopped");
+  }
+
+  pause(): void {
+    this.paused = true;
+    this.logger.info("Main Agent paused");
+  }
+
+  resume(): void {
+    if (!this.running) return;
+    this.paused = false;
+    this.logger.info("Main Agent resumed");
+  }
+
+  isPaused(): boolean {
+    return this.paused;
   }
 
   async assignTask(description: string, maxRetries?: number): Promise<string> {
@@ -156,6 +203,32 @@ export class MainAgent {
 
     await this.enqueueTask(task, TaskLane.Main);
     this.logger.info({ taskId: task.taskId }, "New task assigned to Main Agent");
+
+    return task.taskId;
+  }
+
+  async assignMaintenanceTask(description: string, maxRetries?: number): Promise<string> {
+    const retries = maxRetries ?? this.config.agentExecution?.tasks?.defaults?.maxRetries ?? 3;
+    const sessionKey = buildAgentTaskSessionKey({
+      agentId: this.agentId,
+      taskId: crypto.randomUUID(),
+    });
+
+    const task = await this.taskStore.create({
+      description,
+      sessionKey,
+      lane: TaskLane.Maintenance,
+      metadata: {
+        channel: "cli",
+        priority: "high",
+        tags: ["investigation"],
+      },
+      retries: { maxAttempts: retries },
+      timeoutMs: this.config.agentExecution?.tasks?.defaults?.timeoutMs ?? 120_000,
+    });
+
+    await this.enqueueTask(task, TaskLane.Maintenance);
+    this.logger.info({ taskId: task.taskId }, "New maintenance task assigned to Main Agent");
 
     return task.taskId;
   }
@@ -311,8 +384,14 @@ export class MainAgent {
 
   private async runCycle(): Promise<void> {
     if (!this.running) return;
+    if (this.paused) {
+      this.scheduleNext_();
+      return;
+    }
 
     try {
+      await this.runProviderMaintenance();
+      await this.scanForErrorsAndSpawnInvestigations();
       const active = await this.taskStore.getActiveTasks();
       if (active.length === 0 && !this.autonomousRunning) {
         this.autonomousRunning = true;
@@ -324,6 +403,237 @@ export class MainAgent {
     }
 
     this.scheduleNext_();
+  }
+
+  private getProviderDiscoverySettings(): {
+    enabled: boolean;
+    researchIntervalHours: number;
+    healthCheckIntervalMinutes: number;
+    minBackupProviders: number;
+  } {
+    const discovery = (this.config.resolved.providers as any).discovery ?? {};
+    return {
+      enabled: Boolean(discovery.enabled),
+      researchIntervalHours:
+        typeof discovery.researchIntervalHours === "number" && discovery.researchIntervalHours > 0
+          ? discovery.researchIntervalHours
+          : 24,
+      healthCheckIntervalMinutes:
+        typeof discovery.healthCheckIntervalMinutes === "number" && discovery.healthCheckIntervalMinutes > 0
+          ? discovery.healthCheckIntervalMinutes
+          : 15,
+      minBackupProviders:
+        typeof discovery.minBackupProviders === "number" && discovery.minBackupProviders >= 0
+          ? discovery.minBackupProviders
+          : 2,
+    };
+  }
+
+  private async runProviderMaintenance(): Promise<void> {
+    if (ProviderDiscoveryService.isDisabledByEnv()) return;
+
+    const now = Date.now();
+    const settings = this.getProviderDiscoverySettings();
+
+    const healthy = await this.agentEngine.hasHealthyProvider();
+    if (!healthy) {
+      const shouldAttempt = now - this.lastSurvivalAttemptAt >= this.survivalAttemptCooldownMs;
+      if (!this.survivalMode) {
+        this.survivalMode = true;
+        await this.notifyOwners("⚠️ All providers appear down. Entering survival mode and attempting recovery.");
+      }
+      if (shouldAttempt) {
+        this.lastSurvivalAttemptAt = now;
+        try {
+          await this.providerDiscovery.runDiscovery({ mode: "emergency" });
+        } catch (err) {
+          this.logger.warn({ error: err instanceof Error ? err.message : String(err) }, "Emergency provider discovery failed");
+        }
+      }
+      const recovered = await this.agentEngine.hasHealthyProvider();
+      if (recovered) {
+        this.survivalMode = false;
+        await this.notifyOwners("✅ Provider recovery succeeded. Survival mode cleared.");
+      }
+      return;
+    }
+
+    if (this.survivalMode) {
+      this.survivalMode = false;
+      await this.notifyOwners("✅ Providers recovered. Survival mode cleared.");
+    }
+
+    if (!settings.enabled) return;
+
+    const healthIntervalMs = settings.healthCheckIntervalMinutes * 60 * 1000;
+    if (now - this.lastProviderHealthCheckAt >= healthIntervalMs) {
+      this.lastProviderHealthCheckAt = now;
+      try {
+        await this.providerDiscovery.runHealthCheck();
+      } catch (err) {
+        this.logger.debug({ error: err instanceof Error ? err.message : String(err) }, "Provider health check failed");
+      }
+    }
+
+    const researchIntervalMs = settings.researchIntervalHours * 60 * 60 * 1000;
+    if (now - this.lastProviderDiscoveryAt >= researchIntervalMs) {
+      this.lastProviderDiscoveryAt = now;
+      try {
+        const result = await this.providerDiscovery.runDiscovery({ mode: "scheduled" });
+        if (result.ok && result.overlay) {
+          const providerCount = Object.keys(result.overlay.providers).length;
+          if (providerCount < settings.minBackupProviders) {
+            await this.notifyOwners(
+              `⚠️ Provider discovery: only ${providerCount}/${settings.minBackupProviders} backup providers verified. Set API key/model env vars or enable local runtimes.`
+            );
+          }
+        }
+      } catch (err) {
+        this.logger.debug({ error: err instanceof Error ? err.message : String(err) }, "Scheduled provider discovery failed");
+      }
+    }
+  }
+
+  private async restoreActiveTasksOnStartup(): Promise<void> {
+    try {
+      const active = await this.taskStore.getActiveTasks();
+      if (active.length === 0) return;
+
+      this.logger.info({ count: active.length }, "Restoring active tasks on startup");
+      const now = Date.now();
+
+      for (const task of active) {
+        const lane = task.lane === "maintenance"
+          ? TaskLane.Maintenance
+          : task.lane === "autonomous"
+            ? TaskLane.Autonomous
+            : TaskLane.Main;
+
+        const delayMs =
+          task.status === "retrying" && task.retries.nextRetryAt && task.retries.nextRetryAt > now
+            ? task.retries.nextRetryAt - now
+            : 0;
+
+        await this.taskStore.updateStatus(task.taskId, "queued", "resume_after_restart");
+        if (delayMs > 0) {
+          this.taskQueue.enqueueWithDelay(
+            task,
+            lane,
+            async () => this.runTask(task.taskId),
+            delayMs
+          );
+        } else {
+          this.taskQueue.enqueue(task, lane, async () => this.runTask(task.taskId));
+        }
+      }
+    } catch (err) {
+      this.logger.warn({ error: err instanceof Error ? err.message : String(err) }, "Failed restoring active tasks");
+    }
+  }
+
+  private async scanForErrorsAndSpawnInvestigations(): Promise<void> {
+    const now = Date.now();
+    const scanSince = this.lastErrorScanAt;
+    this.lastErrorScanAt = now;
+
+    const logPath = this.config.resolved.logFilePath;
+    const errors = await this.scanLogForErrors(logPath, scanSince);
+    if (errors.length === 0) return;
+
+    const maxPerCycle = 2;
+    let spawned = 0;
+
+    for (const err of errors) {
+      if (spawned >= maxPerCycle) break;
+
+      const key = err.signature;
+      const last = this.investigatedErrors.get(key) ?? 0;
+      if (now - last < this.errorInvestigationCooldownMs) continue;
+
+      this.investigatedErrors.set(key, now);
+
+      const description = `${err.summary}\n\n${err.details}\n\n${(await import("./templates/investigation.js")).INVESTIGATION_SUBAGENT_PROMPT}`;
+      const taskId = await this.assignMaintenanceTask(description, 2);
+      spawned += 1;
+
+      await this.notifyOwners(
+        `🔍 Detected error. Starting investigation.\n\n*Task*: ${taskId}\n*Summary*: ${err.summary}`
+      );
+    }
+  }
+
+  private async notifyOwners(message: string): Promise<void> {
+    const ownerJids = this.config.whatsapp?.ownerJids || [];
+    const startupRecipients = this.config.whatsapp?.startupRecipients || [];
+    const recipients = startupRecipients.length > 0 ? startupRecipients : ownerJids;
+    if (recipients.length === 0 || !this.sendMessage) return;
+
+    for (const jid of recipients) {
+      try {
+        await this.sendMessage(jid, message);
+      } catch (err) {
+        this.logger.debug({ error: err instanceof Error ? err.message : String(err), jid }, "Failed to notify owner");
+      }
+    }
+  }
+
+  private async scanLogForErrors(
+    logFilePath: string,
+    sinceTs: number,
+  ): Promise<Array<{ signature: string; summary: string; details: string }>> {
+    try {
+      const stat = await fs.stat(logFilePath);
+      if (stat.size === 0) return [];
+
+      const maxBytes = 256_000;
+      const start = Math.max(0, stat.size - maxBytes);
+      const fh = await fs.open(logFilePath, "r");
+      try {
+        const buffer = Buffer.alloc(stat.size - start);
+        await fh.read(buffer, 0, buffer.length, start);
+        const text = buffer.toString("utf-8");
+        const lines = text.split("\n").filter(Boolean);
+
+        const found: Array<{ signature: string; summary: string; details: string }> = [];
+        for (let i = lines.length - 1; i >= 0; i--) {
+          const line = lines[i] ?? "";
+          let entry: any;
+          try {
+            entry = JSON.parse(line);
+          } catch {
+            continue;
+          }
+          const ts = typeof entry.time === "number" ? entry.time : typeof entry.timestamp === "number" ? entry.timestamp : 0;
+          if (sinceTs && ts && ts <= sinceTs) break;
+
+          const level = typeof entry.level === "number" ? entry.level : 0;
+          if (level < 50) continue;
+
+          const msg = typeof entry.msg === "string" ? entry.msg : "error";
+          const errMsg =
+            typeof entry.error === "string"
+              ? entry.error
+              : entry.err && typeof entry.err === "object" && typeof entry.err.message === "string"
+                ? entry.err.message
+                : "";
+          const providerId = typeof entry.providerId === "string" ? entry.providerId : undefined;
+          const model = typeof entry.model === "string" ? entry.model : undefined;
+
+          const summary = providerId ? `${msg} (${providerId}${model ? `/${model}` : ""})` : msg;
+          const details = errMsg ? `Error: ${errMsg}` : `Log: ${line.slice(0, 1000)}`;
+          const signature = crypto.createHash("sha256").update(summary + "\n" + details).digest("hex");
+
+          found.push({ signature, summary, details });
+          if (found.length >= 5) break;
+        }
+
+        return found;
+      } finally {
+        await fh.close();
+      }
+    } catch {
+      return [];
+    }
   }
 
   private async sendStartupMessage(): Promise<void> {

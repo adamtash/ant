@@ -171,6 +171,7 @@ export interface AgentInput {
   cronContext?: CronContext;
   history?: Message[];
   runId?: string;
+  toolPolicy?: string;
 }
 
 /**
@@ -231,6 +232,8 @@ export type CLIProviderType = "copilot" | "claude" | "codex" | "kimi";
  * Chat completion options
  */
 export interface ChatOptions {
+  /** Override the provider's configured model for this call. */
+  model?: string;
   temperature?: number;
   maxTokens?: number;
   /** Best-effort provider-side timeout (also enforced by engine timeouts). */

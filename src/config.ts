@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { z } from "zod";
+import { readProvidersDiscoveredOverlay } from "./config/provider-writer.js";
 
 const DEFAULT_CONFIG_PATH = "ant.config.json";
 
@@ -43,10 +44,51 @@ const ProviderItemSchema = z
     { message: "providers.items.*.baseUrl is required for openai provider" },
   );
 
+const ProvidersDiscoverySchema = z
+  .object({
+    enabled: z.boolean().default(false),
+    researchIntervalHours: z.number().int().positive().default(24),
+    healthCheckIntervalMinutes: z.number().int().positive().default(15),
+    minBackupProviders: z.number().int().min(0).default(2),
+    trustSources: z.array(z.string()).default([]),
+  })
+  .default({});
+
+const ProvidersLocalSchema = z
+  .object({
+    enabled: z.boolean().default(true),
+    preferFastModels: z.boolean().default(true),
+    autoDownloadModels: z.boolean().default(false),
+    ollama: z
+      .object({
+        enabled: z.boolean().default(true),
+        endpoint: z.string().default("http://localhost:11434"),
+        fastModels: z
+          .array(z.string())
+          .default(["llama3.2:1b", "qwen2.5:0.5b", "phi3:mini", "gemma2:2b"]),
+      })
+      .default({}),
+    lmstudio: z
+      .object({
+        enabled: z.boolean().default(true),
+        endpoint: z.string().default("http://localhost:1234/v1"),
+        fastModels: z
+          .array(z.string())
+          .default([
+            "lmstudio-community/Llama-3.2-1B-Instruct-GGUF",
+            "Qwen/Qwen2.5-0.5B-Instruct-GGUF",
+          ]),
+      })
+      .default({}),
+  })
+  .default({});
+
 const ProvidersSchema = z.object({
   default: z.string().min(1),
   items: z.record(ProviderItemSchema),
   fallbackChain: z.array(z.string()).optional().default([]),
+  discovery: ProvidersDiscoverySchema.optional().default({}),
+  local: ProvidersLocalSchema.optional().default({}),
 });
 
 type ProvidersOutput = z.infer<typeof ProvidersSchema>;
@@ -466,8 +508,78 @@ export async function loadConfig(explicitPath?: string): Promise<AntConfig> {
   const configPath = resolveConfigPath(explicitPath);
   const raw = await fs.readFile(configPath, "utf-8");
   const parsed = JSON.parse(raw);
-  const base = ConfigSchema.parse(parsed);
-  return resolveConfig(base, configPath);
+  const withEnv = applyEnvOverrides(parsed);
+  const base = ConfigSchema.parse(withEnv);
+  const resolved = resolveConfig(base, configPath);
+  const overlayResult = await readProvidersDiscoveredOverlay(resolved.resolved.stateDir);
+  if (!overlayResult.ok || !overlayResult.overlay) return resolved;
+
+  const overlay = overlayResult.overlay;
+  const baseProviders = resolved.resolved.providers;
+  const mergedItems: Record<string, z.infer<typeof ProviderItemSchema>> = {
+    ...(baseProviders.items as Record<string, z.infer<typeof ProviderItemSchema>>),
+  };
+
+  const candidates: Array<{
+    id: string;
+    kind: "local" | "remote";
+    reliabilityScore: number;
+  }> = [];
+
+  for (const [id, record] of Object.entries(overlay.providers)) {
+    if (!id) continue;
+    const parsedConfig = ProviderItemSchema.safeParse(record.config);
+    if (!parsedConfig.success) {
+      if (id in mergedItems) {
+        candidates.push({
+          id,
+          kind: record.kind,
+          reliabilityScore: typeof record.reliabilityScore === "number" ? record.reliabilityScore : 0,
+        });
+      }
+      continue;
+    }
+
+    if (!(id in mergedItems)) {
+      mergedItems[id] = parsedConfig.data;
+    }
+
+    candidates.push({
+      id,
+      kind: record.kind,
+      reliabilityScore: typeof record.reliabilityScore === "number" ? record.reliabilityScore : 0,
+    });
+  }
+
+  if (candidates.length === 0) return resolved;
+
+  const localIds = candidates
+    .filter((p) => p.kind === "local")
+    .sort((a, b) => b.reliabilityScore - a.reliabilityScore || a.id.localeCompare(b.id))
+    .map((p) => p.id);
+  const remoteIds = candidates
+    .filter((p) => p.kind === "remote")
+    .sort((a, b) => b.reliabilityScore - a.reliabilityScore || a.id.localeCompare(b.id))
+    .map((p) => p.id);
+  const discoveredOrder = [...localIds, ...remoteIds];
+
+  const mergedFallbackChain = Array.from(
+    new Set([...(baseProviders.fallbackChain ?? []), ...discoveredOrder])
+  );
+
+  const mergedProviders = {
+    ...baseProviders,
+    items: mergedItems,
+    fallbackChain: mergedFallbackChain,
+  };
+
+  return {
+    ...resolved,
+    resolved: {
+      ...resolved.resolved,
+      providers: mergedProviders,
+    },
+  };
 }
 
 export async function saveConfig(config: unknown, explicitPath?: string): Promise<void> {
@@ -479,9 +591,69 @@ export async function saveConfig(config: unknown, explicitPath?: string): Promis
 }
 
 export function resolveConfigPath(explicitPath?: string): string {
-  const envPath = process.env.ANT_CONFIG?.trim();
+  const envPath = (process.env.ANT_CONFIG_PATH ?? process.env.ANT_CONFIG)?.trim();
   const pathToUse = explicitPath?.trim() || envPath || DEFAULT_CONFIG_PATH;
   return path.resolve(pathToUse);
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  if (!value || typeof value !== "object") return false;
+  if (Array.isArray(value)) return false;
+  return Object.getPrototypeOf(value) === Object.prototype;
+}
+
+function applyEnvOverrides(raw: unknown): unknown {
+  if (!isPlainObject(raw)) return raw;
+
+  const config: Record<string, unknown> = { ...raw };
+
+  const envStr = (name: string) => {
+    const v = (process.env[name] || "").trim();
+    return v ? v : undefined;
+  };
+  const envInt = (name: string) => {
+    const v = envStr(name);
+    if (!v) return undefined;
+    const parsed = parseInt(v, 10);
+    return Number.isFinite(parsed) ? parsed : undefined;
+  };
+
+  const workspaceDir = envStr("ANT_WORKSPACE_DIR");
+  if (workspaceDir) config.workspaceDir = workspaceDir;
+
+  const stateDir = envStr("ANT_STATE_DIR");
+  if (stateDir) config.stateDir = stateDir;
+
+  const gatewayPort = envInt("ANT_GATEWAY_PORT");
+  const gatewayHost = envStr("ANT_GATEWAY_HOST");
+  if (gatewayPort !== undefined || gatewayHost) {
+    const gateway = isPlainObject(config.gateway) ? { ...config.gateway } : {};
+    if (gatewayPort !== undefined) gateway.port = gatewayPort;
+    if (gatewayHost) gateway.host = gatewayHost;
+    config.gateway = gateway;
+  }
+
+  const uiPort = envInt("ANT_UI_PORT");
+  const uiHost = envStr("ANT_UI_HOST");
+  if (uiPort !== undefined || uiHost) {
+    const ui = isPlainObject(config.ui) ? { ...config.ui } : {};
+    if (uiPort !== undefined) ui.port = uiPort;
+    if (uiHost) ui.host = uiHost;
+    config.ui = ui;
+  }
+
+  const logLevel = envStr("ANT_LOG_LEVEL");
+  const logFileLevel = envStr("ANT_LOG_FILE_LEVEL");
+  const logFilePath = envStr("ANT_LOG_FILE_PATH");
+  if (logLevel || logFileLevel || logFilePath) {
+    const logging = isPlainObject(config.logging) ? { ...config.logging } : {};
+    if (logLevel) logging.level = logLevel;
+    if (logFileLevel) logging.fileLevel = logFileLevel;
+    if (logFilePath) logging.filePath = logFilePath;
+    config.logging = logging;
+  }
+
+  return config;
 }
 
 function resolveConfig(base: z.infer<typeof ConfigSchema>, configPath: string): AntConfig {
@@ -525,15 +697,15 @@ function resolveConfig(base: z.infer<typeof ConfigSchema>, configPath: string): 
 function normalizeProviders(base: z.infer<typeof ConfigSchema>): ProvidersOutput {
   if (base.providers) return base.providers;
   if (base.provider) {
-    return {
+    return ProvidersSchema.parse({
       default: "default",
       items: {
         default: base.provider,
       },
       fallbackChain: [],
-    };
+    });
   }
-  return {
+  return ProvidersSchema.parse({
     default: "default",
     items: {
       default: {
@@ -546,7 +718,7 @@ function normalizeProviders(base: z.infer<typeof ConfigSchema>): ProvidersOutput
       },
     },
     fallbackChain: [],
-  };
+  });
 }
 
 function normalizeRouting(
@@ -562,6 +734,7 @@ function normalizeRouting(
     summary: raw.summary ?? raw.chat ?? fallback,
     subagent: raw.subagent ?? raw.chat ?? fallback,
     parentForCli: raw.parentForCli ?? raw.tools ?? fallback,
+    tiers: raw.tiers ?? {},
   };
 }
 
