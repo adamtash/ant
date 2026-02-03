@@ -834,15 +834,16 @@ export class MessageRouter extends EventEmitter {
     let session = this.sessions.get(sessionKey);
     const parts = sessionKey.split(":");
     const isSystemSession = ["cron", "agent", "subagent", "system"].includes(parts[0]);
+    const isSessionRecoverable = parts.length >= 3 && this.adapters.has(parts[0] as Channel);
 
-    if (!session && isSystemSession) {
+    if (!session && isSystemSession && !isSessionRecoverable) {
       this.logger.info({ sessionKey }, "Skipping send for system session without channel");
       return false;
     }
     
     // Attempt to recover session from key if missing
     if (!session) {
-      if (parts.length >= 3) {
+      if (isSessionRecoverable) {
         const [channel, type, ...rest] = parts;
         const chatId = rest.join(":");
         
@@ -863,6 +864,10 @@ export class MessageRouter extends EventEmitter {
     }
 
     if (!session) {
+      if (isSystemSession) {
+        this.logger.info({ sessionKey }, "Skipping send for system session without channel");
+        return false;
+      }
       this.logger.warn({ sessionKey }, "Session not found and could not be recovered");
       
       // Emit error event

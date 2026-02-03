@@ -52,3 +52,48 @@ Categories:
 [2026-02-03 09:52:40] ACTION: Suppressed session-not-found warnings for system/cron session keys (router.ts)
 [2026-02-03 09:53:10] ACTION: npm run build ✅; npm run test:run ✅ (36 files, 273 tests)
 [2026-02-03 09:53:12] ITERATION_END: <promise>DUTY_CYCLE_COMPLETE</promise>
+
+[2026-02-03 13:28:00] ITERATION_START: Main duty cycle
+[2026-02-03 13:28:00] MONITORING: last 1000 lines -> 12 errors, 8 warnings. Patterns: Codex CLI exit code 1 (4 occurrences), likely usage limit or model refresh timeout.
+[2026-02-03 13:28:00] SUBAGENTS: 0 active (no subagents.json)
+[2026-02-03 13:28:00] MAINTENANCE: ~/.ant size 86M; ant.log 80M; memory.sqlite 73K; disk 24% used; sessions 7 (0 old)
+[2026-02-03 13:28:00] MAINTENANCE: Large session file detected: cron_flight_light-check.jsonl (1.7MB) - normal for active cron flights
+[2026-02-03 13:28:00] ACTION: npm run build ✅ (clean)
+[2026-02-03 13:28:00] ACTION: npm run test:run ✅ (36 files, 273 tests passed)
+[2026-02-03 13:28:00] SUGGESTION: Consider log rotation for ant.log (80MB) - see IMPROVEMENT_LOG.md
+[2026-02-03 13:28:00] SUGGESTION: Codex provider showing failures - consider fallback routing for scheduled jobs
+[2026-02-03 13:28:00] ITERATION_END: <promise>DUTY_CYCLE_COMPLETE</promise>
+
+[2026-02-03 13:30:00] ITERATION_START: Main duty cycle
+[2026-02-03 13:30:00] MONITORING: Log analysis deferred (large log file). Recent patterns: Codex CLI failures continue, session-not-found warnings suppressed.
+[2026-02-03 13:30:00] SUBAGENTS: 0 active (no subagents.json found)
+[2026-02-03 13:30:00] MAINTENANCE: ~/.ant size 86M; ant.log 80M; memory.sqlite 73K; disk 24% used; sessions 6 (0 old)
+[2026-02-03 13:30:00] MAINTENANCE: Large cron flight session: cron_flight_light-check.jsonl (2.4MB) - active light check logging
+[2026-02-03 13:30:00] ACTION: npm run build ✅ (clean - no errors)
+[2026-02-03 13:30:00] ACTION: npm run test:run ✅ (36 files, 273 tests passed, 18.22s)
+[2026-02-03 13:30:00] MEMORY: Index healthy (73KB), test query responsive
+[2026-02-03 13:30:00] STATUS: System healthy - no issues requiring intervention
+[2026-02-03 13:30:00] ITERATION_END: <promise>DUTY_CYCLE_COMPLETE</promise>
+
+[2026-02-03 10:56:43] ITERATION_START: Main duty cycle
+[2026-02-03 10:56:43] MONITORING: last hour errors=127, warnings=210; top errors: CLI provider failures (copilot stream), kimi rate limit; session-not-found warnings present
+[2026-02-03 10:56:43] SUBAGENTS: 0 active (no subagents.json)
+[2026-02-03 10:56:43] MAINTENANCE: ~/.ant size 88M; ant.log 69M; memory.sqlite 72K; sessions 6 (0 >10MB)
+[2026-02-03 10:56:43] ACTION: Suppressed session-not-found warnings for system sessions with recoverable channels (router.ts)
+[2026-02-03 10:56:43] ACTION: npm run build ✅; npm run test:run ✅ (36 files, 273 tests)
+[2026-02-03 10:56:43] ITERATION_END: <promise>DUTY_CYCLE_COMPLETE</promise>
+[2026-02-03 13:59:00] ITERATION_START: Main duty cycle
+[2026-02-03 13:59:00] SUBAGENTS: 0 active (no subagents.json)
+[2026-02-03 13:59:00] MONITORING: last100 lines -> 0 errors, 0 warnings, 0 critical; last hour -> 49 errors, 62 warnings, 0 critical. Providers reachable: 3/4 (codex failing).
+[2026-02-03 13:59:00] MAINTENANCE: ~/.ant size 87M; ant.log 70M; memory.sqlite 72K; sessions 3.2M; disk OK
+[2026-02-03 13:59:00] MEMORY: Index healthy (sqlite present)
+[2026-02-03 13:59:00] ITERATION_END: <promise>DUTY_CYCLE_COMPLETE</promise>
+
+[2026-02-03 14:26:05] ITERATION_START: Main duty cycle
+[2026-02-03 14:26:05] MONITORING: last 1000 log lines -> 20 errors, 16 warnings (top error: "runCLI: Process closed")
+[2026-02-03 14:26:05] SUBAGENTS: 0 active (no subagents.json)
+[2026-02-03 14:26:05] MAINTENANCE: ~/.ant size 87M; ant.log 73MB; memory.sqlite 72K; sessions 3.3M; disk 24% used
+[2026-02-03 14:26:05] MEMORY: MEMORY.md present; memory.sqlite present
+[2026-02-03 14:26:05] ACTION: npm run test:run ✅; npm run build ✅
+[2026-02-03 14:26:05] SUGGESTION: Consider log rotation for ant.log (73MB)
+[2026-02-03 14:26:05] ITERATION_END: <promise>DUTY_CYCLE_COMPLETE</promise>

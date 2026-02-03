@@ -345,6 +345,15 @@ export async function start(cfg: AntConfig, options: StartOptions = {}): Promise
 
     await server.start();
 
+    let stopTui: (() => void) | null = null;
+    if (options.tui) {
+      const { startTui } = await import("../../../runtime/tui.js");
+      stopTui = await startTui({
+        baseUrl: uiUrl,
+        onExit: () => process.kill(process.pid, "SIGINT"),
+      });
+    }
+
     const mainAgentEnabled = cfg.mainAgent?.enabled ?? true;
     server.setMainAgentRunning(mainAgentEnabled);
 
@@ -371,8 +380,9 @@ export async function start(cfg: AntConfig, options: StartOptions = {}): Promise
         timeout.unref();
 
         try {
-	          mainAgent.stop();
-	          server.setMainAgentRunning(false);
+          stopTui?.();
+          mainAgent.stop();
+          server.setMainAgentRunning(false);
 	          await router.stop();
 	          await server.stop();
 	          await scheduler?.stop();

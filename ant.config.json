@@ -1,7 +1,7 @@
 {
   "workspaceDir": "~",
   "providers": {
-    "default": "codex",
+    "default": "copilot",
     "items": {
       "lmstudio": {
         "type": "openai",
@@ -54,10 +54,10 @@
     ]
   },
   "routing": {
-    "chat": "codex",
-    "tools": "codex",
+    "chat": "copilot",
+    "tools": "copilot",
     "embeddings": "lmstudio",
-    "parentForCli": "codex"
+    "parentForCli": "copilot"
   },
   "ui": {
     "enabled": true,

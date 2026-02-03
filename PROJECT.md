@@ -131,7 +131,7 @@ When running the runtime, open:
 Logs SSE stream now lives at `/api/logs/stream`.
 
 ### TUI mode (optional)
-The TUI shows a two-column live dashboard with log tail and key hints (`p` pause, `q` quit, `?` help).
+The TUI shows live status panels for the runtime, subagents, and drone flights with key hints (`p` pause, `q` quit, `?` help).
 
 ```bash
 npm run dev -- run -c ant.config.json --tui

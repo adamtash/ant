@@ -85,14 +85,11 @@
 - **Memory commands**: `/memory <note>` or `/remember <note>` appends to `MEMORY.md`
 
 ### TUI Mode
-- **Purpose**: Live dashboard for monitoring (main task, queue, subagents)
+- **Purpose**: Live dashboard for monitoring (main task, queue, subagents, drone flights)
 - **Launch**: `npm run dev -- run -c ant.config.json --tui`
 - **Implementation**: `src/runtime/tui.ts` (blessed library)
 - **Features**:
-  - Alternate screen (preserves terminal history)
-  - Console logs suppressed (logs still go to file)
-  - Queue lanes display (queued, active, max concurrent)
-  - Subagent tracking (status, timing)
+  - Status + subagent panels with drone flights (scheduled jobs)
   - Key bindings: `p` pause, `q` quit, `?` help
 
 ### Web UI
@@ -289,7 +286,7 @@ npm run dev -- debug simulate "message"      # Full inbound flow (no WhatsApp)
 - [x] Implement Drone Flights (scheduled maintenance tasks)
 - [x] Create three flight types: Light Check, Hourly, Weekly
 - [x] Auto-register flights on runtime startup
-- [ ] Add Drone Flights status to TUI
+- [x] Add Drone Flights status to TUI
 - [ ] Add more fast-path intents (screenshot, open browser, list files)
 - [ ] Improve retry/backoff for WhatsApp disconnects
 - [ ] Improve retry/backoff for provider API errors

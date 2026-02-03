@@ -87,7 +87,7 @@ Copy and customize `ant.config.json` in the project root:
 # Development mode (with hot reload)
 npm run dev -- run -c ant.config.json
 
-# With TUI dashboard (real-time monitoring)
+# With TUI dashboard (real-time monitoring + drone flights)
 npm run dev -- run -c ant.config.json --tui
 
 # Production mode

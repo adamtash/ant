@@ -40,6 +40,16 @@ This file tracks recurring issues and their solutions for autonomous fixing by t
 **Auto-Fixable**: false (user preference)
 **Note**: Current config has timeoutMs: 1200000 - may need increase for heavy tasks
 
+## Issue ID: ROUTER-PROCESSING-TIMEOUT
+**Description**: Router message processing fails with timeout at 300s for long-running tasks
+**Pattern**: "Timeout: Message processing took longer than 300s" or "Message processing failed" with that error
+**Root Cause**: Router session queue timeout (300s) shorter than cliTools timeout, so long tool loops exceed router guard.
+**Solution**:
+1. Align router sessionOrdering.queueTimeoutMs with cliTools.timeoutMs (default 1,200,000ms).
+2. Use config-driven timeout to avoid mismatch when cliTools timeout changes.
+**Fixed**: true (runtime start + harness now use cliTools.timeoutMs)
+**Auto-Fixable**: true
+
 ## Issue ID: CODEX-CLI-PROMPT-ARG
 **Description**: Codex CLI fails with "unexpected argument '-q'"
 **Pattern**: "error: unexpected argument '-q' found" or "CLI codex error"
@@ -116,8 +126,9 @@ This file tracks recurring issues and their solutions for autonomous fixing by t
 1. Switch routing to another provider (copilot/kimi/lmstudio) for scheduled jobs.
 2. Wait for quota reset time or request a limit increase from admin.
 3. Consider short-circuiting codex provider when this pattern appears.
-**Fixed**: false
+**Fixed**: true (mitigated by switching default routing to copilot)
 **Auto-Fixable**: false (requires quota or routing change)
+**Note**: Config updated 2026-02-03 to use copilot as default provider to avoid Codex rate limits.
 
 ---
 
@@ -151,9 +162,9 @@ This file tracks recurring issues and their solutions for autonomous fixing by t
 **Root Cause**: sendToSession expects session keys like channel:type:chatId; cron/main-agent session keys (e.g., cron:flight:light-check) lack a channel for recovery.
 **Solution**:
 1. Pre-register system sessions or send via channel-specific adapters.
-2. Optionally downgrade or suppress warnings for system-only sessions.
-**Fixed**: false
-**Auto-Fixable**: false
+2. Suppress warnings and error events for system-only session keys.
+**Fixed**: true (skip warnings for system sessions without a recoverable channel)
+**Auto-Fixable**: true
 
 ## Issue ID: CONFIG-ROUTING-DUPLICATE
 **Description**: TypeScript build fails due to duplicate RoutingSchema/RoutingOutput declarations.
@@ -173,3 +184,14 @@ This file tracks recurring issues and their solutions for autonomous fixing by t
 **Fixed**: true
 **Auto-Fixable**: true
 
+## Issue ID: CLI-PROVIDER-PROCESS-CLOSED
+**Description**: CLI provider calls intermittently fail with "runCLI: Process closed"
+**Pattern**: "runCLI: Process closed" or "CLI provider chat call failed"
+**Root Cause**: Unknown; likely provider CLI instability or rate limiting
+**Solution**:
+1. Retry with provider fallback order (codex -> copilot -> kimi -> lmstudio)
+2. Check provider connectivity and quotas
+3. Consider adding retry/backoff or health gating
+**Fixed**: false
+**Auto-Fixable**: false
+**First Seen**: 2026-02-03
