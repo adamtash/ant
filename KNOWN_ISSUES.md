@@ -195,3 +195,45 @@ This file tracks recurring issues and their solutions for autonomous fixing by t
 **Fixed**: false
 **Auto-Fixable**: false
 **First Seen**: 2026-02-03
+
+
+## Issue ID: AUTO-CLI-COMMAND
+**Description**: CLI provider invoked a command but logs are terse; investigate provider verbosity
+**Pattern**: "CLI command"
+**Root Cause**: Unknown - requires investigation
+**Solution**: Investigate logs, add provider fallbacks, and implement retries with backoff
+**Fixed**: false
+**Auto-Fixable**: false
+
+## Issue ID: AUTO-PROVIDER-RESPONSE-PROCESSING-FAILED
+**Description**: Provider returned invalid or unparsable output; consider provider fallback and increase robustness
+**Pattern**: "Provider response processing failed"
+**Root Cause**: Unknown - requires investigation
+**Solution**: Investigate logs, add provider fallbacks, and implement retries with backoff
+**Fixed**: false
+**Auto-Fixable**: false
+
+## Issue ID: AUTO-PARSEKIMIOUTPUT:-DETECTED-POTENTIAL-ERROR-IN-OUTPUT
+**Description**: Kimi CLI emitted error-like text; may indicate rate-limiting or malformed output
+**Pattern**: "parseKimiOutput: Detected potential error in output"
+**Root Cause**: Unknown - requires investigation
+**Solution**: Investigate logs, add provider fallbacks, and implement retries with backoff
+**Fixed**: false
+**Auto-Fixable**: false
+
+## Issue ID: AUTO-AGENT-PROVIDER-RESPONSE-FAILED
+**Description**: Generic provider failure during agent call
+**Pattern**: "Agent provider response failed"
+**Root Cause**: Unknown - requires investigation
+**Solution**: Investigate logs, add provider fallbacks, and implement retries with backoff
+**Fixed**: false
+**Auto-Fixable**: false
+
+## Issue ID: AUTO-EXEC-COMMAND-FAILED
+**Description**: Shell exec failed; check command and environment
+**Pattern**: "Exec command failed"
+**Root Cause**: Unknown - requires investigation
+**Solution**: Investigate logs, add provider fallbacks, and implement retries with backoff
+**Fixed**: false
+**Auto-Fixable**: false
+
