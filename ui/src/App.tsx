@@ -3,12 +3,15 @@
  * Main Application Component
  */
 
-import React from 'react';
-import { Routes, Route, NavLink, Navigate } from 'react-router-dom';
+import React, { useMemo } from 'react';
+import { Routes, Route, NavLink, Navigate, useNavigate } from 'react-router-dom';
 import { motion } from 'framer-motion';
 import { useUIStore, type PageId } from './stores';
-import { useEventConnection } from './api/eventHandler';
+import { useRealtimeState } from './realtime/provider';
 import { ToastContainer } from './components/base';
+import { CommandPalette, type CommandPaletteAction, EntityDrawer, StatusPills } from './components/ops';
+import { useQueryClient } from '@tanstack/react-query';
+import { createTask, pauseMainAgent, resumeMainAgent, runJob } from './api/client';
 import {
   RoyalChamber,
   ForagingGrounds,
@@ -178,11 +181,12 @@ const Sidebar: React.FC = () => {
       {/* Footer */}
       <div className="p-4 border-t border-chamber-wall">
         {!sidebarCollapsed ? (
-          <div className="text-xs text-gray-500">
-            <div className="flex items-center gap-2">
+          <div className="space-y-2">
+            <div className="text-xs text-gray-500 flex items-center gap-2">
               <span className="w-2 h-2 rounded-full bg-nurse-green animate-pulse" />
-              Colony Active
+              Control Plane
             </div>
+            <StatusPills />
           </div>
         ) : (
           <div className="flex justify-center">
@@ -220,22 +224,108 @@ const MainContent: React.FC = () => {
 
 // Main App component
 const App: React.FC = () => {
-  // Connect to backend events
-  const isConnected = useEventConnection();
+  const realtime = useRealtimeState();
+  const queryClient = useQueryClient();
+  const navigate = useNavigate();
+  const addToast = useUIStore((s) => s.addToast);
+
+  const paletteActions = useMemo<Array<CommandPaletteAction>>(
+    () => [
+      {
+        id: 'pause-queen',
+        group: 'Queen',
+        label: 'Pause Queen',
+        icon: '⏸️',
+        onSelect: async () => {
+          await pauseMainAgent();
+          await queryClient.invalidateQueries({ queryKey: ['status'] });
+          addToast({ type: 'success', title: 'Queen paused' });
+        },
+      },
+      {
+        id: 'resume-queen',
+        group: 'Queen',
+        label: 'Resume Queen',
+        icon: '▶️',
+        onSelect: async () => {
+          await resumeMainAgent();
+          await queryClient.invalidateQueries({ queryKey: ['status'] });
+          addToast({ type: 'success', title: 'Queen resumed' });
+        },
+      },
+      {
+        id: 'create-task',
+        group: 'Tasks',
+        label: 'Create web task…',
+        icon: '🍂',
+        onSelect: async () => {
+          const prompt = window.prompt('Web task prompt:');
+          if (!prompt?.trim()) return;
+          const res = await createTask(prompt.trim());
+          if ((res as any).ok) {
+            addToast({ type: 'success', title: 'Task queued' });
+            await queryClient.invalidateQueries({ queryKey: ['tasks'] });
+            navigate('/foraging');
+          } else {
+            addToast({ type: 'error', title: 'Task failed', message: (res as any).error ?? 'Unknown error' });
+          }
+        },
+      },
+      {
+        id: 'run-job',
+        group: 'Scheduler',
+        label: 'Run job by id…',
+        icon: '🗓️',
+        onSelect: async () => {
+          const id = window.prompt('Job id:');
+          if (!id?.trim()) return;
+          const res = await runJob(id.trim());
+          if ((res as any).ok) {
+            addToast({ type: 'success', title: 'Job executed' });
+            await queryClient.invalidateQueries({ queryKey: ['jobs'] });
+          } else {
+            addToast({ type: 'error', title: 'Job failed', message: (res as any).error ?? 'Unknown error' });
+          }
+        },
+      },
+      {
+        id: 'refresh-status',
+        group: 'System',
+        label: 'Refresh status',
+        icon: '🔄',
+        onSelect: async () => {
+          await queryClient.invalidateQueries({ queryKey: ['status'] });
+          addToast({ type: 'info', title: 'Refreshing status…' });
+        },
+      },
+    ],
+    [addToast, navigate, queryClient]
+  );
 
   return (
     <div className="h-screen flex bg-chamber-dark text-white overflow-hidden">
       <Sidebar />
       <MainContent />
       <ToastContainer />
+      <EntityDrawer />
+      <CommandPalette
+        pages={navItems.map((n) => ({
+          id: n.id,
+          label: n.label,
+          path: n.path,
+          icon: n.icon,
+          description: n.description,
+        }))}
+        actions={paletteActions}
+      />
       {/* Connection indicator */}
       <div className="fixed bottom-4 right-4 flex items-center gap-2 text-xs text-gray-500">
         <span
           className={`w-2 h-2 rounded-full ${
-            isConnected ? 'bg-nurse-green animate-pulse' : 'bg-soldier-rust'
+            realtime.connected ? 'bg-nurse-green animate-pulse' : 'bg-soldier-rust'
           }`}
         />
-        {isConnected ? 'Connected' : 'Disconnected'}
+        {realtime.connected ? `Connected (${realtime.transport})` : 'Disconnected'}
       </div>
     </div>
   );

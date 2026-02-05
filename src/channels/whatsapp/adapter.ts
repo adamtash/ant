@@ -53,6 +53,21 @@ export interface WhatsAppAdapterConfig extends BaseAdapterConfig {
   }) => void;
 }
 
+const SUPPORTED_LOG_LEVELS = new Set([
+  "fatal",
+  "error",
+  "warn",
+  "info",
+  "debug",
+  "trace",
+  "silent",
+]);
+
+function resolveWhatsAppLogLevel(): string {
+  const requested = (process.env.ANT_WHATSAPP_LOG_LEVEL || "error").trim().toLowerCase();
+  return SUPPORTED_LOG_LEVELS.has(requested) ? requested : "error";
+}
+
 // ============================================================================
 // WhatsApp Adapter
 // ============================================================================
@@ -75,7 +90,12 @@ export class WhatsAppAdapter extends BaseChannelAdapter {
   private events = createEventPublishers(getEventStream());
 
   constructor(config: WhatsAppAdapterConfig) {
-    super(config);
+    const whatsappLogger = config.logger.child(
+      { channel: "whatsapp" },
+      { level: resolveWhatsAppLogLevel() as any }
+    );
+    super({ ...config, logger: whatsappLogger });
+    this.initLogger({ ...config, logger: whatsappLogger });
     this.cfg = config.cfg;
     this.onStatusUpdate = config.onStatusUpdate;
   }

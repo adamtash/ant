@@ -2,6 +2,8 @@
 
 This document defines the responsibilities and operational guidelines for the Main Agent system. The Main Agent runs continuously in the background, executing these duties in a loop every 5 minutes by default.
 
+> NOTE: ant reads this file from `workspaceDir/<mainAgent.dutiesFile>`. If your `workspaceDir` is `~/.ant`, the active copy should live at `~/.ant/AGENT_DUTIES.md`. This repo copy is a template/reference; see `docs/agent-files.md`.
+
 ## Core Philosophy
 
 The Main Agent operates on the **Ralph Wiggum loop** principle:
@@ -16,6 +18,21 @@ Key principles:
 - **Failures Are Data**: Learn from errors, log patterns, adjust
 - **Persistence Wins**: Keep working until complete or need help
 - **Self-Referential**: Build on previous work in files and logs
+
+## Runtime Context Requirements
+
+- Treat `runtime.repoRoot` as the canonical ANT source path for self-work.
+- When proposing code changes, reason from the repo in `runtime.repoRoot`, not from chat assumptions.
+- For self-maintenance tasks, prefer:
+  1. health check in minimal prompt mode,
+  2. targeted diagnostics,
+  3. scoped fix + verification.
+
+## Prompt Discipline
+
+- Use **minimal prompt mode** for health checks, scheduled jobs, subagent internals, and tool-only flows.
+- Use **full prompt mode** only for user-facing tasks requiring broad project context.
+- Avoid appending AGENT_LOG or large bootstrap context to routine/no-op checks.
 
 ## Autonomous Workflow
 

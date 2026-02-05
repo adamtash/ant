@@ -86,16 +86,16 @@ npm install
   "runtime": {
     "restart": {
       "command": "npm",
-      "args": ["run", "dev", "--", "run", "-c", "ant.config.json"]
+      "args": ["run", "dev", "--", "run"]
     }
   }
 }
 ```
-Save it as `ant.config.json` in the repo root.
+Copy `ant.config.example.json` to `~/.ant/ant.config.json` and set `ANT_WORKSPACE_DIR` / `ANT_RUNTIME_REPO_ROOT` in `.env`.
 
 3) Run:
 ```bash
-npm run dev -- run -c ant.config.json
+npm run dev -- run
 ```
 
 4) Pair WhatsApp by scanning the QR in your terminal.
@@ -131,18 +131,48 @@ When running the runtime, open:
 
 Logs SSE stream now lives at `/api/logs/stream`.
 
+### Split Runtime (Supervisor + Gateway + Worker)
+ANT now supports a supervised split runtime:
+
+- **Supervisor process**: starts/monitors children and routes IPC bridge messages.
+- **Gateway process**: channels, queue, API/UI server, config watcher.
+- **Worker process**: agent engine, memory manager, scheduler, main agent loop.
+
+Enable via config:
+```json
+"runtime": {
+  "mode": "split",
+  "supervisor": {
+    "enabled": true,
+    "restartDelayMs": 1000,
+    "maxRestarts": 10,
+    "restartWindowMs": 60000
+  },
+  "worker": {
+    "heartbeatPath": ".ant/heartbeat.worker",
+    "heartbeatIntervalMs": 5000,
+    "maxHeartbeatAgeMs": 20000
+  }
+}
+```
+
+Notes:
+- UI can remain responsive while worker restarts.
+- Supervisor can restart only the worker for heartbeat stalls.
+- `runtime.repoRoot` is optional; it defaults to the directory containing the loaded `ant.config.json`. It’s mainly used to give the agent a canonical “source root” for `self_build` and self-maintenance prompts.
+
 ### TUI mode (optional)
 The TUI shows live status panels for the runtime, subagents, and drone flights with key hints (`p` pause, `q` quit, `?` help).
 
 ```bash
-npm run dev -- run -c ant.config.json --tui
+npm run dev -- run --tui
 ```
 
 Logs still go to `~/.ant/ant.log`.
 
 ### Tools (built-in)
 - File: `read`, `write`, `ls`
-- Commands: `exec`, `open_app`, `restart_ant`
+- Commands: `exec`, `open_app`, `restart_ant`, `self_build`
 - Media: `screenshot`, `screen_record`, `send_file`
 - Browser: `browser` (Playwright)
 - Memory: `memory_search`, `memory_get`
@@ -190,6 +220,8 @@ You can also use the CLI:
 ant stop
 ant restart
 ```
+
+For supervised split mode, restart requests are written to `.ant/restart.json` and handled by supervisor targets (`all`/`worker`/`gateway`).
 
 ### Logs
 - File: `~/.ant/ant.log`
@@ -412,9 +444,22 @@ If `startupRecipients` is empty, ant falls back to `ownerJids` or your own JID w
 - Results are announced back to the requester chat.
 - Registry stored under `.ant/subagents.json`.
 
+### Prompt Modes
+- The agent chooses prompt context mode per task:
+  - `full`: full bootstrap context (PROJECT/AGENTS/MEMORY) for complex user tasks.
+  - `minimal`: reduced context for health checks, cron flights, subagent internals, and lightweight tool flows.
+  - `none`: identity-only mode for special internal calls.
+- Minimal mode reduces context bloat and speeds simple requests.
+
 ### Memory
-- Embeddings + sqlite index for MEMORY.md + memory/*.md.
-- Session transcripts indexed by default.
+- Embeddings + sqlite hybrid search (vector + FTS keyword) for MEMORY.md + memory/*.md.
+- Session transcripts indexed by default from `.ant/sessions/*.jsonl`.
+- Session indexing filters (`memory.sessions`) to avoid garbage:
+  - include roles
+  - max messages / max bytes
+  - min text length
+  - exclude regex patterns
+- Retention window via `memory.retentionDays`.
 - Configurable transcript sync policies (startup, search, watch, interval).
 - Tools: `memory_search` and `memory_get`.
 
@@ -441,6 +486,7 @@ If `startupRecipients` is empty, ant falls back to `ownerJids` or your own JID w
 - Use `/memory <note>` or `/remember <note>` in chat to append to memory.
 
 - `memory_search` forces session transcript reindexing on search.
+- `memory_search` now uses `MemoryManager` directly (same hybrid retrieval path as runtime).
 
 ---
 
@@ -450,12 +496,12 @@ If `startupRecipients` is empty, ant falls back to `ownerJids` or your own JID w
 
 ```bash
 npm install
-npm run dev -- run -c ant.config.json
+npm run dev -- run
 ```
 
 You should see a QR code in the terminal. Scan it with WhatsApp.
 
-If you enable Telegram (`telegram.enabled: true` + `telegram.botToken`), the Web UI (Tunnels page) shows a QR code that opens your bot (t.me link) and a pairing approval UI.
+If you enable Telegram (`telegram.enabled: true` + `ANT_TELEGRAM_BOT_TOKEN` in `.env`), the Web UI (Tunnels page) shows a QR code that opens your bot (t.me link) and a pairing approval UI.
 
 If you want Codex/Copilot/Claude as the main model, keep an OpenAI provider for tools and set routing:
 
@@ -484,12 +530,12 @@ To reply only to messages sent by your own account, set:
 
 Foreground:
 ```bash
-npm run dev -- run -c ant.config.json
+npm run dev -- run
 ```
 
 Background:
 ```bash
-nohup npm run dev -- run -c ant.config.json > ant.log 2>&1 &
+nohup npm run dev -- run > ant.log 2>&1 &
 tail -f ant.log
 ```
 
@@ -555,16 +601,16 @@ Create a note from chat:
 
 Index + search:
 ```bash
-npm run dev -- memory index -c ant.config.json
-npm run dev -- memory search "favorite snack" -c ant.config.json
+npm run dev -- memory index
+npm run dev -- memory search "favorite snack"
 ```
 
 ### Sessions
 
 ```bash
-npm run dev -- sessions list -c ant.config.json
-npm run dev -- sessions show "whatsapp:dm:<chat-id>" -c ant.config.json
-npm run dev -- sessions clear "whatsapp:dm:<chat-id>" -c ant.config.json
+npm run dev -- sessions list
+npm run dev -- sessions show "whatsapp:dm:<chat-id>"
+npm run dev -- sessions clear "whatsapp:dm:<chat-id>"
 ```
 
 ---
@@ -695,169 +741,20 @@ Enable the Main Agent in `ant.config.json`:
 {
   "mainAgent": {
     "enabled": true,
-    "iterationDelayMinutes": 5,
-    "maxIterationsPerTask": 10,
-    "maxConsecutiveFailures": 3,
     "dutiesFile": "AGENT_DUTIES.md",
-    "logFile": "AGENT_LOG.md",
-    "completionPromise": "<promise>DUTY_CYCLE_COMPLETE</promise>",
-    "duties": {
-      "subagentManagement": true,
-      "systemMaintenance": true,
-      "memoryManagement": true,
-      "improvements": true,
-      "monitoring": true
-    },
-    "thresholds": {
-      "stuckSubagentMinutes": 10,
-      "oldSessionDays": 30,
-      "largeSessionMB": 10,
-      "diskUsagePercent": 80,
-      "memoryIndexDeltaMinutes": 120
-    },
-    "alertOwnerOnCritical": true
+    "logFile": ".ant/AGENT_LOG.md",
+    "intervalMs": 300000
   }
 }
 ```
 
 ### Implementation
 
-The Main Agent runs as a persistent background task:
+Implementation lives in:
+- `src/agent/main-agent.ts` (Main Agent loop / task orchestration)
+- `src/config.ts` (`MainAgentSchema`, `workspaceDir` / `stateDir` resolution)
 
-```typescript
-// src/runtime/main-agent.ts
-
-export async function startMainAgent(params: {
-  cfg: AntConfig;
-  logger: Logger;
-  agent: AgentRunner;
-  sessions: SessionStore;
-  subagents: SubagentManager;
-  memory: MemoryManager;
-  sendMessage: (chatId: string, text: string) => Promise<void>;
-}): Promise<void> {
-  if (!params.cfg.mainAgent?.enabled) {
-    params.logger.info("main agent disabled");
-    return;
-  }
-
-  const sessionKey = "agent:main:system";
-  const config = params.cfg.mainAgent;
-  let consecutiveFailures = 0;
-
-  // Load duties document
-  const dutiesPath = path.join(
-    params.cfg.resolved.workspaceDir,
-    config.dutiesFile || "AGENT_DUTIES.md"
-  );
-  const duties = await fs.readFile(dutiesPath, "utf-8").catch(() => "");
-
-  // Build persistent prompt
-  const systemPrompt = `You are the Main Agent for ant, a self-managing autonomous assistant.
-
-Your duties are defined in the following document. Read it carefully and execute your responsibilities in order.
-
-${duties}
-
-After completing each duty cycle, output: ${config.completionPromise}
-
-You have access to all tools. Use them to inspect system state, perform maintenance, and make improvements.
-
-IMPORTANT:
-- Work incrementally. One task at a time.
-- Always verify before destructive operations.
-- Log your actions to ${config.logFile}.
-- If uncertain, ask the owner via message_send.
-- After ${config.maxIterationsPerTask} iterations on one task, move to the next duty.
-`;
-
-  params.logger.info("main agent starting");
-
-  // Endless loop
-  while (true) {
-    try {
-      // Build prompt for this iteration
-      const prompt = `Begin duty cycle iteration.
-
-Check all duties in order:
-1. Subagent Management
-2. System Maintenance  
-3. Memory Management
-4. Improvements & Optimization
-5. Monitoring & Alerts
-
-For each duty, inspect current state and take necessary actions.
-Log your findings and actions.
-Output completion promise when all duties checked.`;
-
-      // Run agent task
-      const result = await params.agent.runTask({
-        sessionKey,
-        task: prompt,
-        isSubagent: false,
-      });
-
-      // Check for completion promise
-      if (result.includes(config.completionPromise || "DUTY_CYCLE_COMPLETE")) {
-        params.logger.info("main agent duty cycle complete");
-        consecutiveFailures = 0;
-      } else {
-        params.logger.warn("main agent cycle incomplete");
-        consecutiveFailures++;
-      }
-
-      // Check failure threshold
-      if (consecutiveFailures >= config.maxConsecutiveFailures) {
-        const ownerJid = params.cfg.whatsapp.ownerJids?.[0];
-        if (config.alertOwnerOnCritical && ownerJid) {
-          await params.sendMessage(
-            ownerJid,
-            `⚠️ Main Agent: ${consecutiveFailures} consecutive failures. Pausing for review.`
-          );
-        }
-        params.logger.error("main agent paused due to failures");
-        break;
-      }
-
-      // Wait before next iteration
-      const delayMs = (config.iterationDelayMinutes || 5) * 60_000;
-      await new Promise((resolve) => setTimeout(resolve, delayMs));
-    } catch (err) {
-      params.logger.error(
-        { error: err instanceof Error ? err.message : String(err) },
-        "main agent iteration failed"
-      );
-      consecutiveFailures++;
-
-      if (consecutiveFailures >= config.maxConsecutiveFailures) {
-        break;
-      }
-
-      // Shorter delay on error
-      await new Promise((resolve) => setTimeout(resolve, 60_000));
-    }
-  }
-}
-```
-
-### Integration with Runtime
-
-Add to `src/runtime/run.ts`:
-
-```typescript
-import { startMainAgent } from "./main-agent.js";
-
-// After agent initialization
-void startMainAgent({
-  cfg,
-  logger,
-  agent: agent!,
-  sessions,
-  subagents,
-  memory,
-  sendMessage,
-});
-```
+File locations (repo vs workspace vs state) are explained in `docs/agent-files.md`.
 
 ### Ralph-Inspired Workflow
 
@@ -898,10 +795,10 @@ Make sure they're working.
 
 #### Safety Mechanisms
 
-- **Max iterations per task**: Prevents infinite loops on single duty
-- **Max consecutive failures**: Pauses agent after repeated errors
-- **Alert on critical**: Notifies owner via WhatsApp when paused
-- **Log all actions**: Full audit trail in `AGENT_LOG.md`
+- **Per-task timeouts + retries**: Configured under `agentExecution.tasks.defaults`
+- **Provider cooldown/circuit-breaker**: Healthy-provider selection with backoff
+- **Supervisor restarts**: Worker heartbeat monitoring + restart logic (split mode)
+- **Log all actions**: Append to `mainAgent.logFile` (default `.ant/AGENT_LOG.md`)
 
 ### Monitoring
 
@@ -909,13 +806,13 @@ Check Main Agent status:
 
 ```bash
 # View agent log
-tail -f AGENT_LOG.md
+tail -f .ant/AGENT_LOG.md
 
 # Check agent session
-npm run dev -- sessions show "agent:main:system" -c ant.config.json
+npm run dev -- sessions show "agent:main:system"
 
 # Monitor in TUI
-npm run dev -- run -c ant.config.json --tui
+npm run dev -- run --tui
 ```
 
 ### When to Use Main Agent

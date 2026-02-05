@@ -27,8 +27,10 @@ export default defineTool({
       // Save restart context
       const restartFile = path.join(ctx.stateDir, "restart.json");
       const restartContext = {
+        requested: true,
         requestedAt: Date.now(),
         reason,
+        target: "all",
         resumeTask,
         sessionKey: ctx.sessionKey,
       };

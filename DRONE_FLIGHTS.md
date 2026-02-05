@@ -10,6 +10,14 @@ They run on cron schedules and execute prompts via the scheduler.
 - **Weekly Deep Dive** (every Monday 00:00): Comprehensive review and trend analysis.
 - **Hourly X AI+Tech Digest** (every hour): Top AI + tech developments from X.
 
+## Realtime Alerts (Main Agent)
+
+Drone flights are scheduled. For **near-realtime** log watching + incident auto-investigation + notifications, configure the Main Agent:
+- `mainAgent.errorScanIntervalMs` (how often it scans logs)
+- `mainAgent.notifySessions` (WhatsApp/Telegram session keys)
+
+See `docs/config.md` for details.
+
 ## Hourly X AI+Tech Digest
 
 This flight uses the `bird` CLI and Safari cookies for `x.com`.
@@ -55,7 +63,7 @@ The flight will send the full report via the `message_send` tool if you set:
 
 ```
 ANT_X_DIGEST_WHATSAPP_TO=whatsapp:dm:12345@s.whatsapp.net
-ANT_X_DIGEST_TELEGRAM_TO=telegram:dm:123456789
+ANT_X_DIGEST_TELEGRAM_TO=telegram:dm:12345
 ```
 
 Notes:

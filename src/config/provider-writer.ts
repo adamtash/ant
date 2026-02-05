@@ -159,7 +159,7 @@ export async function writeProvidersDiscoveredOverlay(
   opts?: { backup?: boolean }
 ): Promise<{ ok: true; path: string; backupPath?: string } | { ok: false; error: string }> {
   const overlayPath = getProvidersDiscoveredPath(stateDir);
-  const backup = opts?.backup ?? true;
+  const backup = opts?.backup ?? false;
   try {
     await fs.mkdir(stateDir, { recursive: true });
 

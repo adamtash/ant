@@ -5,7 +5,7 @@
 import fs from "node:fs/promises";
 import type { AntConfig } from "../../../config.js";
 import { OutputFormatter } from "../../output-formatter.js";
-import { readPidFile, ensureRuntimePaths } from "../../../gateway/process-control.js";
+import { readRuntimePids, ensureRuntimePaths, isRunning } from "../../../gateway/process-control.js";
 
 export interface StatusOptions {
   config?: string;
@@ -16,6 +16,11 @@ export interface StatusOptions {
 interface StatusInfo {
   running: boolean;
   pid: number | null;
+  pids?: {
+    supervisor?: number | null;
+    gateway?: number | null;
+    worker?: number | null;
+  };
   workspace: string;
   stateDir: string;
   config: string;
@@ -39,17 +44,9 @@ export async function status(cfg: AntConfig, options: StatusOptions = {}): Promi
   const paths = await ensureRuntimePaths(cfg);
 
   // Check if running
-  const pid = await readPidFile(cfg);
-  let running = false;
-
-  if (pid) {
-    try {
-      process.kill(pid, 0);
-      running = true;
-    } catch {
-      // Process not running
-    }
-  }
+  const pids = await readRuntimePids(cfg);
+  const running = await isRunning(cfg);
+  const pid = pids.supervisor ?? pids.primary ?? pids.gateway ?? pids.worker ?? null;
 
   // Check memory database
   let memoryDbExists = false;
@@ -63,6 +60,11 @@ export async function status(cfg: AntConfig, options: StatusOptions = {}): Promi
   const statusInfo: StatusInfo = {
     running,
     pid: running ? pid : null,
+    pids: {
+      supervisor: pids.supervisor ?? null,
+      gateway: pids.gateway ?? null,
+      worker: pids.worker ?? null,
+    },
     workspace: cfg.resolved.workspaceDir,
     stateDir: paths.stateDir,
     config: cfg.resolved.configPath,
@@ -109,6 +111,17 @@ export async function status(cfg: AntConfig, options: StatusOptions = {}): Promi
   out.status("Runtime", running ? "running" : "stopped");
   if (running && pid) {
     out.keyValue("PID", pid);
+  }
+  if (statusInfo.pids) {
+    if (statusInfo.pids.supervisor) {
+      out.keyValue("Supervisor PID", statusInfo.pids.supervisor);
+    }
+    if (statusInfo.pids.gateway) {
+      out.keyValue("Gateway PID", statusInfo.pids.gateway);
+    }
+    if (statusInfo.pids.worker) {
+      out.keyValue("Worker PID", statusInfo.pids.worker);
+    }
   }
   if (statusInfo.uptime) {
     out.keyValue("Uptime", out.formatDuration(statusInfo.uptime));

@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 
-import type { AntConfig } from "../../config.js";
+import { resolveWorkspaceOrStatePath, type AntConfig } from "../../config.js";
 import type { Logger } from "../../log.js";
 import type { AgentEngine } from "../engine.js";
 import {
@@ -9,7 +9,7 @@ import {
   writeProvidersDiscoveredOverlay,
   type ProvidersDiscoveredOverlay,
 } from "../../config/provider-writer.js";
-import { runProviderDiscovery } from "./provider-discovery.js";
+import { runProviderDiscovery, countDiscoveryCandidates } from "./provider-discovery.js";
 import { runDiscoveredProvidersHealthCheck } from "./provider-health.js";
 
 function isTruthyEnv(name: string): boolean {
@@ -35,11 +35,26 @@ async function appendLine(filePath: string, line: string): Promise<void> {
   await fs.appendFile(filePath, `${line}\n`, "utf-8");
 }
 
+type DiscoveryRollup = {
+  date: string;
+  runs: number;
+  added: number;
+  removed: number;
+  kept: number;
+  errors: number;
+  total: number;
+};
+
+function getRollupPath(stateDir: string): string {
+  return path.join(stateDir, "provider-discovery-rollup.json");
+}
+
 export class ProviderDiscoveryService {
   private cfg: AntConfig;
   private readonly agentEngine: AgentEngine;
   private readonly logger: Logger;
   private cachedOverlay: ProvidersDiscoveredOverlay | null = null;
+  private legacyBackupsPruned = false;
 
   constructor(params: { cfg: AntConfig; agentEngine: AgentEngine; logger: Logger }) {
     this.cfg = params.cfg;
@@ -62,6 +77,59 @@ export class ProviderDiscoveryService {
     return result.overlay;
   }
 
+  private async readRollup(): Promise<DiscoveryRollup | null> {
+    const filePath = getRollupPath(this.cfg.resolved.stateDir);
+    try {
+      const raw = await fs.readFile(filePath, "utf-8");
+      const parsed = JSON.parse(raw) as DiscoveryRollup;
+      if (!parsed || typeof parsed.date !== "string") return null;
+      return parsed;
+    } catch {
+      return null;
+    }
+  }
+
+  private async writeRollup(rollup: DiscoveryRollup): Promise<void> {
+    const filePath = getRollupPath(this.cfg.resolved.stateDir);
+    await fs.mkdir(path.dirname(filePath), { recursive: true }).catch(() => undefined);
+    const tmp = `${filePath}.tmp`;
+    await fs.writeFile(tmp, JSON.stringify(rollup, null, 2) + "\n", "utf-8");
+    await fs.rename(tmp, filePath);
+  }
+
+  private async flushRollup(rollup: DiscoveryRollup): Promise<void> {
+    const shouldLog = rollup.added > 0 || rollup.removed > 0 || rollup.errors > 0;
+    if (!shouldLog) return;
+    const note = `Provider discovery rollup ${rollup.date}: runs=${rollup.runs} +${rollup.added} -${rollup.removed} (total ${rollup.total}).`;
+    await this.writeAgentLog(note).catch(() => undefined);
+    await this.writeImportantMemoryNote(note).catch(() => undefined);
+  }
+
+  private async updateRollup(params: {
+    date: string;
+    added: number;
+    removed: number;
+    kept: number;
+    total: number;
+    error: boolean;
+  }): Promise<void> {
+    const existing = await this.readRollup();
+    if (existing && existing.date !== params.date) {
+      await this.flushRollup(existing);
+    }
+
+    const next: DiscoveryRollup = {
+      date: params.date,
+      runs: (existing && existing.date === params.date ? existing.runs : 0) + 1,
+      added: (existing && existing.date === params.date ? existing.added : 0) + params.added,
+      removed: (existing && existing.date === params.date ? existing.removed : 0) + params.removed,
+      kept: (existing && existing.date === params.date ? existing.kept : 0) + params.kept,
+      errors: (existing && existing.date === params.date ? existing.errors : 0) + (params.error ? 1 : 0),
+      total: params.total,
+    };
+    await this.writeRollup(next);
+  }
+
   private async writeImportantMemoryNote(note: string): Promise<void> {
     const filePath = path.join(this.cfg.resolved.workspaceDir, "MEMORY.md");
     const date = new Date().toISOString().slice(0, 10);
@@ -69,9 +137,11 @@ export class ProviderDiscoveryService {
   }
 
   private async writeAgentLog(note: string): Promise<void> {
-    const filePath = path.isAbsolute(this.cfg.mainAgent.logFile)
-      ? this.cfg.mainAgent.logFile
-      : path.join(this.cfg.resolved.workspaceDir, this.cfg.mainAgent.logFile);
+    const filePath = resolveWorkspaceOrStatePath(
+      this.cfg.mainAgent.logFile,
+      this.cfg.resolved.workspaceDir,
+      this.cfg.resolved.stateDir,
+    );
     const date = new Date().toISOString();
     await appendLine(filePath, `- [${date}] ${note}`);
   }
@@ -122,16 +192,30 @@ export class ProviderDiscoveryService {
       return { ok: false, error: "provider_discovery_disabled" };
     }
 
+    const settings = this.cfg.resolved.providers.discovery ?? this.cfg.providers?.discovery;
+    const mode = params?.mode ?? "scheduled";
+
+    if (mode === "scheduled") {
+      const candidateCount = countDiscoveryCandidates(this.cfg);
+      const minCandidates = settings?.minCandidates ?? 0;
+      if (candidateCount < minCandidates) {
+        this.logger.debug({ candidateCount, minCandidates }, "Provider discovery skipped (no candidates)");
+        return { ok: true, overlay: this.cachedOverlay ?? (await this.readOverlay()) ?? undefined, summary: { added: [], removed: [], kept: [] } };
+      }
+    }
+
+    await this.pruneLegacyBackupFiles().catch(() => undefined);
+
     const previous = (await this.readOverlay()) ?? this.cachedOverlay;
     const result = await runProviderDiscovery({
       cfg: this.cfg,
       logger: this.logger,
       previous: previous ?? undefined,
-      mode: params?.mode ?? "scheduled",
+      mode,
     });
 
     const nextOverlay = result.overlay;
-    const wrote = await writeProvidersDiscoveredOverlay(this.cfg.resolved.stateDir, nextOverlay, { backup: true });
+    const wrote = await writeProvidersDiscoveredOverlay(this.cfg.resolved.stateDir, nextOverlay, { backup: false });
     if (!wrote.ok) {
       this.logger.warn({ error: wrote.error }, "Failed writing providers.discovered overlay");
     }
@@ -139,13 +223,32 @@ export class ProviderDiscoveryService {
     const applied = await this.applyOverlay(nextOverlay, previous ?? null);
     this.cachedOverlay = nextOverlay;
 
-    const note = `Provider discovery (${params?.mode ?? "scheduled"}): +${result.summary.added.length} -${result.summary.removed.length} (total ${Object.keys(nextOverlay.providers).length}).`;
-    await this.writeAgentLog(note).catch(() => undefined);
-    await this.writeImportantMemoryNote(note).catch(() => undefined);
+    const totalProviders = Object.keys(nextOverlay.providers).length;
+    const note = `Provider discovery (${mode}): +${result.summary.added.length} -${result.summary.removed.length} (total ${totalProviders}).`;
+    const hadChanges = result.summary.added.length > 0 || result.summary.removed.length > 0;
+    const hadError = !wrote.ok;
+    const logMode = settings?.logMode ?? "daily-rollup";
+
+    if (mode === "emergency" || logMode === "changes-only") {
+      if (hadChanges || hadError) {
+        await this.writeAgentLog(note).catch(() => undefined);
+        await this.writeImportantMemoryNote(note).catch(() => undefined);
+      }
+    } else if (logMode === "daily-rollup") {
+      const date = new Date().toISOString().slice(0, 10);
+      await this.updateRollup({
+        date,
+        added: result.summary.added.length,
+        removed: result.summary.removed.length,
+        kept: result.summary.kept.length,
+        total: totalProviders,
+        error: hadError,
+      });
+    }
 
     this.logger.info(
       {
-        mode: params?.mode ?? "scheduled",
+        mode,
         added: result.summary.added,
         removed: result.summary.removed,
         fallbackCount: applied.fallbackChain.length,
@@ -166,6 +269,8 @@ export class ProviderDiscoveryService {
       return { ok: false, error: "provider_discovery_disabled" };
     }
 
+    await this.pruneLegacyBackupFiles().catch(() => undefined);
+
     const previous = (await this.readOverlay()) ?? this.cachedOverlay;
     if (!previous) return { ok: true, overlay: { version: 1, generatedAt: Date.now(), providers: {} }, removedIds: [] };
 
@@ -176,7 +281,7 @@ export class ProviderDiscoveryService {
       timeoutMs: 8000,
     });
 
-    const wrote = await writeProvidersDiscoveredOverlay(this.cfg.resolved.stateDir, checked.overlay, { backup: true });
+    const wrote = await writeProvidersDiscoveredOverlay(this.cfg.resolved.stateDir, checked.overlay, { backup: false });
     if (!wrote.ok) {
       this.logger.warn({ error: wrote.error }, "Failed writing providers.discovered overlay after health check");
     }
@@ -196,5 +301,23 @@ export class ProviderDiscoveryService {
     );
 
     return { ok: true, overlay: checked.overlay, removedIds: checked.removedIds };
+  }
+
+  private async pruneLegacyBackupFiles(): Promise<void> {
+    if (this.legacyBackupsPruned) return;
+    this.legacyBackupsPruned = true;
+
+    try {
+      const entries = await fs.readdir(this.cfg.resolved.stateDir);
+      const backups = entries.filter((name) => name.startsWith("providers.discovered.backup-") && name.endsWith(".json"));
+      await Promise.all(
+        backups.map((name) => fs.unlink(path.join(this.cfg.resolved.stateDir, name)).catch(() => undefined))
+      );
+      if (backups.length > 0) {
+        this.logger.info({ removed: backups.length }, "Removed legacy provider discovery backup files");
+      }
+    } catch {
+      // ignore cleanup failures
+    }
   }
 }

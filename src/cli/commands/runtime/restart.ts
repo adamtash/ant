@@ -5,7 +5,7 @@
 import type { AntConfig } from "../../../config.js";
 import { OutputFormatter } from "../../output-formatter.js";
 import { RuntimeError } from "../../error-handler.js";
-import { readPidFile, stopAnt } from "../../../gateway/process-control.js";
+import { isRunning, stopAnt } from "../../../gateway/process-control.js";
 import { start } from "./start.js";
 
 export interface RestartOptions {
@@ -22,8 +22,8 @@ export async function restart(cfg: AntConfig, options: RestartOptions = {}): Pro
   const out = new OutputFormatter({ quiet: options.quiet });
 
   // Check if running
-  const pid = await readPidFile(cfg);
-  if (!pid) {
+  const running = await isRunning(cfg);
+  if (!running) {
     throw new RuntimeError("Agent is not running", "Use 'ant start' to start the agent first.");
   }
 

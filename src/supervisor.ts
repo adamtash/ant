@@ -1,424 +1,532 @@
-/**
- * Supervisor - Process supervisor for graceful restart and task resumption
- *
- * Features:
- * - Spawns the main ANT process as a child process
- * - Watches for the restart flag file at .ant/restart.json
- * - Handles restart requests (exit code 42 or restart.json exists)
- * - Gracefully handles SIGINT/SIGTERM
- * - Passes through command line arguments to the child process
- *
- * This enables graceful restarts when the agent updates its own code.
- */
-
 import { spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs/promises";
 import { watch, type FSWatcher } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
+import type { BridgeEnvelope } from "./runtime/bridge/types.js";
 
-/**
- * Exit code used by restart-manager to signal restart request
- */
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const RESTART_EXIT_CODE = 42;
 
-/**
- * Restart state stored in .ant/restart.json (compatible with restart-manager.ts)
- */
+type RuntimeRole = "gateway" | "worker";
+type RestartTarget = "all" | "gateway" | "worker";
+
 interface RestartState {
-  requested: boolean;
-  requestedAt: number;
-  reason: string;
+  requested?: boolean;
+  requestedAt?: number;
+  reason?: string;
   message?: string;
-  taskContext?: {
-    id: string;
-    type: string;
-    query?: string;
-    sessionKey?: string;
-    chatId?: string;
-    channel?: string;
-    startedAt: number;
-    state: Record<string, unknown>;
-    toolsExecuted: string[];
-    partialResponse?: string;
-  };
+  target?: RestartTarget;
   metadata?: Record<string, unknown>;
 }
 
-/**
- * Supervisor configuration
- */
 interface SupervisorConfig {
   stateDir: string;
   command: string;
-  args: string[];
+  args?: string[];
+  gatewayArgs: string[];
+  workerArgs: string[];
   cwd: string;
   restartDelayMs: number;
   maxRestarts: number;
   restartWindowMs: number;
+  workerHeartbeatPath: string;
+  workerHeartbeatMaxAgeMs: number;
+  heartbeatCheckIntervalMs: number;
 }
 
-/**
- * Get default configuration based on command line arguments
- */
-export function getDefaultConfig(): SupervisorConfig {
-  // Pass through all arguments after 'supervisor' command to the child
-  const cliArgs = process.argv.slice(2);
-
-  // Remove 'supervisor' if it's the first arg (when invoked as `ant supervisor run`)
-  const childArgs = cliArgs[0] === "supervisor" ? cliArgs.slice(1) : cliArgs;
-
-  // If no command specified, default to 'run'
-  if (childArgs.length === 0) {
-    childArgs.push("run");
+function defaultStateDirFromCwd(cwd: string): string {
+  const resolved = path.resolve(cwd);
+  if (path.basename(resolved) === ".ant") {
+    return resolved;
   }
+  return path.join(resolved, ".ant");
+}
 
+export function getDefaultConfig(): SupervisorConfig {
+  const cwd = process.cwd();
+  const stateDir = defaultStateDirFromCwd(cwd);
   return {
-    stateDir: path.join(process.cwd(), ".ant"),
-    command: process.execPath, // Use same node executable
-    args: [path.join(__dirname, "cli.js"), ...childArgs],
-    cwd: process.cwd(),
+    stateDir,
+    command: process.execPath,
+    gatewayArgs: [path.join(__dirname, "cli.js"), "gateway"],
+    workerArgs: [path.join(__dirname, "cli.js"), "worker"],
+    cwd,
     restartDelayMs: 1000,
     maxRestarts: 10,
-    restartWindowMs: 60000,
+    restartWindowMs: 60_000,
+    workerHeartbeatPath: path.join(stateDir, "heartbeat.worker"),
+    workerHeartbeatMaxAgeMs: 20_000,
+    heartbeatCheckIntervalMs: 5000,
   };
 }
 
-/**
- * Main supervisor class
- */
-class Supervisor {
-  private config: SupervisorConfig;
-  private child: ChildProcess | null = null;
-  private restartCount = 0;
-  private lastRestartTime = 0;
+export class Supervisor {
+  private readonly config: SupervisorConfig;
+  private readonly legacyArgs?: string[];
+  private gateway: ChildProcess | null = null;
+  private worker: ChildProcess | null = null;
+  private legacyChild: ChildProcess | null = null;
   private shuttingDown = false;
+  private doneResolve: (() => void) | null = null;
+  private restartCount = 0;
+  private restartWindowStart = Date.now();
+  private restartFileTimer: NodeJS.Timeout | null = null;
+  private heartbeatTimer: NodeJS.Timeout | null = null;
+  private restartQueue: Promise<void> = Promise.resolve();
+  private readonly restartFile: string;
+  private readonly supervisorPidFile: string;
+  private readonly primaryPidFile: string;
+  private workerSpawnedAt = 0;
+  private restartStateBusy = false;
   private watcher: FSWatcher | null = null;
-  private restartFile: string;
-  private readonly sigintHandler = () => this.shutdown("SIGINT");
-  private readonly sigtermHandler = () => this.shutdown("SIGTERM");
-  private signalHandlersRegistered = false;
+
+  private readonly sigintHandler = () => void this.shutdown("SIGINT");
+  private readonly sigtermHandler = () => void this.shutdown("SIGTERM");
+  private readonly sighupHandler = () => {
+    void this.enqueueRestart(async () => {
+      await this.restartAll("SIGHUP");
+    });
+  };
 
   constructor(config: Partial<SupervisorConfig> = {}) {
-    const defaults = getDefaultConfig();
-    this.config = { ...defaults, ...config };
+    this.config = { ...getDefaultConfig(), ...config };
+    this.legacyArgs = Array.isArray((config as { args?: string[] }).args)
+      ? (config as { args?: string[] }).args
+      : undefined;
     this.restartFile = path.join(this.config.stateDir, "restart.json");
+    this.supervisorPidFile = path.join(this.config.stateDir, "ant.supervisor.pid");
+    this.primaryPidFile = path.join(this.config.stateDir, "ant.pid");
   }
 
-  /**
-   * Start the supervisor
-   */
   async start(): Promise<void> {
-    console.log("[supervisor] Starting ANT supervisor...");
-    console.log(`[supervisor] State directory: ${this.config.stateDir}`);
-    console.log(`[supervisor] Child command: ${this.config.command} ${this.config.args.join(" ")}`);
+    if (this.legacyArgs) {
+      await this.startLegacy();
+      return;
+    }
 
-    // Ensure state directory exists
     await fs.mkdir(this.config.stateDir, { recursive: true });
+    await this.writePidFiles();
+    this.registerSignals();
 
-    this.registerSignalHandlers();
+    await this.spawnRole("gateway");
+    await this.spawnRole("worker");
 
-    // Start watching for restart file
-    this.startWatching();
+    this.startMonitors();
 
-    // Start the main loop
-    try {
-      await this.runLoop();
-    } finally {
-      this.unregisterSignalHandlers();
-    }
+    await new Promise<void>((resolve) => {
+      this.doneResolve = resolve;
+    });
   }
 
-  /**
-   * Start watching the restart file for changes
-   */
-  private startWatching(): void {
-    try {
-      // Watch the state directory for changes to restart.json
-      this.watcher = watch(this.config.stateDir, (eventType, filename) => {
-        if (filename === "restart.json" && eventType === "change") {
-          // File was modified - the child process will handle it
-          // We just log for visibility
-          console.log("[supervisor] Detected restart.json change");
+  private async startLegacy(): Promise<void> {
+    await fs.mkdir(this.config.stateDir, { recursive: true });
+    this.registerSignals();
+    this.startLegacyWatcher();
+
+    while (!this.shuttingDown) {
+      if (!this.allowRestart("legacy")) {
+        console.error("[supervisor] Too many restarts within time window, exiting");
+        process.exit(1);
+      }
+
+      this.legacyChild = spawn(this.config.command, this.legacyArgs ?? [], {
+        cwd: this.config.cwd,
+        env: {
+          ...process.env,
+          ANT_SUPERVISED: "1",
+        },
+        stdio: "inherit",
+      });
+
+      const exitCode = await new Promise<number | null>((resolve) => {
+        if (!this.legacyChild) {
+          resolve(null);
+          return;
         }
+        this.legacyChild.on("exit", (code) => {
+          resolve(code);
+        });
+        this.legacyChild.on("error", () => {
+          resolve(1);
+        });
       });
 
-      this.watcher.on("error", (err) => {
-        console.error(`[supervisor] Watch error: ${err.message}`);
-      });
+      this.legacyChild = null;
+      if (this.shuttingDown) break;
+
+      const state = await this.consumeRestartState();
+      const shouldRestart = exitCode === RESTART_EXIT_CODE || Boolean(state?.requested);
+      if (!shouldRestart && exitCode === 0) break;
+      if (!shouldRestart && exitCode !== 0) {
+        process.exit(exitCode ?? 1);
+      }
+
+      await this.sleep(this.config.restartDelayMs);
+    }
+
+    this.stopLegacyWatcher();
+    this.unregisterSignals();
+  }
+
+  private startLegacyWatcher(): void {
+    try {
+      this.watcher = watch(this.config.stateDir, () => undefined);
     } catch {
-      // Directory might not exist yet, that's ok
-      console.log("[supervisor] Could not watch state directory (will be created on first run)");
+      this.watcher = null;
     }
   }
 
-  /**
-   * Stop watching
-   */
-  private stopWatching(): void {
+  private stopLegacyWatcher(): void {
     if (this.watcher) {
       this.watcher.close();
       this.watcher = null;
     }
   }
 
-  private registerSignalHandlers(): void {
-    if (this.signalHandlersRegistered) return;
+  private registerSignals(): void {
     process.on("SIGINT", this.sigintHandler);
     process.on("SIGTERM", this.sigtermHandler);
-    this.signalHandlersRegistered = true;
+    process.on("SIGHUP", this.sighupHandler);
   }
 
-  private unregisterSignalHandlers(): void {
-    if (!this.signalHandlersRegistered) return;
+  private unregisterSignals(): void {
     process.off("SIGINT", this.sigintHandler);
     process.off("SIGTERM", this.sigtermHandler);
-    this.signalHandlersRegistered = false;
+    process.off("SIGHUP", this.sighupHandler);
   }
 
-  /**
-   * Main run loop - keeps process running
-   */
-  private async runLoop(): Promise<void> {
-    while (!this.shuttingDown) {
-      // Check restart limits
-      if (!this.canRestart()) {
-        console.error("[supervisor] Too many restarts within time window, exiting");
-        console.error(`[supervisor] (${this.restartCount} restarts in ${this.config.restartWindowMs}ms)`);
-        process.exit(1);
-      }
+  private startMonitors(): void {
+    this.restartFileTimer = setInterval(() => {
+      void this.checkRestartState();
+    }, 1000);
+    this.restartFileTimer.unref();
 
-      // Spawn the child process
-      await this.spawnChild();
+    this.heartbeatTimer = setInterval(() => {
+      void this.checkWorkerHeartbeat();
+    }, Math.max(1000, this.config.heartbeatCheckIntervalMs));
+    this.heartbeatTimer.unref();
+  }
 
-      // Wait for child to exit
-      const exitCode = await this.waitForExit();
-
-      if (this.shuttingDown) break;
-
-      // Check if this was a restart request
-      const isRestartCode = exitCode === RESTART_EXIT_CODE;
-      const restartState = await this.checkRestartState();
-      const shouldRestart = isRestartCode || restartState?.requested;
-
-      if (exitCode === 0 && !shouldRestart) {
-        // Clean exit, no restart needed
-        console.log("[supervisor] Process exited cleanly (code 0)");
-        break;
-      }
-
-      if (shouldRestart) {
-        const reason = restartState?.reason || (isRestartCode ? "exit_code_42" : "unknown");
-        console.log(`[supervisor] Restart requested (reason: ${reason})`);
-
-        if (restartState?.message) {
-          console.log(`[supervisor] Message: ${restartState.message}`);
-        }
-
-        if (restartState?.taskContext) {
-          console.log(`[supervisor] Will resume task: ${restartState.taskContext.id}`);
-        }
-
-        // Don't clear restart state - the child process will read and clear it on startup
-      } else {
-        // Non-zero exit without restart request - might be a crash
-        console.log(`[supervisor] Process exited with code ${exitCode}`);
-
-        // Only restart on crash if it wasn't a normal termination signal
-        if (exitCode === null || exitCode > 128) {
-          console.log("[supervisor] Process was killed, restarting...");
-        } else if (exitCode !== 0) {
-          console.log("[supervisor] Non-zero exit without restart request, exiting supervisor");
-          process.exit(exitCode);
-        }
-      }
-
-      // Wait before restarting
-      console.log(`[supervisor] Waiting ${this.config.restartDelayMs}ms before restart...`);
-      await this.sleep(this.config.restartDelayMs);
-
-      this.restartCount++;
-      this.lastRestartTime = Date.now();
-      console.log("[supervisor] Restarting child process...");
+  private stopMonitors(): void {
+    if (this.restartFileTimer) {
+      clearInterval(this.restartFileTimer);
+      this.restartFileTimer = null;
     }
-
-    this.stopWatching();
-    console.log("[supervisor] Supervisor exiting");
+    if (this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = null;
+    }
   }
 
-  /**
-   * Spawn the child process
-   */
-  private async spawnChild(): Promise<void> {
-    console.log(`[supervisor] Spawning: ${this.config.command} ${this.config.args.join(" ")}`);
+  private async writePidFiles(): Promise<void> {
+    await fs.writeFile(this.supervisorPidFile, String(process.pid), "utf-8");
+    await fs.writeFile(this.primaryPidFile, String(process.pid), "utf-8");
+  }
 
-    this.child = spawn(this.config.command, this.config.args, {
+  private async removePidFiles(): Promise<void> {
+    await fs.unlink(this.supervisorPidFile).catch(() => undefined);
+    await fs.unlink(this.primaryPidFile).catch(() => undefined);
+  }
+
+  private childForRole(role: RuntimeRole): ChildProcess | null {
+    return role === "gateway" ? this.gateway : this.worker;
+  }
+
+  private setChild(role: RuntimeRole, child: ChildProcess | null): void {
+    if (role === "gateway") {
+      this.gateway = child;
+    } else {
+      this.worker = child;
+    }
+  }
+
+  private argsForRole(role: RuntimeRole): string[] {
+    return role === "gateway" ? this.config.gatewayArgs : this.config.workerArgs;
+  }
+
+  private async spawnRole(role: RuntimeRole): Promise<void> {
+    if (this.shuttingDown) return;
+
+    const args = this.argsForRole(role);
+    const child = spawn(this.config.command, args, {
       cwd: this.config.cwd,
       env: {
         ...process.env,
-        // Tell child it's running under supervisor
         ANT_SUPERVISED: "1",
+        ANT_RUNTIME_ROLE: role,
       },
-      stdio: "inherit",
+      stdio: ["inherit", "inherit", "inherit", "ipc"],
     });
 
-    this.child.on("spawn", () => {
-      console.log(`[supervisor] Child process started (pid: ${this.child?.pid})`);
+    this.setChild(role, child);
+    if (role === "worker") {
+      this.workerSpawnedAt = Date.now();
+    }
+
+    child.on("message", (message: unknown) => {
+      this.handleBridgeMessage(role, message);
+    });
+
+    child.on("exit", (code, signal) => {
+      this.handleChildExit(role, code, signal);
+    });
+
+    child.on("error", () => {
+      this.handleChildExit(role, 1, null);
     });
   }
 
-  /**
-   * Wait for child process to exit
-   */
-  private waitForExit(): Promise<number | null> {
-    return new Promise((resolve) => {
-      if (!this.child) {
-        resolve(null);
+  private handleBridgeMessage(source: RuntimeRole, message: unknown): void {
+    if (!message || typeof message !== "object") return;
+    const envelope = message as Partial<BridgeEnvelope>;
+    if (envelope.channel !== "bridge") return;
+    const targetRole = envelope.target === "gateway" || envelope.target === "worker" ? envelope.target : null;
+    if (!targetRole) return;
+
+    const target = this.childForRole(targetRole);
+    if (!target || typeof target.send !== "function" || target.exitCode !== null) return;
+    target.send(message as BridgeEnvelope);
+  }
+
+  private handleChildExit(role: RuntimeRole, code: number | null, signal: NodeJS.Signals | null): void {
+    this.setChild(role, null);
+    if (this.shuttingDown) return;
+
+    void this.enqueueRestart(async () => {
+      if (this.shuttingDown) return;
+
+      const state = await this.consumeRestartState();
+      if (state) {
+        await this.restartFromState(state, `restart_file:${role}`);
         return;
       }
 
-      this.child.on("exit", (code, signal) => {
-        if (signal) {
-          console.log(`[supervisor] Child process killed by signal: ${signal}`);
-        }
-        this.child = null;
-        resolve(code);
-      });
+      if (code === RESTART_EXIT_CODE) {
+        await this.restartAll(`exit_code_42:${role}`);
+        return;
+      }
 
-      this.child.on("error", (err) => {
-        console.error(`[supervisor] Process error: ${err.message}`);
-        this.child = null;
-        resolve(1);
-      });
+      if (role === "worker") {
+        await this.restartWorker(`worker_exit:${String(code ?? signal ?? "unknown")}`);
+      } else {
+        await this.restartGateway(`gateway_exit:${String(code ?? signal ?? "unknown")}`);
+      }
     });
   }
 
-  /**
-   * Check if we can restart (rate limiting)
-   */
-  private canRestart(): boolean {
-    const now = Date.now();
-
-    // Reset counter if outside window
-    if (now - this.lastRestartTime > this.config.restartWindowMs) {
-      this.restartCount = 0;
+  private async stopRole(role: RuntimeRole): Promise<void> {
+    const child = this.childForRole(role);
+    if (!child) return;
+    if (child.exitCode !== null) {
+      this.setChild(role, null);
+      return;
     }
 
-    return this.restartCount < this.config.maxRestarts;
+    await new Promise<void>((resolve) => {
+      let done = false;
+      const finish = () => {
+        if (done) return;
+        done = true;
+        resolve();
+      };
+
+      const timer = setTimeout(() => {
+        if (child.exitCode === null) {
+          child.kill("SIGKILL");
+        }
+        finish();
+      }, 10_000);
+      timer.unref();
+
+      child.once("exit", () => {
+        clearTimeout(timer);
+        finish();
+      });
+
+      child.kill("SIGTERM");
+    });
+
+    this.setChild(role, null);
   }
 
-  /**
-   * Check for scheduled restart state
-   */
-  private async checkRestartState(): Promise<RestartState | null> {
+  private async restartGateway(reason: string): Promise<void> {
+    if (!this.allowRestart(reason)) {
+      await this.shutdown("restart_limit", 1);
+      return;
+    }
+
+    await this.stopRole("gateway");
+    await this.sleep(this.config.restartDelayMs);
+    await this.spawnRole("gateway");
+  }
+
+  private async restartWorker(reason: string): Promise<void> {
+    if (!this.allowRestart(reason)) {
+      await this.shutdown("restart_limit", 1);
+      return;
+    }
+
+    await this.stopRole("worker");
+    await this.sleep(this.config.restartDelayMs);
+    await this.spawnRole("worker");
+  }
+
+  private async restartAll(reason: string): Promise<void> {
+    if (!this.allowRestart(reason)) {
+      await this.shutdown("restart_limit", 1);
+      return;
+    }
+
+    await this.stopRole("gateway");
+    await this.stopRole("worker");
+    await this.sleep(this.config.restartDelayMs);
+    await this.spawnRole("gateway");
+    await this.spawnRole("worker");
+  }
+
+  private allowRestart(_reason: string): boolean {
+    const now = Date.now();
+    if (now - this.restartWindowStart > this.config.restartWindowMs) {
+      this.restartWindowStart = now;
+      this.restartCount = 0;
+    }
+    if (this.restartCount >= this.config.maxRestarts) return false;
+    this.restartCount += 1;
+    return true;
+  }
+
+  private async checkRestartState(): Promise<void> {
+    if (this.shuttingDown || this.restartStateBusy) return;
+    this.restartStateBusy = true;
     try {
-      const content = await fs.readFile(this.restartFile, "utf-8");
-      return JSON.parse(content) as RestartState;
+      const state = await this.consumeRestartState();
+      if (!state) return;
+      await this.enqueueRestart(async () => {
+        await this.restartFromState(state, "restart_file_poll");
+      });
+    } finally {
+      this.restartStateBusy = false;
+    }
+  }
+
+  private async consumeRestartState(): Promise<RestartState | null> {
+    try {
+      const raw = await fs.readFile(this.restartFile, "utf-8");
+      const parsed = JSON.parse(raw) as RestartState;
+      if (!parsed?.requested) return null;
+      await fs.unlink(this.restartFile).catch(() => undefined);
+      return parsed;
     } catch {
       return null;
     }
   }
 
-  /**
-   * Graceful shutdown
-   */
-  private shutdown(signal: string): void {
-    if (this.shuttingDown) {
-      console.log(`[supervisor] Already shutting down, received ${signal} again`);
-      if (this.child) {
-        console.log("[supervisor] Force killing child process");
-        this.child.kill("SIGKILL");
-      }
-      process.exit(1);
+  private async restartFromState(state: RestartState, source: string): Promise<void> {
+    const target: RestartTarget = state.target ?? "all";
+    const reason = state.reason ? `${source}:${state.reason}` : source;
+    if (target === "worker") {
+      await this.restartWorker(reason);
+      return;
     }
-
-    console.log(`[supervisor] Received ${signal}, shutting down gracefully...`);
-    this.shuttingDown = true;
-
-    if (this.child) {
-      // Forward the signal to child
-      this.child.kill(signal as NodeJS.Signals);
-
-      // Force kill after 10 seconds
-      const forceKillTimer = setTimeout(() => {
-        if (this.child) {
-          console.log("[supervisor] Force killing child process after timeout");
-          this.child.kill("SIGKILL");
-        }
-      }, 10000);
-
-      // Don't let the timer keep the process alive
-      forceKillTimer.unref();
+    if (target === "gateway") {
+      await this.restartGateway(reason);
+      return;
     }
+    await this.restartAll(reason);
   }
 
-  /**
-   * Sleep helper
-   */
-  private sleep(ms: number): Promise<void> {
-    return new Promise((resolve) => setTimeout(resolve, ms));
+  private async checkWorkerHeartbeat(): Promise<void> {
+    if (this.shuttingDown) return;
+    if (!this.worker || this.worker.exitCode !== null) return;
+
+    const now = Date.now();
+    // Grace period: allow worker startup/init before requiring heartbeat file.
+    if (this.workerSpawnedAt > 0 && now - this.workerSpawnedAt < this.config.workerHeartbeatMaxAgeMs) {
+      return;
+    }
+
+    try {
+      const stat = await fs.stat(this.config.workerHeartbeatPath);
+      const ageMs = now - stat.mtimeMs;
+      if (ageMs <= this.config.workerHeartbeatMaxAgeMs) return;
+    } catch {
+      // Missing heartbeat file counts as unhealthy.
+    }
+
+    await this.enqueueRestart(async () => {
+      if (this.shuttingDown) return;
+      await this.restartWorker("worker_heartbeat_stale");
+    });
+  }
+
+  private enqueueRestart(task: () => Promise<void>): Promise<void> {
+    this.restartQueue = this.restartQueue
+      .then(task)
+      .catch(async () => {
+        await this.shutdown("restart_error", 1);
+      });
+    return this.restartQueue;
+  }
+
+  private async shutdown(reason: string, exitCode = 0): Promise<void> {
+    if (this.shuttingDown) return;
+    this.shuttingDown = true;
+    this.stopMonitors();
+    this.stopLegacyWatcher();
+    this.unregisterSignals();
+
+    if (this.legacyChild && this.legacyChild.exitCode === null) {
+      this.legacyChild.kill("SIGTERM");
+    }
+    await this.stopRole("gateway");
+    await this.stopRole("worker");
+    await this.removePidFiles();
+
+    this.doneResolve?.();
+    this.doneResolve = null;
+    process.exitCode = exitCode;
+  }
+
+  private async sleep(ms: number): Promise<void> {
+    await new Promise<void>((resolve) => setTimeout(resolve, ms));
   }
 }
 
-/**
- * Parse command line arguments for supervisor-specific options
- */
 export function parseArgs(argv: string[] = process.argv.slice(2)): { config: Partial<SupervisorConfig>; help: boolean } {
-  const args = argv;
   const config: Partial<SupervisorConfig> = {};
   let help = false;
 
-  for (let i = 0; i < args.length; i++) {
-    const arg = args[i];
-
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
     if (arg === "--help" || arg === "-h") {
       help = true;
-    } else if (arg === "--restart-delay" && args[i + 1]) {
-      config.restartDelayMs = parseInt(args[++i], 10);
-    } else if (arg === "--max-restarts" && args[i + 1]) {
-      config.maxRestarts = parseInt(args[++i], 10);
-    } else if (arg === "--state-dir" && args[i + 1]) {
-      config.stateDir = args[++i];
+    } else if (arg === "--state-dir" && argv[i + 1]) {
+      config.stateDir = argv[++i]!;
+    } else if (arg === "--restart-delay" && argv[i + 1]) {
+      config.restartDelayMs = parseInt(argv[++i]!, 10);
+    } else if (arg === "--max-restarts" && argv[i + 1]) {
+      config.maxRestarts = parseInt(argv[++i]!, 10);
     }
   }
 
   return { config, help };
 }
 
-/**
- * Print help message
- */
 export function printHelp(): void {
   console.log(`
-ANT Supervisor - Process supervisor for graceful restarts
+ANT Supervisor
 
-Usage: node supervisor.js [options] [-- child-args...]
+Usage: node supervisor.js [options]
 
 Options:
-  --help, -h          Show this help message
-  --restart-delay MS  Delay before restarting (default: 1000)
-  --max-restarts N    Max restarts in window (default: 10)
-  --state-dir PATH    State directory (default: .ant)
-
-The supervisor:
-  1. Spawns the main ANT process as a child
-  2. Watches for restart requests via:
-     - Exit code 42 from the child process
-     - .ant/restart.json file with { requested: true }
-  3. Gracefully restarts when requested
-  4. Forwards SIGINT/SIGTERM to the child
-  5. Passes remaining arguments to the child process
-
-Examples:
-  node supervisor.js run              # Run ANT with supervisor
-  node supervisor.js run --tui        # Run ANT with TUI mode
-  node supervisor.js --max-restarts 5 run
+  --help, -h          Show help
+  --state-dir PATH    Runtime state directory
+  --restart-delay MS  Delay before restart
+  --max-restarts N    Restart limit in window
 `);
 }
-
-export { Supervisor };
 
 function isMainModule(): boolean {
   const entry = process.argv[1];
@@ -432,21 +540,17 @@ function isMainModule(): boolean {
 
 export async function runSupervisorCli(argv: string[] = process.argv): Promise<void> {
   const { config, help } = parseArgs(argv.slice(2));
-
   if (help) {
     printHelp();
-    process.exitCode = 0;
     return;
   }
-
   const supervisor = new Supervisor(config);
   await supervisor.start();
 }
 
-// Run supervisor only when invoked as an entrypoint script.
 if (isMainModule()) {
   runSupervisorCli().catch((err) => {
-    console.error("[supervisor] Fatal error:", err);
+    console.error("[supervisor] fatal", err);
     process.exitCode = 1;
   });
 }

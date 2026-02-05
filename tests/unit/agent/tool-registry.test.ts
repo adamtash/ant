@@ -23,7 +23,7 @@ describe("ToolRegistry", () => {
 
   beforeAll(async () => {
     workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "ant-tool-registry-workspace-"));
-    stateDir = path.join(workspaceDir, ".ant");
+    stateDir = path.join(workspaceDir);
     await fs.mkdir(stateDir, { recursive: true });
   });
 

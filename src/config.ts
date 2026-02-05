@@ -1,3 +1,4 @@
+import fsSync from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -6,6 +7,7 @@ import { z } from "zod";
 import { readProvidersDiscoveredOverlay } from "./config/provider-writer.js";
 
 const DEFAULT_CONFIG_PATH = path.join(os.homedir(), ".ant", "ant.config.json");
+const PROJECT_CONFIG_FILENAME = "ant.config.json";
 
 const ProviderItemSchema = z
   .object({
@@ -48,8 +50,10 @@ const ProvidersDiscoverySchema = z
   .object({
     enabled: z.boolean().default(false),
     researchIntervalHours: z.number().int().positive().default(24),
-    healthCheckIntervalMinutes: z.number().int().positive().default(15),
-    minBackupProviders: z.number().int().min(0).default(2),
+    healthCheckIntervalMinutes: z.number().int().positive().default(120),
+    minBackupProviders: z.number().int().min(0).default(1),
+    minCandidates: z.number().int().min(0).default(1),
+    logMode: z.enum(["daily-rollup", "changes-only"]).default("daily-rollup"),
     trustSources: z.array(z.string()).default([]),
   })
   .default({});
@@ -164,6 +168,7 @@ const TelegramSchema = z
 const MemorySchema = z.object({
   enabled: z.boolean().default(true),
   indexSessions: z.boolean().default(true),
+  retentionDays: z.number().int().positive().default(30),
   sqlitePath: z.string().min(1),
   embeddingsModel: z.string().min(1),
   provider: z
@@ -208,6 +213,20 @@ const MemorySchema = z.object({
     })
     .default({}),
   sources: z.array(z.enum(["memory", "sessions"])).default(["memory", "sessions"]),
+  sessions: z
+    .object({
+      includeRoles: z.array(z.enum(["user", "assistant", "tool", "system"])).default(["user", "assistant"]),
+      maxMessages: z.number().int().positive().default(1000),
+      maxBytes: z.number().int().positive().default(2_000_000),
+      minChars: z.number().int().positive().default(4),
+      excludePatterns: z.array(z.string()).default([
+        "^\\s*Tool result:",
+        "^\\s*System:",
+        "^\\s*Tool call:",
+        "^\\s*\\[Old tool result content cleared\\]",
+      ]),
+    })
+    .default({}),
   sync: z
     .object({
       onSessionStart: z.boolean().default(true),
@@ -297,6 +316,16 @@ const MainAgentSchema = z.object({
   intervalMs: z.number().int().positive().default(60000),
   dutiesFile: z.string().default("AGENT_DUTIES.md"),
   logFile: z.string().default(".ant/AGENT_LOG.md"),
+  errorScanIntervalMs: z.number().int().positive().default(30_000),
+  notifySessions: z.array(z.string()).default([]),
+  notifyOn: z
+    .object({
+      errors: z.boolean().default(true),
+      incidentResults: z.boolean().default(true),
+      providers: z.boolean().default(true),
+      improvements: z.boolean().default(true),
+    })
+    .default({}),
 });
 
 const SubagentsSchema = z.object({
@@ -438,6 +467,40 @@ const LoggingSchema = z.object({
 
 const RuntimeSchema = z
   .object({
+    mode: z.enum(["single", "split"]).default("single"),
+    repoRoot: z.string().optional(),
+    supervisor: z
+      .object({
+        enabled: z.boolean().default(true),
+        restartDelayMs: z.number().int().positive().default(1000),
+        maxRestarts: z.number().int().positive().default(10),
+        restartWindowMs: z.number().int().positive().default(60_000),
+      })
+      .default({}),
+    worker: z
+      .object({
+        heartbeatPath: z.string().default(".ant/heartbeat.worker"),
+        heartbeatIntervalMs: z.number().int().positive().default(5000),
+        maxHeartbeatAgeMs: z.number().int().positive().default(20_000),
+        requestTimeoutMs: z.number().int().positive().default(300_000),
+      })
+      .default({}),
+    selfBuild: z
+      .object({
+        enabled: z.boolean().default(true),
+        maxFixAttempts: z.number().int().min(0).default(1),
+        notifyOwnersOnFailure: z.boolean().default(true),
+        commands: z
+          .object({
+            build: z.string().default("npm run build"),
+            uiBuild: z.string().default("npm run ui:build"),
+            typecheck: z.string().default("npm run typecheck"),
+            test: z.string().default("npm test"),
+            diagnostics: z.string().default("ant diagnostics test-all"),
+          })
+          .default({}),
+      })
+      .default({}),
     restart: z
       .object({
         command: z.string().min(1),
@@ -536,6 +599,7 @@ export type AntConfig = z.infer<typeof ConfigSchema> & {
     logFileLevel: string;
     configPath: string;
     uiStaticDir: string;
+    repoRoot: string;
   };
 };
 
@@ -625,10 +689,61 @@ export async function saveConfig(config: unknown, explicitPath?: string): Promis
   await fs.writeFile(configPath, JSON.stringify(parsed, null, 2), "utf-8");
 }
 
+function formatZodPath(pathSegments: Array<string | number>): string {
+  if (pathSegments.length === 0) return "<root>";
+  let out = "";
+  for (const seg of pathSegments) {
+    if (typeof seg === "number") {
+      out += `[${seg}]`;
+      continue;
+    }
+    out += out ? `.${seg}` : seg;
+  }
+  return out;
+}
+
+export function validateConfigObject(raw: unknown): {
+  ok: boolean;
+  errors?: Array<{ path: string; message: string }>;
+} {
+  const parsed = ConfigSchema.safeParse(raw);
+  if (parsed.success) return { ok: true };
+
+  const errors = parsed.error.errors.map((err) => ({
+    path: formatZodPath(err.path),
+    message: err.message,
+  }));
+
+  return { ok: false, errors };
+}
+
 export function resolveConfigPath(explicitPath?: string): string {
   const envPath = (process.env.ANT_CONFIG_PATH ?? process.env.ANT_CONFIG)?.trim();
-  const pathToUse = explicitPath?.trim() || envPath || DEFAULT_CONFIG_PATH;
-  return path.resolve(pathToUse);
+  const pathToUse =
+    expandTilde(explicitPath?.trim() || "") ||
+    expandTilde(envPath || "") ||
+    findConfigUpwards(process.cwd(), PROJECT_CONFIG_FILENAME) ||
+    DEFAULT_CONFIG_PATH;
+  return path.resolve(expandTilde(pathToUse));
+}
+
+function findConfigUpwards(startDir: string, fileName: string): string | null {
+  let current = path.resolve(startDir);
+  while (true) {
+    const candidate = path.join(current, fileName);
+    try {
+      if (fsSync.existsSync(candidate) && fsSync.statSync(candidate).isFile()) {
+        return candidate;
+      }
+    } catch {
+      // ignore fs errors and continue walking
+    }
+
+    const parent = path.dirname(current);
+    if (parent === current) break;
+    current = parent;
+  }
+  return null;
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -670,10 +785,12 @@ function applyEnvOverrides(raw: unknown): unknown {
 
   const uiPort = envInt("ANT_UI_PORT");
   const uiHost = envStr("ANT_UI_HOST");
-  if (uiPort !== undefined || uiHost) {
+  const uiStaticDir = envStr("ANT_UI_STATIC_DIR");
+  if (uiPort !== undefined || uiHost || uiStaticDir) {
     const ui = isPlainObject(config.ui) ? { ...config.ui } : {};
     if (uiPort !== undefined) ui.port = uiPort;
     if (uiHost) ui.host = uiHost;
+    if (uiStaticDir) ui.staticDir = uiStaticDir;
     config.ui = ui;
   }
 
@@ -716,20 +833,49 @@ function applyEnvOverrides(raw: unknown): unknown {
     config.telegram = telegram;
   }
 
+  const runtimeRepoRoot = envStr("ANT_RUNTIME_REPO_ROOT");
+  if (runtimeRepoRoot) {
+    const runtime = isPlainObject(config.runtime) ? { ...config.runtime } : {};
+    runtime.repoRoot = runtimeRepoRoot;
+    config.runtime = runtime;
+  }
+
   return config;
 }
 
 function resolveConfig(base: z.infer<typeof ConfigSchema>, configPath: string): AntConfig {
   const workspaceDir = resolveUserPath(base.workspaceDir);
+  const defaultStateDir = defaultStateDirForWorkspace(workspaceDir);
+  const configuredStateDir = base.stateDir?.trim();
+  let stateDirInput = configuredStateDir || defaultStateDir;
+  if (configuredStateDir && path.basename(workspaceDir) === ".ant") {
+    const dotAnt = isDotAntPath(stripLeadingDotSlash(configuredStateDir));
+    if (dotAnt.isDotAnt) {
+      stateDirInput = dotAnt.rest ? path.join(workspaceDir, dotAnt.rest) : workspaceDir;
+    }
+  }
   const stateDir = resolveUserPath(
-    base.stateDir?.trim() || path.join(workspaceDir, ".ant"),
+    stateDirInput,
     workspaceDir,
   );
-  const memorySqlitePath = resolveUserPath(base.memory.sqlitePath, workspaceDir);
-  const whatsappSessionDir = resolveUserPath(base.whatsapp.sessionDir, workspaceDir);
+  const memorySqlitePath = resolveWorkspaceOrStatePath(
+    base.memory.sqlitePath,
+    workspaceDir,
+    stateDir,
+  );
+  const whatsappSessionDir = resolveWorkspaceOrStatePath(
+    base.whatsapp.sessionDir,
+    workspaceDir,
+    stateDir,
+  );
   const telegramStateDir = path.join(stateDir, "telegram");
-  const logFilePath = resolveUserPath(
+  const logFilePath = resolveWorkspaceOrStatePath(
     base.logging.filePath?.trim() || path.join(stateDir, "ant.log"),
+    workspaceDir,
+    stateDir,
+  );
+  const repoRoot = resolveUserPath(
+    base.runtime.repoRoot?.trim() || path.dirname(configPath),
     workspaceDir,
   );
   const logFileLevel = base.logging.fileLevel?.trim() || base.logging.level;
@@ -742,6 +888,39 @@ function resolveConfig(base: z.infer<typeof ConfigSchema>, configPath: string): 
 
   return {
     ...base,
+    mainAgent: {
+      ...base.mainAgent,
+      logFile: resolveWorkspaceOrStatePath(
+        base.mainAgent.logFile,
+        workspaceDir,
+        stateDir,
+      ),
+    },
+    runtime: {
+      ...base.runtime,
+      worker: {
+        ...base.runtime.worker,
+        heartbeatPath: resolveWorkspaceOrStatePath(
+          base.runtime.worker.heartbeatPath,
+          workspaceDir,
+          stateDir,
+        ),
+      },
+    },
+    agentExecution: {
+      ...base.agentExecution,
+      tasks: {
+        ...base.agentExecution.tasks,
+        registry: {
+          ...base.agentExecution.tasks.registry,
+          dir: resolveWorkspaceOrStatePath(
+            base.agentExecution.tasks.registry.dir,
+            workspaceDir,
+            stateDir,
+          ),
+        },
+      },
+    },
     resolved: {
       workspaceDir,
       stateDir,
@@ -755,6 +934,7 @@ function resolveConfig(base: z.infer<typeof ConfigSchema>, configPath: string): 
       logFileLevel,
       configPath,
       uiStaticDir,
+      repoRoot,
     },
   };
 }
@@ -803,12 +983,63 @@ function normalizeRouting(
   };
 }
 
-function resolveUserPath(value: string, baseDir?: string): string {
+function stripLeadingDotSlash(raw: string): string {
+  let out = raw;
+  while (out.startsWith("./") || out.startsWith(".\\")) {
+    out = out.slice(2);
+  }
+  return out;
+}
+
+function isDotAntPath(raw: string): { isDotAnt: boolean; rest: string } {
+  const normalized = raw.replace(/\\/g, "/");
+  if (normalized === ".ant") {
+    return { isDotAnt: true, rest: "" };
+  }
+  if (normalized.startsWith(".ant/")) {
+    return { isDotAnt: true, rest: normalized.slice(".ant/".length) };
+  }
+  return { isDotAnt: false, rest: "" };
+}
+
+function defaultStateDirForWorkspace(workspaceDir: string): string {
+  if (path.basename(workspaceDir) === ".ant") {
+    return workspaceDir;
+  }
+  return path.join(workspaceDir, ".ant");
+}
+
+export function resolveWorkspaceOrStatePath(
+  value: string,
+  workspaceDir: string,
+  stateDir: string,
+): string {
   const trimmed = value.trim();
   if (!trimmed) return trimmed;
-  if (trimmed.startsWith("~")) {
-    return path.join(os.homedir(), trimmed.slice(1));
+  if (trimmed.startsWith("~") || path.isAbsolute(trimmed)) {
+    return resolveUserPath(trimmed, workspaceDir);
   }
+
+  const normalizedRelative = stripLeadingDotSlash(trimmed);
+  const dotAnt = isDotAntPath(normalizedRelative);
+  if (dotAnt.isDotAnt) {
+    return path.resolve(stateDir, dotAnt.rest);
+  }
+
+  return path.resolve(workspaceDir, trimmed);
+}
+
+function expandTilde(value: string): string {
+  const trimmed = value.trim();
+  if (!trimmed) return trimmed;
+  if (trimmed === "~") return os.homedir();
+  if (trimmed.startsWith("~/")) return path.join(os.homedir(), trimmed.slice(2));
+  return trimmed;
+}
+
+function resolveUserPath(value: string, baseDir?: string): string {
+  const trimmed = expandTilde(value);
+  if (!trimmed) return trimmed;
   if (path.isAbsolute(trimmed)) {
     return path.normalize(trimmed);
   }

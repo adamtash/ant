@@ -11,7 +11,7 @@
 
 import fs from "node:fs/promises";
 import path from "node:path";
-import type { ToolDefinition, CronContext, AgentConfig, Message } from "./types.js";
+import type { ToolDefinition, CronContext, AgentConfig, Message, PromptMode } from "./types.js";
 
 /**
  * Runtime info for prompt building
@@ -20,6 +20,7 @@ export interface RuntimeInfo {
   model: string;
   providerType: "openai" | "cli";
   workspaceDir: string;
+  repoRoot?: string;
   currentTime: Date;
   cronContext?: CronContext;
 }
@@ -42,6 +43,7 @@ export interface PromptBuilderOptions {
   runtimeInfo: RuntimeInfo;
   memoryContext?: MemoryContext;
   isSubagent?: boolean;
+  promptMode?: PromptMode;
 }
 
 /**
@@ -57,26 +59,36 @@ export interface BootstrapFile {
  * Build the complete system prompt
  */
 export function buildSystemPrompt(options: PromptBuilderOptions): string {
+  const mode: PromptMode = options.promptMode ?? "full";
+  if (mode === "none") {
+    return buildIdentitySection(options, mode);
+  }
+
+  const isMinimal = mode === "minimal";
   const sections: string[] = [];
 
   // Core identity
-  sections.push(buildIdentitySection(options));
+  sections.push(buildIdentitySection(options, mode));
 
   // Runtime info
-  sections.push(buildRuntimeSection(options.runtimeInfo));
+  sections.push(buildRuntimeSection(options.runtimeInfo, mode));
 
   // Tools documentation
   if (options.tools.length > 0) {
-    sections.push(buildToolsSection(options.tools, options.runtimeInfo.providerType));
+    sections.push(
+      isMinimal
+        ? buildToolsSectionMinimal(options.tools, options.runtimeInfo.providerType)
+        : buildToolsSection(options.tools, options.runtimeInfo.providerType)
+    );
   }
 
   // Memory context
-  if (options.memoryContext) {
+  if (!isMinimal && options.memoryContext) {
     sections.push(buildMemorySection(options.memoryContext));
   }
 
   // Bootstrap files (MEMORY.md, PROJECT.md, etc.)
-  if (options.bootstrapFiles.length > 0) {
+  if (!isMinimal && options.bootstrapFiles.length > 0) {
     sections.push(buildBootstrapSection(options.bootstrapFiles));
   }
 
@@ -86,7 +98,7 @@ export function buildSystemPrompt(options: PromptBuilderOptions): string {
   }
 
   // Guidelines
-  sections.push(buildGuidelinesSection(options.isSubagent));
+  sections.push(buildGuidelinesSection(options.isSubagent, mode));
 
   return sections.filter(Boolean).join("\n\n---\n\n");
 }
@@ -94,10 +106,10 @@ export function buildSystemPrompt(options: PromptBuilderOptions): string {
 /**
  * Build identity section
  */
-function buildIdentitySection(options: PromptBuilderOptions): string {
+function buildIdentitySection(options: PromptBuilderOptions, mode: PromptMode): string {
   const customPrompt = options.config.systemPrompt?.trim();
 
-  const baseIdentity = `# ANT - Autonomous Agent
+  const baseIdentityFull = `# ANT - Autonomous Agent
 
 You are ANT, an autonomous AI agent that helps users accomplish tasks. You have access to tools for file operations, shell commands, browser control, memory search, and more.
 
@@ -109,23 +121,35 @@ Key capabilities:
 - Spawn subagents for parallel tasks
 - Send messages across channels (WhatsApp, CLI, Web)`;
 
+  const baseIdentityMinimal = `# ANT
+
+You are ANT, an autonomous assistant. Use tools when needed and respond concisely.`;
+
   if (customPrompt) {
-    return `${baseIdentity}\n\n## Custom Instructions\n\n${customPrompt}`;
+    const base = mode === "full" ? baseIdentityFull : baseIdentityMinimal;
+    return `${base}\n\n## Custom Instructions\n\n${customPrompt}`;
   }
 
-  return baseIdentity;
+  return mode === "full" ? baseIdentityFull : baseIdentityMinimal;
 }
 
 /**
  * Build runtime info section
  */
-function buildRuntimeSection(runtimeInfo: RuntimeInfo): string {
-  return `# Runtime Information
-
-- **Current Time**: ${runtimeInfo.currentTime.toISOString()}
-- **Model**: ${runtimeInfo.model}
-- **Provider**: ${runtimeInfo.providerType}
-- **Workspace**: ${runtimeInfo.workspaceDir}`;
+function buildRuntimeSection(runtimeInfo: RuntimeInfo, mode: PromptMode): string {
+  const lines = [
+    `- **Current Time**: ${runtimeInfo.currentTime.toISOString()}`,
+    `- **Model**: ${runtimeInfo.model}`,
+    `- **Provider**: ${runtimeInfo.providerType}`,
+    `- **Workspace**: ${runtimeInfo.workspaceDir}`,
+  ];
+  if (runtimeInfo.repoRoot) {
+    lines.push(`- **Repo Root**: ${runtimeInfo.repoRoot}`);
+  }
+  if (mode === "minimal") {
+    return `# Runtime\n\n${lines.join("\n")}`;
+  }
+  return `# Runtime Information\n\n${lines.join("\n")}`;
 }
 
 /**
@@ -165,6 +189,23 @@ ${params}
 You can use the following tools to accomplish tasks. ${callInstruction}
 
 ${toolDocs}`;
+}
+
+function buildToolsSectionMinimal(tools: ToolDefinition[], providerType: "openai" | "cli"): string {
+  const toolLines = tools
+    .map((tool) => `- \`${tool.function.name}\`: ${tool.function.description}`)
+    .join("\n");
+
+  const callInstruction =
+    providerType === "cli"
+      ? [
+          "When you need a tool, respond ONLY with valid JSON in this exact shape:",
+          '{"toolCalls":[{"name":"tool_name","arguments":{}}]}',
+          "Choose tool_name from the list below and include all required arguments.",
+        ].join("\n")
+      : "Call tools using the standard function calling format.";
+
+  return `# Tools (Summary)\n\n${callInstruction}\n\n${toolLines}`;
 }
 
 /**
@@ -219,8 +260,15 @@ You are running autonomously. Complete the scheduled task and report results.`;
 /**
  * Build guidelines section
  */
-function buildGuidelinesSection(isSubagent?: boolean): string {
-  const baseGuidelines = `# Guidelines
+function buildGuidelinesSection(isSubagent: boolean | undefined, mode: PromptMode): string {
+  const baseGuidelines =
+    mode === "minimal"
+      ? `# Guidelines
+
+1. **Be concise** - Answer directly.
+2. **Use tools when needed** - Prefer tools over guessing.
+3. **Be safe** - Explain blockers or limits.`
+      : `# Guidelines
 
 1. **Be concise** - Keep responses focused and actionable
 2. **Use tools effectively** - Prefer using tools over asking for information you can look up

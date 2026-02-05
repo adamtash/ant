@@ -92,9 +92,12 @@ export class PheromoneMap {
    * Convert world position to grid coordinates
    */
   private toGridCoords(pos: Vector2D): { x: number; y: number } {
+    // World space is centered at (0,0) while the grid is indexed from (0,0) at top-left.
+    const shiftedX = pos.x + this.width / 2;
+    const shiftedY = pos.y + this.height / 2;
     return {
-      x: Math.floor(pos.x / this.cellSize),
-      y: Math.floor(pos.y / this.cellSize),
+      x: Math.floor(shiftedX / this.cellSize),
+      y: Math.floor(shiftedY / this.cellSize),
     };
   }
 
@@ -330,8 +333,8 @@ export class PheromoneMap {
         const value = this.grid[y][x][type];
         if (value > PHEROMONE.threshold) {
           data.push({
-            x: x * this.cellSize + this.cellSize / 2,
-            y: y * this.cellSize + this.cellSize / 2,
+            x: x * this.cellSize + this.cellSize / 2 - this.width / 2,
+            y: y * this.cellSize + this.cellSize / 2 - this.height / 2,
             value,
           });
         }

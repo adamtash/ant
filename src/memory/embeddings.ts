@@ -104,9 +104,16 @@ export async function createEmbeddingProvider(config: {
   // OpenClaw-style multi-provider
   const cfg = config.openClawConfig ?? {
     provider: "auto",
-    fallback: ["openai"],
+    fallback: ["local", "openai"],
     local: { baseUrl: "http://localhost:1234/v1" },
   };
+
+  if (!Array.isArray(cfg.fallback) || cfg.fallback.length === 0) {
+    cfg.fallback = ["local", "openai"];
+  }
+  if (cfg.provider === "auto" && !cfg.fallback.includes("local")) {
+    cfg.fallback = ["local", ...cfg.fallback];
+  }
 
   // Try primary provider
   if (cfg.provider !== "auto") {
@@ -180,8 +187,9 @@ async function tryProvider(
 export class OpenAIEmbeddingProvider implements EmbeddingProvider {
   private readonly baseUrl: string;
   private readonly apiKey?: string;
-  private readonly model: string;
+  private model: string;
   private detectedDimension?: number;
+  private autoSwitchedModel = false;
 
   constructor(config: { baseUrl: string; apiKey?: string; model: string }) {
     this.baseUrl = config.baseUrl;
@@ -244,6 +252,39 @@ export class OpenAIEmbeddingProvider implements EmbeddingProvider {
   }
 
   private async fetchEmbeddings(texts: string[]): Promise<number[][]> {
+    const firstAttempt = await this.fetchEmbeddingsWithModel(texts, this.model);
+    if (firstAttempt.ok) {
+      return firstAttempt.embeddings;
+    }
+
+    const modelRejected = /not embedding/i.test(firstAttempt.body);
+    if (!modelRejected || this.autoSwitchedModel) {
+      throw new Error(`Embedding request failed: ${firstAttempt.status} ${firstAttempt.body}`);
+    }
+
+    const fallbackModel = await this.findFallbackEmbeddingModel();
+    if (!fallbackModel || fallbackModel === this.model) {
+      throw new Error(`Embedding request failed: ${firstAttempt.status} ${firstAttempt.body}`);
+    }
+
+    const previous = this.model;
+    this.model = fallbackModel;
+    this.autoSwitchedModel = true;
+    console.warn(
+      `Embedding model '${previous}' was rejected by server; switching to '${fallbackModel}'.`
+    );
+
+    const secondAttempt = await this.fetchEmbeddingsWithModel(texts, this.model);
+    if (!secondAttempt.ok) {
+      throw new Error(`Embedding request failed: ${secondAttempt.status} ${secondAttempt.body}`);
+    }
+    return secondAttempt.embeddings;
+  }
+
+  private async fetchEmbeddingsWithModel(
+    texts: string[],
+    model: string
+  ): Promise<{ ok: true; embeddings: number[][] } | { ok: false; status: number; body: string }> {
     const url = new URL(this.baseUrl);
     if (!url.pathname.endsWith("/")) {
       url.pathname += "/";
@@ -262,14 +303,14 @@ export class OpenAIEmbeddingProvider implements EmbeddingProvider {
       method: "POST",
       headers,
       body: JSON.stringify({
-        model: this.model,
+        model,
         input: texts,
       }),
     });
 
     if (!response.ok) {
-      const text = await response.text();
-      throw new Error(`Embedding request failed: ${response.status} ${text}`);
+      const body = await response.text();
+      return { ok: false, status: response.status, body };
     }
 
     const data = (await response.json()) as {
@@ -277,12 +318,54 @@ export class OpenAIEmbeddingProvider implements EmbeddingProvider {
     };
 
     if (!data.data) {
-      return texts.map(() => []);
+      return { ok: true, embeddings: texts.map(() => []) };
     }
 
     // Sort by index to ensure correct order
     const sorted = [...data.data].sort((a, b) => a.index - b.index);
-    return sorted.map((item) => normalizeEmbedding(item.embedding));
+    return { ok: true, embeddings: sorted.map((item) => normalizeEmbedding(item.embedding)) };
+  }
+
+  private async findFallbackEmbeddingModel(): Promise<string | null> {
+    try {
+      const url = new URL(this.baseUrl);
+      if (!url.pathname.endsWith("/")) {
+        url.pathname += "/";
+      }
+      url.pathname += "models";
+
+      const headers: Record<string, string> = {};
+      if (this.apiKey) {
+        headers.authorization = `Bearer ${this.apiKey}`;
+      }
+
+      const response = await fetch(url.toString(), {
+        method: "GET",
+        headers,
+      });
+      if (!response.ok) return null;
+
+      const data = (await response.json()) as {
+        data?: Array<{ id?: string }>;
+      };
+      const ids = (data.data ?? [])
+        .map((item) => item.id)
+        .filter((id): id is string => typeof id === "string" && id.length > 0);
+
+      const candidates = ids.filter(
+        (id) => id !== this.model && /embed|embedding/i.test(id)
+      );
+      if (candidates.length === 0) return null;
+
+      const preferred =
+        candidates.find((id) => /^text-embedding/i.test(id)) ??
+        candidates.find((id) => /nomic/i.test(id)) ??
+        candidates[0] ??
+        null;
+      return preferred;
+    } catch {
+      return null;
+    }
   }
 
   getModel(): string {

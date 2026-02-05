@@ -1,0 +1,93 @@
+{
+  "version": 1,
+  "jobs": [
+    {
+      "id": "flight:light-check",
+      "name": "Light Check",
+      "enabled": true,
+      "schedule": "*/5 * * * *",
+      "trigger": {
+        "type": "agent_ask",
+        "prompt": "Execute a light health check:\n\n1. Analyze the last 100 lines of ~/.ant/ant.log\n2. Count ERROR, WARN, and critical error events\n3. Check if any subagents are running\n4. Verify we can reach at least one provider\n5. If error rate > 5 errors per hour in the last hour, alert owner\n\nFormat your response as:\n- Error count: X\n- Warning count: Y\n- Subagents active: X\n- Providers reachable: X/X\n- Status: HEALTHY | WARNING | CRITICAL\n- Recommendation: [action if needed]"
+      },
+      "actions": [
+        {
+          "type": "log_event",
+          "level": "info",
+          "prefix": "🚁 Drone Flight [Light Check]"
+        }
+      ],
+      "retryOnFailure": true,
+      "maxRetries": 1,
+      "timeout": 1200000,
+      "createdAt": 1770239039208,
+      "updatedAt": 1770239039208
+    },
+    {
+      "id": "flight:hourly-maintenance",
+      "name": "Hourly Deep Maintenance",
+      "enabled": true,
+      "schedule": "0 * * * *",
+      "trigger": {
+        "type": "agent_ask",
+        "prompt": "Execute hourly deep maintenance:\n\n1. Read and analyze the last 500 lines of ~/.ant/ant.log\n2. Identify error patterns (repeated 3+ times)\n3. For each pattern found:\n   - Search KNOWN_ISSUES.md for a match\n   - If found, apply the documented fix\n   - If new, note as investigation item\n4. Update KNOWN_ISSUES.md with any new patterns\n5. List all fixes applied and issues investigated\n\nFormat response as:\n## Hourly Maintenance Report\n- Files Analyzed: ~/.ant/ant.log\n- Errors Found: X patterns\n- Fixes Applied: X\n- New Issues: X\n- Status: <success|partial|failed>\n- Details:\n  * [Pattern]: [Fix Applied] ✅\n  * [New Pattern]: [Under investigation] 🔍"
+      },
+      "actions": [
+        {
+          "type": "log_event",
+          "level": "info",
+          "prefix": "🚁 Drone Flight [Hourly Deep Maintenance]"
+        }
+      ],
+      "retryOnFailure": true,
+      "maxRetries": 2,
+      "timeout": 600000,
+      "createdAt": 1770239039220,
+      "updatedAt": 1770239039220
+    },
+    {
+      "id": "flight:weekly-review",
+      "name": "Weekly Deep Dive",
+      "enabled": true,
+      "schedule": "0 0 * * 1",
+      "trigger": {
+        "type": "agent_ask",
+        "prompt": "Execute weekly comprehensive review:\n\n1. Analyze entire week's logs (or last 5000 lines)\n2. Plot error trends (increasing/stable/decreasing)\n3. Identify top 3 most common error types\n4. Read AGENT_LOG.md to see what improvements were implemented\n5. Measure the impact of improvements\n6. Review system performance metrics\n7. Generate recommendations for next week\n\nWrite a comprehensive report to AGENT_LOG.md with:\n- Weekly Summary (errors, fixes, improvements)\n- Trends (what's getting better/worse)\n- Impact Analysis (which improvements helped most)\n- Next Week Priorities\n- Performance metrics\n\nUse format:\n## Weekly Review - [Week of DATE]\n- Total Errors: X\n- Error Trends: [graph]\n- Top Issues: [list]\n- Improvements Applied: [count]\n- Impact Score: X/10\n- Next Week Focus: [priorities]"
+      },
+      "actions": [
+        {
+          "type": "log_event",
+          "level": "info",
+          "prefix": "🚁 Drone Flight [Weekly Deep Dive]"
+        }
+      ],
+      "retryOnFailure": true,
+      "maxRetries": 1,
+      "timeout": 3600000,
+      "createdAt": 1770239039222,
+      "updatedAt": 1770239039222
+    },
+    {
+      "id": "flight:x-ai-tech-digest",
+      "name": "Hourly X AI+Tech Digest",
+      "enabled": true,
+      "schedule": "0 * * * *",
+      "trigger": {
+        "type": "agent_ask",
+        "prompt": "Execute hourly X AI + Tech digest:\n\n1) Get X cookies from Safari:\n   - Prefer env BIRD_AUTH_TOKEN/BIRD_CT0 if already set.\n   - Otherwise run:\n     node ./scripts/x-safari-cookies.js --format args --domain x.com,twitter.com\n   - If auth_token/ct0 are missing, output exactly: AUTH FAILURE and stop.\n\n2) Fetch sources (append cookie args to each command):\n   - bird news --ai-only -n 80 --json --plain <COOKIE_ARGS>\n   - bird news -n 80 --json --plain <COOKIE_ARGS>\n   - bird search \"(AI OR artificial intelligence OR LLM OR model OR openai OR anthropic OR deepmind OR xAI OR nvidia OR amd OR microsoft OR apple OR amazon OR meta OR cybersecurity OR chip OR datacenter OR startup OR funding OR regulation) lang:en -filter:replies -filter:retweets\" -n 80 --json --plain <COOKIE_ARGS>\n\n3) Dedupe by tweet id and external URL; keep only last 24 hours.\n\n4) Produce 6–10 items ranked by impact + recency.\n   Each item must include:\n   - Title (short)\n   - 1–2 sentence summary\n   - Tweet URL\n   - External link (if present)\n\n5) End with \"What to watch next\" (3 bullets).\n\n6) Write the report to:\n   ~/.ant/reports/x-ai-tech-YYYY-MM-DD-HH.md\n   and print the same report to stdout.\n\n7) Send the report to WhatsApp and Telegram (if configured):\n   - Read env vars via exec:\n     * ANT_X_DIGEST_WHATSAPP_TO (WhatsApp JID or full session key)\n     * ANT_X_DIGEST_TELEGRAM_TO (full Telegram session key recommended)\n   - If ANT_X_DIGEST_WHATSAPP_TO is non-empty, use message_send:\n     { \"to\": \"<value>\", \"message\": \"<full report>\" }\n   - If ANT_X_DIGEST_TELEGRAM_TO is non-empty, use message_send:\n     { \"to\": \"<value>\", \"message\": \"<full report>\" }\n   - For Telegram, prefer a full session key like:\n     \"telegram:dm:<chatId>\" or \"telegram:group:<chatId>\".\n     If missing or invalid, skip Telegram sending."
+      },
+      "actions": [
+        {
+          "type": "log_event",
+          "level": "info",
+          "prefix": "🚁 Drone Flight [Hourly X AI+Tech Digest]"
+        }
+      ],
+      "retryOnFailure": true,
+      "maxRetries": 1,
+      "timeout": 900000,
+      "createdAt": 1770239039224,
+      "updatedAt": 1770239039224
+    }
+  ]
+}

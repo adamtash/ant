@@ -217,7 +217,7 @@ const classes = getDynamicClasses('bg', 'ant-dark');
 
 ### API calls return 404
 
-- Ensure the runtime is running: `npm run dev -- run -c ant.config.json`
+- Ensure the runtime is running: `npm run dev -- run`
 - Check that the runtime is serving on `http://localhost:5117`
 - Verify `/api` proxy is configured in `vite.config.ts`
 
@@ -235,7 +235,7 @@ const classes = getDynamicClasses('bg', 'ant-dark');
 
 ## 📝 Development Workflow
 
-1. **Start runtime**: `npm run dev -- run -c ant.config.json`
+1. **Start runtime**: `npm run dev -- run`
 2. **Start UI dev server**: `npm run ui:dev`
 3. **Open browser**: `http://localhost:5117`
 4. **Make changes**: Files auto-reload on save

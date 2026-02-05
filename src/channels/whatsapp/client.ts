@@ -13,7 +13,6 @@ import makeWASocket, {
   DisconnectReason,
   fetchLatestBaileysVersion,
   makeCacheableSignalKeyStore,
-  useMultiFileAuthState,
   type WASocket,
   type WAMessage,
   type AnyMessageContent,
@@ -25,6 +24,7 @@ import { Boom } from "@hapi/boom";
 
 import type { AntConfig } from "../../config.js";
 import type { Logger } from "../../log.js";
+import { useCompactAuthState } from "./auth-state.js";
 import { inferMimeType } from "./message-handler.js";
 
 // ============================================================================
@@ -252,12 +252,31 @@ export class WhatsAppClient extends EventEmitter {
     const sessionDir = this.cfg.resolved.whatsappSessionDir;
     await fs.mkdir(sessionDir, { recursive: true });
 
-    const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
+    const { state, saveCreds } = await useCompactAuthState(sessionDir);
     const { version } = await fetchLatestBaileysVersion();
+    const requestedBaileysLevel = (
+      process.env.ANT_WHATSAPP_BAILEYS_LOG_LEVEL ||
+      process.env.ANT_WHATSAPP_LOG_LEVEL ||
+      "error"
+    )
+      .trim()
+      .toLowerCase();
+    const baileysLevel = [
+      "fatal",
+      "error",
+      "warn",
+      "info",
+      "debug",
+      "trace",
+      "silent",
+    ].includes(requestedBaileysLevel)
+      ? requestedBaileysLevel
+      : "error";
+    const socketLogger = this.logger.child({ component: "baileys" }, { level: baileysLevel as any });
 
     const socket = makeWASocket({
       version,
-      logger: this.logger as unknown as Parameters<typeof makeWASocket>[0]["logger"],
+      logger: socketLogger as unknown as Parameters<typeof makeWASocket>[0]["logger"],
       printQRInTerminal: false,
       auth: {
         creds: state.creds,

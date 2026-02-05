@@ -250,8 +250,11 @@ export async function spawnTestInstance(
 ): Promise<TestInstance> {
   const testId = generateTestId();
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), `ant-test-${testId}-`));
-  const gatewayPort = await findAvailablePort(0);
-  const uiPort = await findAvailablePort(0);
+  // Runtime currently serves UI and API from a single HTTP server/port.
+  // Keep `gateway.port` and `ui.port` aligned to avoid port mismatch flakes in integration tests.
+  const port = await findAvailablePort(0);
+  const gatewayPort = port;
+  const uiPort = port;
   const configPath = path.join(tempDir, "test.config.json");
 
   const config: TestEnvConfig = {
@@ -429,6 +432,14 @@ export async function httpPost(
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
+    signal: AbortSignal.timeout(10000),
+  });
+}
+
+export async function httpDelete(instance: TestInstance, path: string): Promise<Response> {
+  const url = `${instance.getGatewayUrl()}${path}`;
+  return fetch(url, {
+    method: "DELETE",
     signal: AbortSignal.timeout(10000),
   });
 }

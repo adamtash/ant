@@ -1,67 +1,266 @@
 /**
- * Onboard Command - Setup wizard inspired by OpenClaw
+ * Onboard Command - interactive setup wizard
+ *
+ * Writes:
+ * - Config: ant.config.json (non-secrets)
+ * - Env: .env (secrets + optional overrides)
  */
 
+import fsSync from "node:fs";
 import fs from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import readline from "node:readline";
 import { execSync } from "node:child_process";
+
 import chalk from "chalk";
+
+import { applyEnvUpdates, resolveEnvFilePath } from "../env-file.js";
+import { validateConfigObject } from "../config.js";
 import { OutputFormatter } from "./output-formatter.js";
 
 export interface OnboardOptions {
   config?: string;
+  env?: string;
   force?: boolean;
   quiet?: boolean;
 }
 
-interface OnboardConfig {
-  workspaceDir: string;
-  provider: {
-    type: "openai" | "cli";
-    cliProvider?: "codex" | "copilot" | "claude" | "kimi";
-    baseUrl?: string;
-    model: string;
-  };
-  memory: {
-    enabled: boolean;
-    sqlitePath: string;
-    embeddingsModel: string;
-  };
-  whatsapp: {
-    sessionDir: string;
-    respondToGroups: boolean;
-    mentionOnly: boolean;
-  };
-  ui: {
-    enabled: boolean;
-    port: number;
+type ProviderChoice = "lmstudio" | "openai" | "cli";
+
+function resolveUserPath(value: string, baseDir?: string): string {
+  const trimmed = value.trim();
+  if (!trimmed) return trimmed;
+  if (trimmed === "~") return os.homedir();
+  if (trimmed.startsWith("~/")) return path.join(os.homedir(), trimmed.slice(2));
+  if (path.isAbsolute(trimmed)) return path.normalize(trimmed);
+  return baseDir ? path.resolve(baseDir, trimmed) : path.resolve(trimmed);
+}
+
+function configExists(configPath: string): boolean {
+  try {
+    return fsSync.existsSync(configPath) && fsSync.statSync(configPath).isFile();
+  } catch {
+    return false;
+  }
+}
+
+function detectCliTools(): Array<"codex" | "copilot" | "claude" | "kimi"> {
+  const tools: Array<"codex" | "copilot" | "claude" | "kimi"> = [];
+  for (const tool of ["codex", "copilot", "claude", "kimi"] as const) {
+    try {
+      execSync(`which ${tool}`, { stdio: "ignore" });
+      tools.push(tool);
+    } catch {
+      // ignore
+    }
+  }
+  return tools;
+}
+
+async function detectLmStudio(): Promise<boolean> {
+  try {
+    const ctrl = new AbortController();
+    const timeout = setTimeout(() => ctrl.abort(), 1000);
+    const res = await fetch("http://localhost:1234/v1/models", { signal: ctrl.signal });
+    clearTimeout(timeout);
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+function createBaseConfig(): Record<string, unknown> {
+  return {
+    workspaceDir: ".",
+    providers: {
+      default: "lmstudio",
+      items: {
+        lmstudio: {
+          type: "openai",
+          baseUrl: "http://localhost:1234/v1",
+          model: "local-model",
+          embeddingsModel: "text-embedding-nomic-embed-text-v1.5",
+        },
+      },
+      fallbackChain: [],
+      discovery: {
+        enabled: false,
+      },
+    },
+    routing: {
+      chat: "lmstudio",
+      tools: "lmstudio",
+      embeddings: "lmstudio",
+      parentForCli: "lmstudio",
+    },
+    ui: {
+      enabled: true,
+      host: "127.0.0.1",
+      port: 5117,
+      autoOpen: true,
+      openUrl: "http://127.0.0.1:5117",
+      staticDir: "ui/dist",
+    },
+    telegram: {
+      enabled: false,
+      mode: "polling",
+      dmPolicy: "pairing",
+      // botToken intentionally omitted; store it in .env as ANT_TELEGRAM_BOT_TOKEN.
+    },
+    whatsapp: {
+      sessionDir: ".ant/whatsapp",
+      respondToGroups: false,
+      mentionOnly: true,
+      botName: "ant",
+      respondToSelfOnly: true,
+      allowSelfMessages: true,
+      resetOnLogout: true,
+      typingIndicator: true,
+      mentionKeywords: ["ant"],
+      ownerJids: [],
+    },
+    memory: {
+      enabled: true,
+      indexSessions: true,
+      retentionDays: 30,
+      sqlitePath: ".ant/memory.sqlite",
+      embeddingsModel: "text-embedding-nomic-embed-text-v1.5",
+    },
+    scheduler: {
+      enabled: true,
+      storePath: ".ant/jobs.json",
+      timezone: "UTC",
+    },
+    gateway: {
+      enabled: true,
+      port: 18789,
+      host: "127.0.0.1",
+    },
+    logging: {
+      level: "info",
+      fileLevel: "trace",
+      filePath: ".ant/ant.log",
+    },
+    mainAgent: {
+      enabled: true,
+      intervalMs: 300_000,
+      dutiesFile: "AGENT_DUTIES.md",
+      logFile: ".ant/AGENT_LOG.md",
+    },
+    runtime: {
+      mode: "split",
+    },
   };
 }
 
-/**
- * Interactive setup wizard
- */
+function setProviderConfig(params: {
+  base: Record<string, unknown>;
+  choice: ProviderChoice;
+  lmstudio?: { baseUrl: string; model: string; embeddingsModel: string };
+  openai?: { model: string; embeddingsModel: string };
+  cli?: { tool: "codex" | "copilot" | "claude" | "kimi"; model: string };
+  useLmStudioForEmbeddings: boolean;
+}): void {
+  const providers = (params.base.providers ?? {}) as Record<string, unknown>;
+  const items = ((providers.items ?? {}) as Record<string, unknown>) ?? {};
+
+  if (params.choice === "lmstudio" && params.lmstudio) {
+    items.lmstudio = {
+      type: "openai",
+      baseUrl: params.lmstudio.baseUrl,
+      model: params.lmstudio.model,
+      embeddingsModel: params.lmstudio.embeddingsModel,
+    };
+    (providers as any).default = "lmstudio";
+    (providers as any).items = items;
+    params.base.providers = providers;
+    params.base.routing = {
+      chat: "lmstudio",
+      tools: "lmstudio",
+      embeddings: "lmstudio",
+      parentForCli: "lmstudio",
+    };
+    (params.base.memory as any).embeddingsModel = params.lmstudio.embeddingsModel;
+    return;
+  }
+
+  if (params.choice === "openai" && params.openai) {
+    items.openai = {
+      type: "openai",
+      baseUrl: "https://api.openai.com/v1",
+      model: params.openai.model,
+      embeddingsModel: params.openai.embeddingsModel,
+    };
+    (providers as any).default = "openai";
+    (providers as any).items = items;
+    params.base.providers = providers;
+    params.base.routing = {
+      chat: "openai",
+      tools: "openai",
+      embeddings: "openai",
+      parentForCli: "openai",
+    };
+    (params.base.memory as any).embeddingsModel = params.openai.embeddingsModel;
+    return;
+  }
+
+  if (params.choice === "cli" && params.cli) {
+    const id = params.cli.tool;
+    items[id] = {
+      type: "cli",
+      cliProvider: params.cli.tool,
+      model: params.cli.model,
+    };
+
+    if (params.useLmStudioForEmbeddings && params.lmstudio) {
+      items.lmstudio = {
+        type: "openai",
+        baseUrl: params.lmstudio.baseUrl,
+        model: params.lmstudio.model,
+        embeddingsModel: params.lmstudio.embeddingsModel,
+      };
+    }
+
+    (providers as any).default = id;
+    (providers as any).items = items;
+    params.base.providers = providers;
+
+    const embeddingsProvider = params.useLmStudioForEmbeddings ? "lmstudio" : id;
+    params.base.routing = {
+      chat: id,
+      tools: id,
+      embeddings: embeddingsProvider,
+      parentForCli: id,
+    };
+
+    if (params.useLmStudioForEmbeddings && params.lmstudio) {
+      (params.base.memory as any).embeddingsModel = params.lmstudio.embeddingsModel;
+    } else {
+      // CLI providers cannot embed; disable memory to avoid confusing runtime errors.
+      (params.base.memory as any).enabled = false;
+    }
+  }
+}
+
 export async function onboard(options: OnboardOptions = {}): Promise<void> {
   const out = new OutputFormatter({ quiet: options.quiet });
 
+  const configPath = resolveUserPath(
+    options.config || path.join(os.homedir(), ".ant", "ant.config.json"),
+  );
+  const envPath = resolveUserPath(options.env || resolveEnvFilePath(configPath));
+
   out.header("ANT Setup Wizard");
   out.newline();
-  out.info("This wizard will help you configure ANT.");
-  out.info("Press Ctrl+C at any time to cancel.");
+  out.keyValue("Config path", configPath);
+  out.keyValue("Env path", envPath);
   out.newline();
 
-  // Check for existing config
-  const configPath = options.config || "ant.config.json";
-  try {
-    await fs.access(configPath);
-    if (!options.force) {
-      out.warn(`Configuration file already exists: ${configPath}`);
-      out.info("Use --force to overwrite or specify a different path with --config.");
-      return;
-    }
-  } catch {
-    // Config doesn't exist, good to proceed
+  if (configExists(configPath) && !options.force) {
+    out.warn(`Config already exists: ${configPath}`);
+    out.info("Re-run with --force to overwrite.");
+    return;
   }
 
   const rl = readline.createInterface({
@@ -78,6 +277,15 @@ export async function onboard(options: OnboardOptions = {}): Promise<void> {
     });
   };
 
+  const askSecret = (question: string, defaultValue?: string): Promise<string> => {
+    return new Promise((resolve) => {
+      const prompt = defaultValue ? `${question} [${defaultValue}]: ` : `${question}: `;
+      (rl as any).question(chalk.cyan(prompt), { hideEchoBack: true }, (answer: string) => {
+        resolve((answer || "").trim() || defaultValue || "");
+      });
+    });
+  };
+
   const confirm = async (question: string, defaultYes = true): Promise<boolean> => {
     const suffix = defaultYes ? "[Y/n]" : "[y/N]";
     const answer = await ask(`${question} ${suffix}`, "");
@@ -85,194 +293,159 @@ export async function onboard(options: OnboardOptions = {}): Promise<void> {
     return answer.toLowerCase().startsWith("y");
   };
 
-  const config: OnboardConfig = {
-    workspaceDir: ".",
-    provider: {
-      type: "openai",
-      model: "gpt-4",
-    },
-    memory: {
-      enabled: true,
-      sqlitePath: ".ant/memory.sqlite",
-      embeddingsModel: "text-embedding-ada-002",
-    },
-    whatsapp: {
-      sessionDir: ".ant/whatsapp",
-      respondToGroups: false,
-      mentionOnly: true,
-    },
-    ui: {
-      enabled: true,
-      port: 5117,
-    },
-  };
-
   try {
-    // Step 1: Workspace
-    out.section("Step 1: Workspace");
-    config.workspaceDir = await ask("Workspace directory", ".");
+    const base = createBaseConfig();
 
-    // Step 2: LLM Provider
+    out.section("Step 1: Workspace + State");
+    base.workspaceDir = await ask("Workspace directory", ".");
+
+    const useGlobalState = await confirm("Store runtime state in ~/.ant? (recommended)", true);
+    if (useGlobalState) {
+      (base as any).stateDir = "~/.ant";
+    } else {
+      delete (base as any).stateDir;
+    }
+
     out.newline();
-    out.section("Step 2: LLM Provider");
-    out.info("Choose how ANT will access language models.");
+    out.section("Step 2: Provider");
+    out.info("Choose how ant will access language models.");
     out.newline();
 
     const hasCliTools = detectCliTools();
     const hasLmStudio = await detectLmStudio();
+    if (hasLmStudio) out.info("Detected LM Studio at http://localhost:1234/v1");
+    if (hasCliTools.length > 0) out.info(`Detected CLI tools: ${hasCliTools.join(", ")}`);
 
-    out.listItem("1. Local LLM (LM Studio, Ollama, etc.)");
-    out.listItem("2. CLI Tool (codex, copilot, claude)");
-    out.listItem("3. OpenAI API");
+    out.listItem("1. Local LLM (LM Studio / OpenAI-compatible)");
+    out.listItem("2. OpenAI API (cloud)");
+    out.listItem("3. CLI tool (codex/copilot/claude/kimi)");
     out.newline();
 
-    const providerChoice = await ask("Select provider type (1-3)", hasLmStudio ? "1" : hasCliTools.length > 0 ? "2" : "1");
+    const providerChoiceRaw = await ask("Select provider type (1-3)", hasLmStudio ? "1" : hasCliTools.length ? "3" : "2");
+    const providerChoice: ProviderChoice =
+      providerChoiceRaw === "2" ? "openai" : providerChoiceRaw === "3" ? "cli" : "lmstudio";
 
-    switch (providerChoice) {
-      case "1":
-        config.provider.type = "openai";
-        config.provider.baseUrl = await ask("LLM server URL", "http://localhost:1234/v1");
-        config.provider.model = await ask("Model name", "local-model");
-        break;
+    const envUpdates: Record<string, string | null> = {};
 
-      case "2":
-        config.provider.type = "cli";
-        if (hasCliTools.length > 0) {
-          out.info(`Detected: ${hasCliTools.join(", ")}`);
-          config.provider.cliProvider = hasCliTools[0] as "codex" | "copilot" | "claude";
-        }
-        const cliTool = await ask("CLI tool (codex/copilot/claude)", config.provider.cliProvider || "codex");
-        config.provider.cliProvider = cliTool as "codex" | "copilot" | "claude";
-        config.provider.model = await ask("Model name", "gpt-4");
-        break;
+    const lmstudioDefaults = {
+      baseUrl: "http://localhost:1234/v1",
+      model: "local-model",
+      embeddingsModel: "text-embedding-nomic-embed-text-v1.5",
+    };
 
-      case "3":
-        config.provider.type = "openai";
-        config.provider.baseUrl = "https://api.openai.com/v1";
-        out.warn("You'll need to set OPENAI_API_KEY environment variable.");
-        config.provider.model = await ask("Model name", "gpt-4");
-        break;
+    if (providerChoice === "lmstudio") {
+      const baseUrl = await ask("LM Studio baseUrl", lmstudioDefaults.baseUrl);
+      const model = await ask("Chat model", lmstudioDefaults.model);
+      const embeddingsModel = await ask("Embeddings model", lmstudioDefaults.embeddingsModel);
+      setProviderConfig({
+        base,
+        choice: "lmstudio",
+        lmstudio: { baseUrl, model, embeddingsModel },
+        useLmStudioForEmbeddings: true,
+      });
     }
 
-    // Step 3: Memory
-    out.newline();
-    out.section("Step 3: Memory");
-    config.memory.enabled = await confirm("Enable memory (semantic search)?");
-    if (config.memory.enabled) {
-      config.memory.sqlitePath = await ask("Memory database path", ".ant/memory.sqlite");
-      config.memory.embeddingsModel = await ask("Embeddings model", "text-embedding-ada-002");
+    if (providerChoice === "openai") {
+      out.warn("OpenAI API requires OPENAI_API_KEY in .env.");
+      const model = await ask("Chat model", "gpt-4.1-mini");
+      const embeddingsModel = await ask("Embeddings model", "text-embedding-3-small");
+      const key = await askSecret("OPENAI_API_KEY (leave blank to skip)", "");
+      if (key) envUpdates.OPENAI_API_KEY = key;
+      setProviderConfig({
+        base,
+        choice: "openai",
+        openai: { model, embeddingsModel },
+        useLmStudioForEmbeddings: false,
+      });
     }
 
-    // Step 4: WhatsApp
-    out.newline();
-    out.section("Step 4: WhatsApp");
-    const enableWhatsApp = await confirm("Configure WhatsApp integration?");
-    if (enableWhatsApp) {
-      config.whatsapp.sessionDir = await ask("WhatsApp session directory", ".ant/whatsapp");
-      config.whatsapp.respondToGroups = await confirm("Respond to group messages?", false);
-      if (config.whatsapp.respondToGroups) {
-        config.whatsapp.mentionOnly = await confirm("Only respond when mentioned?", true);
+    if (providerChoice === "cli") {
+      const defaultTool = hasCliTools[0] || "copilot";
+      const toolRaw = await ask("CLI tool (codex/copilot/claude/kimi)", defaultTool);
+      const tool = (["codex", "copilot", "claude", "kimi"] as const).includes(toolRaw as any)
+        ? (toolRaw as any)
+        : defaultTool;
+      const model = await ask("Model name", tool === "copilot" ? "gpt-5-mini" : "gpt-5.2-codex");
+
+      const useLmStudioForEmbeddings = await confirm("Use LM Studio for embeddings/memory?", true);
+      let lmstudio: { baseUrl: string; model: string; embeddingsModel: string } | undefined;
+      if (useLmStudioForEmbeddings) {
+        const baseUrl = await ask("LM Studio baseUrl", lmstudioDefaults.baseUrl);
+        const embeddingsModel = await ask("Embeddings model", lmstudioDefaults.embeddingsModel);
+        lmstudio = { baseUrl, model: "local-model", embeddingsModel };
       }
+
+      setProviderConfig({
+        base,
+        choice: "cli",
+        cli: { tool, model },
+        lmstudio,
+        useLmStudioForEmbeddings,
+      });
     }
 
-    // Step 5: Web UI
     out.newline();
-    out.section("Step 5: Web UI");
-    config.ui.enabled = await confirm("Enable web UI?");
-    if (config.ui.enabled) {
-      config.ui.port = parseInt(await ask("UI port", "5117"));
+    out.section("Step 3: Channels");
+    const enableTelegram = await confirm("Enable Telegram channel?", false);
+    if (enableTelegram) {
+      (base as any).telegram = {
+        ...(base as any).telegram,
+        enabled: true,
+        mode: "polling",
+        dmPolicy: "pairing",
+      };
+      const token = await askSecret("ANT_TELEGRAM_BOT_TOKEN (leave blank to skip)", "");
+      if (token) envUpdates.ANT_TELEGRAM_BOT_TOKEN = token;
     }
 
-    // Generate config
+    const enableWhatsApp = await confirm("Enable WhatsApp channel?", true);
+    if (!enableWhatsApp) {
+      envUpdates.ANT_WHATSAPP_ENABLED = "false";
+    }
+
     out.newline();
     out.section("Configuration Preview");
+    const validate = validateConfigObject(base);
+    if (!validate.ok) {
+      out.warn("Generated config has validation errors:");
+      for (const err of validate.errors || []) {
+        out.listItem(`${err.path}: ${err.message}`);
+      }
+      out.newline();
+      out.warn("Fix the issues above or edit the config after saving.");
+    }
 
-    const finalConfig = generateConfig(config);
-    console.log(chalk.dim(JSON.stringify(finalConfig, null, 2)));
+    console.log(chalk.dim(JSON.stringify(base, null, 2)));
 
     out.newline();
-    if (await confirm("Save this configuration?")) {
-      await fs.writeFile(configPath, JSON.stringify(finalConfig, null, 2), "utf-8");
-      out.newline();
-      out.success(`Configuration saved to ${configPath}`);
-      out.newline();
-      out.info("Next steps:");
-      out.listItem("Run 'ant doctor' to verify your setup");
-      out.listItem("Run 'ant start' to start the agent");
-    } else {
+    if (!(await confirm("Save this configuration?", true))) {
       out.info("Configuration not saved.");
+      return;
     }
+
+    await fs.mkdir(path.dirname(configPath), { recursive: true });
+    await fs.writeFile(configPath, JSON.stringify(base, null, 2), "utf-8");
+    out.success(`Wrote config: ${configPath}`);
+
+    if (Object.keys(envUpdates).length > 0) {
+      const res = await applyEnvUpdates(envPath, envUpdates);
+      if (!res.ok) {
+        out.warn(`Failed to update .env: ${res.error}`);
+      } else {
+        out.success(`Updated env: ${res.path}`);
+      }
+    } else {
+      out.info("No env changes requested (secrets left blank).");
+    }
+
+    out.newline();
+    out.info("Next steps:");
+    out.listItem("Run `ant doctor` to verify your setup");
+    out.listItem("Run `ant start` (or `ant run`) to start the runtime");
+    out.listItem("Use the UI: Genetic Code -> Secrets to update tokens later");
   } finally {
     rl.close();
   }
-}
-
-/**
- * Detect available CLI tools
- */
-function detectCliTools(): string[] {
-  const tools: string[] = [];
-  for (const tool of ["codex", "copilot", "claude"]) {
-    try {
-      execSync(`which ${tool}`, { stdio: "ignore" });
-      tools.push(tool);
-    } catch {
-      // Not found
-    }
-  }
-  return tools;
-}
-
-/**
- * Detect if LM Studio is running
- */
-async function detectLmStudio(): Promise<boolean> {
-  try {
-    const ctrl = new AbortController();
-    const timeout = setTimeout(() => ctrl.abort(), 1000);
-    const res = await fetch("http://localhost:1234/v1/models", { signal: ctrl.signal });
-    clearTimeout(timeout);
-    return res.ok;
-  } catch {
-    return false;
-  }
-}
-
-/**
- * Generate final config object
- */
-function generateConfig(input: OnboardConfig): Record<string, unknown> {
-  const config: Record<string, unknown> = {
-    workspaceDir: input.workspaceDir,
-    provider: {
-      type: input.provider.type,
-      model: input.provider.model,
-    },
-    memory: {
-      enabled: input.memory.enabled,
-      sqlitePath: input.memory.sqlitePath,
-      embeddingsModel: input.memory.embeddingsModel,
-    },
-    whatsapp: {
-      sessionDir: input.whatsapp.sessionDir,
-      respondToGroups: input.whatsapp.respondToGroups,
-      mentionOnly: input.whatsapp.mentionOnly,
-    },
-    ui: {
-      enabled: input.ui.enabled,
-      port: input.ui.port,
-    },
-  };
-
-  if (input.provider.type === "openai" && input.provider.baseUrl) {
-    (config.provider as Record<string, unknown>).baseUrl = input.provider.baseUrl;
-  }
-
-  if (input.provider.type === "cli" && input.provider.cliProvider) {
-    (config.provider as Record<string, unknown>).cliProvider = input.provider.cliProvider;
-  }
-
-  return config;
 }
 
 export default onboard;

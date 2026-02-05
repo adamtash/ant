@@ -67,7 +67,7 @@ export class SourceUpdater {
   }) {
     this.logger = params.logger;
     this.workspaceDir = params.workspaceDir;
-    this.changesDir = params.changesDir || path.join(params.workspaceDir, ".ant/changes");
+    this.changesDir = params.changesDir || path.join(params.workspaceDir, "changes");
 
     // Default allowed paths (relative to workspace)
     this.allowedPaths = params.allowedPaths || [

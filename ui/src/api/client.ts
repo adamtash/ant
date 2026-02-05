@@ -17,9 +17,15 @@ import type {
   SessionsResponse,
   SessionDetailResponse,
   ConfigResponse,
+  ConfigValidationResponse,
+  EnvResponse,
+  EnvUpdateResponse,
   HealthResponse,
   ActionResponse,
   SystemEvent,
+  LogsResponse,
+  MainAgentTasksResponse,
+  MainAgentTaskResponse,
 } from './types';
 
 // ============================================
@@ -166,7 +172,16 @@ export const getProviderHealthById = (id: string) =>
 // ============================================
 
 export const getTasks = () => apiGet<TasksResponse>('/tasks');
-export const getTask = (id: string) => apiGet<TaskDetailResponse>(`/tasks/${id}`);
+export const getTasksPage = (params: { limit?: number; offset?: number } = {}) => {
+  const limit = typeof params.limit === "number" ? params.limit : undefined;
+  const offset = typeof params.offset === "number" ? params.offset : undefined;
+  const qs = new URLSearchParams();
+  if (limit !== undefined) qs.set("limit", String(limit));
+  if (offset !== undefined) qs.set("offset", String(offset));
+  const suffix = qs.toString() ? `?${qs.toString()}` : "";
+  return apiGet<TasksResponse>(`/tasks${suffix}`);
+};
+export const getTask = (id: string) => apiGet<TaskDetailResponse>(`/tasks/${encodeURIComponent(id)}`);
 export const getTaskRaw = (id: string) => apiGet<unknown>(`/tasks/${encodeURIComponent(id)}`);
 export const createTask = (prompt: string) =>
   apiPost<ActionResponse>('/tasks', { prompt });
@@ -225,6 +240,15 @@ export const terminateAgent = (id: string) =>
 export const searchMemory = (query: string) =>
   apiGet<MemorySearchResponse>(`/memory/search?q=${encodeURIComponent(query)}`);
 export const getMemoryIndex = () => apiGet<MemoryIndexResponse>('/memory/index');
+export const getMemoryIndexPage = (params: { limit?: number; offset?: number; category?: string; source?: string } = {}) => {
+  const qs = new URLSearchParams();
+  if (typeof params.limit === "number") qs.set("limit", String(params.limit));
+  if (typeof params.offset === "number") qs.set("offset", String(params.offset));
+  if (params.category) qs.set("category", params.category);
+  if (params.source) qs.set("source", params.source);
+  const suffix = qs.toString() ? `?${qs.toString()}` : "";
+  return apiGet<MemoryIndexResponse>(`/memory/index${suffix}`);
+};
 export const getMemoryStats = () => apiGet<MemoryStatsResponse>('/memory/stats');
 export const addMemory = (content: string, category?: string, tags?: string[]) =>
   apiPost<ActionResponse>('/memory', { content, category, tags });
@@ -250,6 +274,13 @@ export const deleteSkill = (name: string) =>
 // ============================================
 
 export const getJobs = () => apiGet<JobsResponse>('/jobs');
+export const getJobsPage = (params: { limit?: number; offset?: number } = {}) => {
+  const qs = new URLSearchParams();
+  if (typeof params.limit === "number") qs.set("limit", String(params.limit));
+  if (typeof params.offset === "number") qs.set("offset", String(params.offset));
+  const suffix = qs.toString() ? `?${qs.toString()}` : "";
+  return apiGet<JobsResponse>(`/jobs${suffix}`);
+};
 export const getJob = (id: string) => apiGet<JobDetailResponse>(`/jobs/${id}`);
 export const createJob = (job: {
   name: string;
@@ -269,6 +300,13 @@ export const toggleJob = (id: string) =>
 // ============================================
 
 export const getSessions = () => apiGet<SessionsResponse>('/sessions');
+export const getSessionsPage = (params: { limit?: number; offset?: number } = {}) => {
+  const qs = new URLSearchParams();
+  if (typeof params.limit === "number") qs.set("limit", String(params.limit));
+  if (typeof params.offset === "number") qs.set("offset", String(params.offset));
+  const suffix = qs.toString() ? `?${qs.toString()}` : "";
+  return apiGet<SessionsResponse>(`/sessions${suffix}`);
+};
 export const getSession = (key: string) =>
   apiGet<SessionDetailResponse>(`/sessions/${encodeURIComponent(key)}`);
 export const deleteSession = (key: string) =>
@@ -282,7 +320,28 @@ export const getConfig = () => apiGet<ConfigResponse>('/config');
 export const updateConfig = (config: Record<string, unknown>) =>
   apiPost<ActionResponse>('/config', config); // Changed to POST
 export const validateConfig = (config: Record<string, unknown>) =>
-  apiPost<ActionResponse>('/config/validate', config);
+  apiPost<ConfigValidationResponse>('/config/validate', config);
+export const dryRunConfigChanges = (changes: Record<string, unknown>) =>
+  apiPost<Record<string, unknown>>("/config", { changes, dryRun: true });
+export const applyConfigChanges = (changes: Record<string, unknown>) =>
+  apiPost<Record<string, unknown>>("/config", { changes });
+
+export const getEnv = () => apiGet<EnvResponse>("/env");
+export const updateEnv = (updates: Record<string, string | null>) =>
+  apiPost<EnvUpdateResponse>("/env", { updates });
+
+// ============================================
+// Main Agent
+// ============================================
+
+export const getMainAgentTasks = () =>
+  apiGet<MainAgentTasksResponse>("/main-agent/tasks");
+export const getMainAgentTask = (id: string) =>
+  apiGet<MainAgentTaskResponse>(`/main-agent/tasks/${encodeURIComponent(id)}`);
+export const assignMainAgentTask = (description: string) =>
+  apiPost<ActionResponse>("/main-agent/tasks", { description });
+export const pauseMainAgent = () => apiPost<ActionResponse>("/main-agent/pause");
+export const resumeMainAgent = () => apiPost<ActionResponse>("/main-agent/resume");
 
 // ============================================
 // Channels
@@ -358,6 +417,14 @@ export function openLogStream(onMessage: (line: string) => void): EventSource {
   });
   return source;
 }
+
+export const getLogsPage = (params: { limit?: number; offset?: number } = {}) => {
+  const qs = new URLSearchParams();
+  if (typeof params.limit === "number") qs.set("limit", String(params.limit));
+  if (typeof params.offset === "number") qs.set("offset", String(params.offset));
+  const suffix = qs.toString() ? `?${qs.toString()}` : "";
+  return apiGet<LogsResponse>(`/logs${suffix}`);
+};
 
 export function openEventStream(
   onEvent: (event: SystemEvent) => void

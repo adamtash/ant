@@ -3,7 +3,6 @@
 ## Identity & Goal
 - **Product:** **ant** — local autonomous assistant with WhatsApp integration, tools, memory, and subagents.
 - **Core Goals:** single OpenAI-compatible provider (LM Studio), WhatsApp chat, subagents, memory indexing, host-only tool execution (no sandbox for now), TUI.
-- **Repo Root:** `/Users/a/Projects/ant-cli`
 - **GitHub:** https://github.com/adamtash/ant
 
 ## Repository Structure
@@ -17,16 +16,16 @@
 - **Memory:** `src/memory/` - SQLite + embeddings
 
 ### Configuration & State
-- **Config:** `ant.config.json` - runtime configuration (providers, routing, WhatsApp, memory, mainAgent, etc.)
+- **Config:** `~/.ant/ant.config.json` (copy from `ant.config.example.json`) - runtime configuration (providers, routing, WhatsApp, memory, mainAgent, etc.)
 - **Config Schema:** `src/config.ts` - TypeScript types and defaults
-- **State Dir:** `.ant/` (sessions, memory, captures, whatsapp auth, subagents registry)
-- **Sessions:** `.ant/sessions/*.jsonl` - per-session message logs
-- **Memory DB:** `.ant/memory.sqlite` - embeddings index
-- **Subagents Registry:** `.ant/subagents.json` - active/completed subagent runs
-- **WhatsApp Auth:** `.ant/whatsapp/` - Baileys session state
-- **Logs:** `~/.ant/ant.log` (configurable via `logging.filePath`)
+- **State Dir:** `stateDir` (default: `workspaceDir/.ant`, special-case: `workspaceDir: "~/.ant"` → `stateDir: "~/.ant"`)
+- **Sessions:** `stateDir/sessions/*.jsonl` - per-session message logs
+- **Memory DB:** `stateDir/memory.sqlite` - embeddings index
+- **Subagents Registry:** `stateDir/subagents.json` - active/completed subagent runs
+- **WhatsApp Auth:** `stateDir/whatsapp/` - Baileys session state
+- **Logs:** `stateDir/ant.log` (configurable via `logging.filePath`)
 - **Agent Duties:** `AGENT_DUTIES.md` - Main Agent responsibilities (workspaceDir)
-- **Agent Log:** `AGENT_LOG.md` - Main Agent action log (workspaceDir)
+- **Agent Log:** `.ant/AGENT_LOG.md` - Main Agent action log (resolved under `stateDir`)
 
 ### Documentation
 - **PROJECT.md** - comprehensive knowledge base (overview, config, features, usage, architecture, roadmap)
@@ -39,6 +38,15 @@
 2. **Queue** → send typing → **Agent** (check memory commands / direct tools)
 3. **Agent** → route to providers → execute tool loop → build response
 4. **Runtime** → parse MEDIA: tokens → send text + media → store session
+
+### Runtime Process Model
+- `runtime.mode: "single"` runs gateway + worker in one process (legacy/dev fallback).
+- `runtime.mode: "split"` runs a **supervisor** plus two children:
+  - **gateway process**: adapters, queue, API/UI, WebSocket, config watcher
+  - **worker process**: agent engine, memory manager, scheduler, main-agent loop
+- Gateway and worker communicate over supervisor-routed IPC (`src/runtime/bridge/*`).
+- Worker heartbeats are written to `runtime.worker.heartbeatPath`; supervisor restarts only worker on stale heartbeat.
+- `runtime.repoRoot` is optional (defaults to the directory containing the loaded `ant.config.json`) and is injected into prompt context as the canonical ANT source root.
 
 ### Media Pipeline
 - Tools return `MEDIA:/path` tokens in their response
@@ -54,6 +62,15 @@
   - `"open X"` → `open_app` tool (macOS only)
   - `"restart ant"` → `restart_ant` tool
 - **To add more**: Pattern match in `tryDirectToolHandling()` and invoke tool directly
+
+### Self Build + Restart
+- Tool: `self_build` (agent category).
+- Controlled by `runtime.selfBuild`:
+  - `enabled`
+  - `commands` (`build`, `uiBuild`, `typecheck`, `test`, `diagnostics`)
+  - `maxFixAttempts`
+  - `notifyOwnersOnFailure`
+- On success, writes `.ant/restart.json` with `target: "all"` for supervisor-managed restart.
 
 ### CLI Provider Support
 - **Parent LLM** handles tools (configured via `routing.parentForCli`)
@@ -76,6 +93,12 @@
   - `MEMORY.md` / `memory.md` in workspace
   - `memory/*.md` files
   - Session transcripts (`.ant/sessions/*.jsonl`)
+- **Session filtering** (`memory.sessions`):
+  - include/exclude roles
+  - max messages + max bytes
+  - min character threshold
+  - regex/string exclude patterns for noisy lines
+- **Retention**: `memory.retentionDays` controls old session cleanup in SQLite.
 - **Force reindex on search**: `memory_search` tool triggers sync before searching
 - **Sync policies** (configurable):
   - `onSessionStart` - index when runtime boots
@@ -86,7 +109,7 @@
 
 ### TUI Mode
 - **Purpose**: Live dashboard for monitoring (main task, queue, subagents, drone flights)
-- **Launch**: `npm run dev -- run -c ant.config.json --tui`
+- **Launch**: `npm run dev -- run --tui`
 - **Implementation**: `src/runtime/tui.ts` (blessed library)
 - **Features**:
   - Status + subagent panels with drone flights (scheduled jobs)
@@ -112,6 +135,12 @@
 - **Resolution**: `src/runtime/providers.ts` → `resolveProvider(action)`
 - **Fallback**: If no routing entry, uses `providers.default`
 - **Per-action models**: Provider can define `models.chat`, `models.tools`, etc.
+- **Discovery gating**:
+  - Scheduled discovery skips when candidate count is below `providers.discovery.minCandidates`
+  - Candidate count = local discovery runtimes enabled + backup env-var providers available
+- **Discovery logs**:
+  - `providers.discovery.logMode: "daily-rollup" | "changes-only"`
+  - Daily rollup suppresses no-op spam and logs only meaningful change/error summaries
 
 ### Tool Execution Loop
 1. LLM returns tool calls (OpenAI format: `tool_calls` array)
@@ -207,32 +236,34 @@
 ## Operational Notes
 
 ### Running & Testing
-- **Dev mode**: `npm run dev -- run -c ant.config.json`
-- **With TUI**: `npm run dev -- run -c ant.config.json --tui`
+- **Dev mode (split)**: `npm run dev -- run`
+- **Single-process fallback**: `npm run dev -- start`
+- **Internal roles**: `npm run dev -- gateway` and `npm run dev -- worker` (supervisor-spawned in normal operation)
+- **With TUI**: `npm run dev -- run --tui`
 - **Debug (no WhatsApp)**: `npm run dev -- debug run "test prompt"`
 - **Simulate inbound**: `npm run dev -- debug simulate "/memory test note"`
 - **Build**: `npm run build` (output: `dist/`)
-- **Run built**: `node dist/cli.js run -c ant.config.json`
+- **Run built**: `node dist/cli.js run`
 
 ### CLI Commands
 ```bash
 # Runtime control
-npm run dev -- run -c ant.config.json        # Start runtime
+npm run dev -- run        # Start runtime
 ant stop                                      # Stop running instance (WIP)
 ant restart                                   # Restart via configured command
 
 # Memory management
-npm run dev -- remember "note" -c ant.config.json
-npm run dev -- recall "query" -c ant.config.json
+npm run dev -- remember "note"
+npm run dev -- recall "query"
 
 # Session management
-npm run dev -- sessions list -c ant.config.json
-npm run dev -- sessions show "whatsapp:dm:<jid>" -c ant.config.json
-npm run dev -- sessions clear "whatsapp:dm:<jid>" -c ant.config.json
+npm run dev -- sessions list
+npm run dev -- sessions show "whatsapp:dm:<jid>"
+npm run dev -- sessions clear "whatsapp:dm:<jid>"
 
 # Subagent management
-npm run dev -- subagents list -c ant.config.json
-npm run dev -- subagents show <runId> -c ant.config.json
+npm run dev -- subagents list
+npm run dev -- subagents show <runId>
 
 # Debug tools
 npm run dev -- debug run "test prompt"       # Agent only (no WhatsApp)
@@ -413,7 +444,7 @@ try {
 2. **Check TODOs**: Look for `TODO` comments in code
 3. **Make changes**: Edit source files
 4. **Test locally**: `npm run dev -- debug run "test prompt"`
-5. **Test with WhatsApp**: `npm run dev -- run -c ant.config.json`
+5. **Test with WhatsApp**: `npm run dev -- run`
 6. **Check logs**: `tail -f ~/.ant/ant.log`
 7. **Update docs**: If adding features, update `PROJECT.md` and `AGENTS.md`
 

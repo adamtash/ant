@@ -15,6 +15,7 @@ import { Command } from "commander";
 import { loadConfig } from "./config.js";
 import { OutputFormatter } from "./cli/output-formatter.js";
 import { handleError } from "./cli/error-handler.js";
+import { onboard } from "./cli/onboard.js";
 
 // Import runtime commands
 import { start } from "./cli/commands/runtime/start.js";
@@ -74,6 +75,33 @@ program
   .action(async (options, cmd) => {
     const cfg = await loadConfig(cmd.optsWithGlobals().config);
     await handleError(() => start(cfg, options));
+  });
+
+program
+  .command("run")
+  .description("Start the split runtime with supervisor")
+  .option("--tui", "Show a live TUI with agent status")
+  .option("-d, --detached", "Run in background")
+  .action(async (options, cmd) => {
+    const cfg = await loadConfig(cmd.optsWithGlobals().config);
+    await handleError(() => start({ ...cfg, runtime: { ...cfg.runtime, mode: "split" } }, options));
+  });
+
+program
+  .command("gateway")
+  .description("Start gateway process (internal)")
+  .option("--tui", "Show a live TUI with agent status")
+  .action(async (options, cmd) => {
+    const cfg = await loadConfig(cmd.optsWithGlobals().config);
+    await handleError(() => start(cfg, { ...options, role: "gateway" }));
+  });
+
+program
+  .command("worker")
+  .description("Start worker process (internal)")
+  .action(async (options, cmd) => {
+    const cfg = await loadConfig(cmd.optsWithGlobals().config);
+    await handleError(() => start(cfg, { ...options, role: "worker" }));
   });
 
 program
@@ -315,16 +343,6 @@ sessions
 // LEGACY COMMANDS (deprecated - use new commands instead)
 // =============================================================================
 
-program
-  .command("run")
-  .description("Start the agent runtime (alias for 'ant start')")
-  .option("--tui", "Show a live TUI with agent status")
-  .action(async (options, cmd) => {
-    const cfg = await loadConfig(cmd.optsWithGlobals().config);
-    out.warn("'ant run' is deprecated. Use 'ant start' instead.");
-    await handleError(() => start(cfg, { ...options, tui: Boolean(options.tui) }));
-  });
-
 const debug = program.command("debug").description("Debug utilities");
 debug
   .command("run")
@@ -426,11 +444,19 @@ program
 
 program
   .command("onboard")
-  .description("Interactive setup wizard")
-  .action(async () => {
-    out.header("ANT Setup Wizard");
-    out.info("This wizard will help you set up ANT.");
-    out.info("Coming soon - use 'ant doctor' to check your configuration.");
+  .description("Interactive setup wizard (config + .env)")
+  .option("--env <path>", "Path to .env file (defaults to .env in cwd if exists, else next to config)")
+  .option("--force", "Overwrite existing config file")
+  .action(async (options, cmd) => {
+    const globals = cmd.optsWithGlobals();
+    await handleError(() =>
+      onboard({
+        config: globals.config,
+        env: options.env,
+        force: Boolean(options.force),
+        quiet: Boolean(globals.quiet),
+      }),
+    );
   });
 
 // =============================================================================

@@ -5,7 +5,7 @@
 import type { AntConfig } from "../../../config.js";
 import { OutputFormatter } from "../../output-formatter.js";
 import { RuntimeError } from "../../error-handler.js";
-import { readPidFile, stopAnt } from "../../../gateway/process-control.js";
+import { stopAnt, isRunning } from "../../../gateway/process-control.js";
 
 export interface StopOptions {
   config?: string;
@@ -20,8 +20,8 @@ export async function stop(cfg: AntConfig, options: StopOptions = {}): Promise<v
   const out = new OutputFormatter({ quiet: options.quiet });
 
   // Check if running
-  const pid = await readPidFile(cfg);
-  if (!pid) {
+  const running = await isRunning(cfg);
+  if (!running) {
     out.warn("Agent does not appear to be running.");
     return;
   }

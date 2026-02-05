@@ -5,8 +5,11 @@ import path from "node:path";
 type WatchdogConfig = {
   mode: "child" | "docker";
   healthUrl: string;
+  workerHealthUrl: string;
   heartbeatPath: string;
+  workerHeartbeatPath: string;
   heartbeatMaxAgeMs: number;
+  workerHeartbeatMaxAgeMs: number;
   healthTimeoutMs: number;
   healthCheckIntervalMs: number;
   maxConsecutiveFailures: number;
@@ -85,21 +88,37 @@ async function sleep(ms: number): Promise<void> {
   await new Promise<void>((resolve) => setTimeout(resolve, ms));
 }
 
+function defaultStateDir(cwd: string): string {
+  const resolved = path.resolve(cwd);
+  if (path.basename(resolved) === ".ant") {
+    return resolved;
+  }
+  return path.join(resolved, ".ant");
+}
+
 function loadConfig(): WatchdogConfig {
   const cwd = process.cwd();
+  const stateDir = defaultStateDir(cwd);
   const healthUrl = (process.env.MAIN_ANT_HEALTH_URL || "http://127.0.0.1:5117/api/health").trim();
+  const workerHealthUrl = (process.env.MAIN_ANT_WORKER_HEALTH_URL || "http://127.0.0.1:5117/api/worker/health").trim();
   const heartbeatPath = path.resolve(
-    process.env.MAIN_ANT_HEARTBEAT_PATH?.trim() || path.join(cwd, ".ant", "heartbeat")
+    process.env.MAIN_ANT_HEARTBEAT_PATH?.trim() || path.join(stateDir, "heartbeat")
+  );
+  const workerHeartbeatPath = path.resolve(
+    process.env.MAIN_ANT_WORKER_HEARTBEAT_PATH?.trim() || path.join(stateDir, "heartbeat.worker")
   );
   const containerName = process.env.MAIN_ANT_CONTAINER?.trim() || undefined;
-  const startCommand = (process.env.MAIN_ANT_START_COMMAND || "node dist/cli.js start -c ant.config.json").trim();
+  const startCommand = (process.env.MAIN_ANT_START_COMMAND || "node dist/cli.js run").trim();
   const startCwd = path.resolve(process.env.MAIN_ANT_START_CWD?.trim() || cwd);
 
   return {
     mode: containerName ? "docker" : "child",
     healthUrl,
+    workerHealthUrl,
     heartbeatPath,
+    workerHeartbeatPath,
     heartbeatMaxAgeMs: readEnvInt("HEARTBEAT_MAX_AGE_MS", 20_000),
+    workerHeartbeatMaxAgeMs: readEnvInt("WORKER_HEARTBEAT_MAX_AGE_MS", 20_000),
     healthTimeoutMs: readEnvInt("HEALTH_TIMEOUT_MS", 5000),
     healthCheckIntervalMs: readEnvInt("HEALTH_CHECK_INTERVAL_MS", 10_000),
     maxConsecutiveFailures: readEnvInt("MAX_CONSECUTIVE_FAILURES", 3),
@@ -206,17 +225,22 @@ class Watchdog {
   }
 
   private async checkOnce(): Promise<void> {
-    const healthOk = await checkHttpOk(this.cfg.healthUrl, this.cfg.healthTimeoutMs);
-    const heartbeatOk = await checkHeartbeat(this.cfg.heartbeatPath, this.cfg.heartbeatMaxAgeMs);
+    const [gatewayHealthOk, workerHealthOk, gatewayHeartbeatOk, workerHeartbeatOk] = await Promise.all([
+      checkHttpOk(this.cfg.healthUrl, this.cfg.healthTimeoutMs),
+      checkHttpOk(this.cfg.workerHealthUrl, this.cfg.healthTimeoutMs),
+      checkHeartbeat(this.cfg.heartbeatPath, this.cfg.heartbeatMaxAgeMs),
+      checkHeartbeat(this.cfg.workerHeartbeatPath, this.cfg.workerHeartbeatMaxAgeMs),
+    ]);
 
-    if (healthOk && heartbeatOk) {
+    if (gatewayHealthOk && workerHealthOk && gatewayHeartbeatOk && workerHeartbeatOk) {
       this.consecutiveFailures = 0;
       return;
     }
 
     this.consecutiveFailures += 1;
     console.log(
-      `[watchdog] unhealthy (health=${healthOk ? "ok" : "fail"}, heartbeat=${heartbeatOk ? "ok" : "stale"}) ` +
+      `[watchdog] unhealthy (gatewayHealth=${gatewayHealthOk ? "ok" : "fail"}, workerHealth=${workerHealthOk ? "ok" : "fail"}, ` +
+        `gatewayHeartbeat=${gatewayHeartbeatOk ? "ok" : "stale"}, workerHeartbeat=${workerHeartbeatOk ? "ok" : "stale"}) ` +
         `failures=${this.consecutiveFailures}/${this.cfg.maxConsecutiveFailures}`
     );
 
@@ -246,7 +270,9 @@ const cfg = loadConfig();
 console.log("[watchdog] starting", {
   mode: cfg.mode,
   healthUrl: cfg.healthUrl,
+  workerHealthUrl: cfg.workerHealthUrl,
   heartbeatPath: cfg.heartbeatPath,
+  workerHeartbeatPath: cfg.workerHeartbeatPath,
   intervalMs: cfg.healthCheckIntervalMs,
   maxFailures: cfg.maxConsecutiveFailures,
 });

@@ -71,3 +71,113 @@ describe("CLIProvider placeholders", () => {
   });
 });
 
+describe("CLIProvider argument conventions", () => {
+  beforeEach(() => {
+    spawnMock.mockReset();
+  });
+
+  const createChild = () => {
+    const child = new EventEmitter() as any;
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    child.stdin = { write: vi.fn(), end: vi.fn() };
+    child.kill = vi.fn();
+    return child;
+  };
+
+  it("uses -p for copilot and captures stderr output when stdout is empty", async () => {
+    const child = createChild();
+    spawnMock.mockImplementation(() => {
+      setTimeout(() => {
+        child.stderr.emit("data", "COPILOT_ANSWER");
+        child.emit("close", 0);
+      }, 0);
+      return child;
+    });
+
+    const provider = new CLIProvider({
+      id: "copilot",
+      cliType: "copilot",
+      model: "gpt-5-mini",
+      logger: mockLogger as any,
+      command: "copilot",
+      args: ["--yolo", "--model", "gpt-5-mini", "--no-ask-user", "--silent"],
+      timeoutMs: 10_000,
+    });
+
+    const res = await provider.chat([{ role: "user", content: "hello" }]);
+    const spawnedArgs = spawnMock.mock.calls[0]?.[1] as string[] | undefined;
+
+    expect(spawnedArgs).toContain("-p");
+    expect(res.content.trim()).toBe("COPILOT_ANSWER");
+  });
+
+  it("writes prompt to stdin for codex when '-' is present", async () => {
+    const child = createChild();
+    spawnMock.mockImplementation(() => {
+      setTimeout(() => child.emit("close", 0), 0);
+      return child;
+    });
+
+    const provider = new CLIProvider({
+      id: "codex",
+      cliType: "codex",
+      model: "gpt-5.2-codex",
+      logger: mockLogger as any,
+      command: "codex",
+      args: ["exec", "--skip-git-repo-check", "--add-dir", "~/", "--full-auto", "-"],
+      timeoutMs: 10_000,
+    });
+
+    await provider.chat([{ role: "user", content: "hello" }]);
+
+    const spawnedArgs = spawnMock.mock.calls[0]?.[1] as string[] | undefined;
+    expect(spawnedArgs).toContain("-");
+    expect(child.stdin.write).toHaveBeenCalledTimes(1);
+  });
+
+  it("adds -p prompt for claude when prompt placeholder is not provided", async () => {
+    const child = createChild();
+    spawnMock.mockImplementation(() => {
+      setTimeout(() => child.emit("close", 0), 0);
+      return child;
+    });
+
+    const provider = new CLIProvider({
+      id: "claude",
+      cliType: "claude",
+      model: "claude-3.5",
+      logger: mockLogger as any,
+      command: "claude",
+      args: ["--no-color"],
+      timeoutMs: 10_000,
+    });
+
+    await provider.chat([{ role: "user", content: "hello" }]);
+    const spawnedArgs = spawnMock.mock.calls[0]?.[1] as string[] | undefined;
+    expect(spawnedArgs).toContain("-p");
+  });
+
+  it("adds -p prompt and --print for kimi", async () => {
+    const child = createChild();
+    spawnMock.mockImplementation(() => {
+      setTimeout(() => child.emit("close", 0), 0);
+      return child;
+    });
+
+    const provider = new CLIProvider({
+      id: "kimi",
+      cliType: "kimi",
+      model: "kimi-k2",
+      logger: mockLogger as any,
+      command: "kimi",
+      args: ["--yolo"],
+      timeoutMs: 10_000,
+    });
+
+    await provider.chat([{ role: "user", content: "hello" }]);
+    const spawnedArgs = spawnMock.mock.calls[0]?.[1] as string[] | undefined;
+    expect(spawnedArgs).toContain("-p");
+    expect(spawnedArgs).toContain("--print");
+  });
+});

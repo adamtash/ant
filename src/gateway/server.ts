@@ -17,7 +17,8 @@ import type { Logger } from "../log.js";
 import { EventBus } from "./event-bus.js";
 import { getEventStream, createEventPublishers } from "../monitor/event-stream.js";
 import { SessionManager } from "./session-manager.js";
-import { loadConfig, saveConfig } from "../config.js";
+import { loadConfig, saveConfig, validateConfigObject, type AntConfig } from "../config.js";
+import { applyEnvUpdates, readEnvSnapshot, resolveEnvFilePath } from "../env-file.js";
 import type { MessageRouter } from "../channels/router.js";
 import type {
   GatewayConnection,
@@ -32,6 +33,7 @@ import type { MainAgent, MainAgentTask } from "../agent/index.js";
 import type { MemoryManager } from "../memory/manager.js";
 import type { Scheduler } from "../scheduler/scheduler.js";
 import { Scheduler as SchedulerUtils } from "../scheduler/scheduler.js";
+import type { JobAction, JobTrigger } from "../scheduler/types.js";
 import { initializeDroneFlights } from "../scheduler/drone-flights-init.js";
 import type { SkillRegistryManager } from "../agent/skill-registry.js";
 import type { ToolRegistry } from "../agent/tool-registry.js";
@@ -42,12 +44,22 @@ import type { MonitorEvent, ErrorOccurredData } from "../monitor/types.js";
 import { buildAgentScopedSessionKey, buildAgentTaskSessionKey, normalizeAgentId } from "../routing/session-key.js";
 import { onAgentEvent, type AgentEventPayload } from "../monitor/agent-events.js";
 import { listActiveRuns } from "../agent/active-runs.js";
+import type { BridgeClient } from "../runtime/bridge/client.js";
 import {
   approveTelegramPairingCode,
   denyTelegramPairingCode,
   getTelegramPairingSnapshot,
   removeTelegramAllowFromEntry,
 } from "../channels/telegram/pairing-store.js";
+
+const EDITABLE_ENV_KEYS = [
+  "OPENAI_API_KEY",
+  "COPILOT_TOKEN",
+  "CLAUDE_API_KEY",
+  "ANT_TELEGRAM_BOT_TOKEN",
+] as const;
+
+type EditableEnvKey = (typeof EDITABLE_ENV_KEYS)[number];
 
 /**
  * Gateway configuration
@@ -76,6 +88,57 @@ export interface SystemHealth {
   errorRate?: number;
 }
 
+function parseLogLine(line: string): Record<string, unknown> | null {
+  const trimmed = line.trim();
+  if (!trimmed.startsWith("{")) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(trimmed);
+    if (parsed && typeof parsed === "object") {
+      return parsed as Record<string, unknown>;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function isWhatsAppLogRecord(record: Record<string, unknown>): boolean {
+  const module = typeof record.module === "string" ? record.module.toLowerCase() : "";
+  const component = typeof record.component === "string" ? record.component.toLowerCase() : "";
+  const channel = typeof record.channel === "string" ? record.channel.toLowerCase() : "";
+  const msg = typeof record.msg === "string" ? record.msg.toLowerCase() : "";
+
+  if (channel === "whatsapp") return true;
+  if (module.includes("whatsapp")) return true;
+  if (component.includes("whatsapp")) return true;
+  if (msg.includes("whatsapp")) return true;
+  return false;
+}
+
+export function shouldIncludeGatewayLogLine(line: string): boolean {
+  const record = parseLogLine(line);
+  if (!record) {
+    const lower = line.toLowerCase();
+    if (!lower.includes("whatsapp")) {
+      return true;
+    }
+    return (
+      lower.includes("error") ||
+      lower.includes("failed") ||
+      lower.includes("exception")
+    );
+  }
+
+  if (!isWhatsAppLogRecord(record)) {
+    return true;
+  }
+
+  const level = typeof record.level === "number" ? record.level : 30;
+  return level >= 50;
+}
+
 /**
  * Gateway Server - Main WebSocket control plane
  */
@@ -87,6 +150,7 @@ export class GatewayServer {
   private readonly logger: Logger;
   private readonly eventBus: EventBus;
   private readonly sessions: SessionManager;
+  private antConfig: AntConfig | null = null;
   private readonly agentEngine?: AgentEngine;
   private readonly router?: MessageRouter;
   private mainAgent?: MainAgent;
@@ -118,6 +182,7 @@ export class GatewayServer {
   private scheduler?: Scheduler;
   private skillRegistry?: SkillRegistryManager;
   private toolRegistry?: ToolRegistry;
+  private bridge?: BridgeClient;
   private errorCount = 0;
   private lastErrorTime = 0;
   private eventStream = getEventStream();
@@ -134,6 +199,7 @@ export class GatewayServer {
   constructor(params: {
     config: GatewayConfig;
     logger: Logger;
+    antConfig?: AntConfig;
     agentEngine?: AgentEngine;
     router?: MessageRouter;
     mainAgent?: MainAgent;
@@ -141,10 +207,12 @@ export class GatewayServer {
     scheduler?: Scheduler;
     skillRegistry?: SkillRegistryManager;
     toolRegistry?: ToolRegistry;
+    bridge?: BridgeClient;
   }) {
     this.config = params.config;
     this.logger = params.logger.child({ component: "gateway" });
     this.eventBus = new EventBus(this.logger);
+    this.antConfig = params.antConfig ?? null;
     this.agentEngine = params.agentEngine;
     this.router = params.router;
     this.mainAgent = params.mainAgent;
@@ -152,20 +220,70 @@ export class GatewayServer {
     this.scheduler = params.scheduler;
     this.skillRegistry = params.skillRegistry;
     this.toolRegistry = params.toolRegistry;
+    this.bridge = params.bridge;
     this.sessions = new SessionManager({
       stateDir: params.config.stateDir,
       logger: this.logger,
     });
     this.providerHealthTracker = new ProviderHealthTracker(this.logger);
     this.providerHealthTracker.connectToStream(this.eventStream);
+    if (this.antConfig) {
+      this.registerProvidersFromConfig(this.antConfig);
+    }
     this.setupPersistence();
     this.setupErrorTracking();
+  }
+
+  setAntConfig(cfg: AntConfig): void {
+    this.antConfig = cfg;
+    this.registerProvidersFromConfig(cfg);
+  }
+
+  private registerProvidersFromConfig(cfg: AntConfig): void {
+    const items = cfg.resolved.providers.items as Record<
+      string,
+      { type?: "openai" | "cli" | "ollama"; model?: string }
+    >;
+    for (const [id, provider] of Object.entries(items)) {
+      if (!id) continue;
+      const type = provider.type ?? "openai";
+      const model = provider.model ?? "unknown";
+      this.providerHealthTracker.registerProvider(id, id, type, model);
+    }
   }
 
   setConfigReloadHandler(
     handler: (params: { changes?: Record<string, unknown>; dryRun?: boolean }) => Promise<Record<string, unknown>>
   ): void {
     this.configReloadHandler = handler;
+  }
+
+  private buildHealthSnapshot(): SystemHealth {
+    const totalMem = os.totalmem();
+    const freeMem = os.freemem();
+
+    const cpuUsage = os.loadavg()[0] || 0;
+    const cpuCount = os.cpus().length || 1;
+    const cpuPercent = Math.min(100, Math.round((cpuUsage / cpuCount) * 100));
+
+    const memPercent =
+      totalMem > 0 ? Math.round(((totalMem - freeMem) / totalMem) * 100) : 0;
+
+    const now = Date.now();
+    const timeSinceLastError = now - this.lastErrorTime;
+    const errorRate = timeSinceLastError < 60000 ? this.errorCount : 0;
+
+    return {
+      cpu: cpuPercent,
+      memory: memPercent,
+      disk: 0,
+      uptime: this.startTime ? now - this.startTime : 0,
+      lastRestart: this.startTime,
+      queueDepth: this.router?.getSessionQueueStats().queued ?? 0,
+      activeConnections: this.connections.size,
+      totalErrors: this.errorCount,
+      errorRate,
+    };
   }
 
   private isTestApiEnabled(): boolean {
@@ -437,8 +555,12 @@ export class GatewayServer {
 
     // Status
     app.get("/api/status", async (req, res) => {
-      const status = await this.buildStatusResponse();
-      res.json(status);
+      try {
+        const status = await this.buildStatusResponse();
+        res.json(status);
+      } catch (err) {
+        res.status(500).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
+      }
     });
 
     // Sessions list (paginated)
@@ -484,6 +606,17 @@ export class GatewayServer {
       });
     });
 
+    // Delete session
+    app.delete("/api/sessions/:key", async (req, res) => {
+      const key = req.params.key;
+      try {
+        await this.sessions.clear(key);
+        res.json({ ok: true });
+      } catch (err) {
+        res.status(500).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
+      }
+    });
+
     // Session tool parts
     app.get("/api/sessions/:key/tool-parts", async (req, res) => {
       const key = req.params.key;
@@ -502,6 +635,15 @@ export class GatewayServer {
         });
       } catch (err) {
           res.status(500).json({ ok: false, error: String(err) });
+      }
+    });
+
+    app.post("/api/config/validate", (req, res) => {
+      try {
+        const result = validateConfigObject(req.body);
+        res.json(result);
+      } catch (err) {
+        res.status(500).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
       }
     });
 
@@ -527,6 +669,7 @@ export class GatewayServer {
                 : (isObj ? (body as Record<string, unknown>) : undefined);
             const result = await this.configReloadHandler({ changes, dryRun });
             res.json(result);
+            return;
           } catch (err) {
             if (err instanceof Error && err.message === "skip_handler") {
               // Fall through to legacy save behavior below.
@@ -563,12 +706,88 @@ export class GatewayServer {
       }
     });
 
+    // Env (.env) - secrets + overrides
+    app.get("/api/env", async (_req, res) => {
+      try {
+        const envPath = resolveEnvFilePath(this.config.configPath);
+        const snapshot = await readEnvSnapshot(envPath);
+        if (!snapshot.ok) {
+          res.status(500).json({ ok: false, error: snapshot.error });
+          return;
+        }
+
+        const keys: Record<string, { fileSet: boolean; envSet: boolean }> = {};
+        for (const key of EDITABLE_ENV_KEYS) {
+          keys[key] = {
+            fileSet: Boolean(snapshot.entries[key]?.trim()),
+            envSet: Boolean((process.env[key] || "").trim()),
+          };
+        }
+
+        res.json({
+          ok: true,
+          path: snapshot.path,
+          exists: snapshot.exists,
+          keys,
+        });
+      } catch (err) {
+        res.status(500).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
+      }
+    });
+
+    app.post("/api/env", async (req, res) => {
+      try {
+        const body: unknown = req.body;
+        const isObj = body && typeof body === "object" && !Array.isArray(body);
+        const rawUpdates =
+          isObj && "updates" in (body as Record<string, unknown>)
+            ? (body as any).updates
+            : body;
+
+        if (!rawUpdates || typeof rawUpdates !== "object" || Array.isArray(rawUpdates)) {
+          res.status(400).json({ ok: false, error: "Body must be an object or { updates: object }" });
+          return;
+        }
+
+        const updates: Partial<Record<EditableEnvKey, string | null>> = {};
+        for (const [key, value] of Object.entries(rawUpdates as Record<string, unknown>)) {
+          if (!EDITABLE_ENV_KEYS.includes(key as EditableEnvKey)) continue;
+          if (value === null) {
+            updates[key as EditableEnvKey] = null;
+            continue;
+          }
+          if (typeof value !== "string") continue;
+          updates[key as EditableEnvKey] = value;
+        }
+
+        const envPath = resolveEnvFilePath(this.config.configPath);
+        const result = await applyEnvUpdates(envPath, updates as Record<string, string | null>);
+        if (!result.ok) {
+          res.status(500).json({ ok: false, error: result.error });
+          return;
+        }
+
+        for (const [key, value] of Object.entries(updates)) {
+          if (value === null) {
+            delete process.env[key];
+            continue;
+          }
+          process.env[key] = value;
+        }
+
+        res.json({ ok: true, path: result.path, changedKeys: result.changedKeys, requiresRestart: true });
+      } catch (err) {
+        res.status(500).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
+      }
+    });
+
     // ============================================
     // Agents API Endpoints
     // ============================================
     
     // GET /api/agents
     app.get("/api/agents", async (req, res) => {
+      try {
       // Build agent list from main agent tasks and subagent records
       const agents: Array<{
         id: string;
@@ -590,15 +809,30 @@ export class GatewayServer {
           specialization: string[];
         };
       }> = [];
-      
+      const mainTasks = (this.mainAgent
+        ? await this.mainAgent.getAllTasks()
+        : this.bridge
+          ? await this.bridge.request("mainAgent.tasks")
+          : []) as MainAgentTask[];
+      let mainAgentRunning = this.mainAgentRunning;
+      if (!this.mainAgent && this.bridge) {
+        try {
+          const status = await this.bridge.request("mainAgent.status");
+          if (status && typeof status === "object" && typeof (status as any).running === "boolean") {
+            mainAgentRunning = (status as any).running;
+          }
+        } catch {
+          // ignore
+        }
+      }
+
       // Add main agent as queen
-      if (this.mainAgent) {
-        const mainTasks = (await this.mainAgent.getAllTasks()) as MainAgentTask[];
+      if (this.mainAgent || this.bridge) {
         agents.push({
           id: "main-agent",
           caste: "queen",
           name: "Queen",
-          status: this.mainAgentRunning ? "active" : "idle",
+          status: mainAgentRunning ? "active" : "idle",
           currentTask: mainTasks.find((t) => t.status === "running")?.description,
           progress: mainTasks.length > 0 
             ? mainTasks.filter((t) => t.status === "succeeded").length / mainTasks.length 
@@ -642,8 +876,7 @@ export class GatewayServer {
       }
 
       // Add subagent tasks as worker agents
-      if (this.mainAgent) {
-        const mainTasks = (await this.mainAgent.getAllTasks()) as MainAgentTask[];
+      if (mainTasks.length > 0) {
         for (const task of mainTasks) {
           if (!task.parentTaskId) continue;
           const isActive = ["queued", "running", "retrying"].includes(task.status);
@@ -672,22 +905,42 @@ export class GatewayServer {
       }
       
       res.json({ ok: true, agents });
+      } catch (err) {
+        res.status(500).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
+      }
     });
 
     // GET /api/agents/:id
     app.get("/api/agents/:id", async (req, res) => {
+      try {
       const { id } = req.params;
       
       // Handle main agent
-      if (id === "main-agent" && this.mainAgent) {
-        const mainTasks = (await this.mainAgent.getAllTasks()) as MainAgentTask[];
+      const mainTasks = (this.mainAgent
+        ? await this.mainAgent.getAllTasks()
+        : this.bridge
+          ? await this.bridge.request("mainAgent.tasks")
+          : []) as MainAgentTask[];
+      let mainAgentRunning = this.mainAgentRunning;
+      if (!this.mainAgent && this.bridge) {
+        try {
+          const status = await this.bridge.request("mainAgent.status");
+          if (status && typeof status === "object" && typeof (status as any).running === "boolean") {
+            mainAgentRunning = (status as any).running;
+          }
+        } catch {
+          // ignore
+        }
+      }
+
+      if (id === "main-agent" && (this.mainAgent || this.bridge)) {
         res.json({
           ok: true,
           agent: {
             id: "main-agent",
             caste: "queen",
             name: "Queen",
-            status: this.mainAgentRunning ? "active" : "idle",
+            status: mainAgentRunning ? "active" : "idle",
             currentTask: mainTasks.find((t) => t.status === "running")?.description,
             progress: mainTasks.length > 0 
               ? mainTasks.filter((t) => t.status === "succeeded").length / mainTasks.length 
@@ -737,8 +990,7 @@ export class GatewayServer {
         return;
       }
 
-      if (this.mainAgent) {
-        const mainTasks = (await this.mainAgent.getAllTasks()) as MainAgentTask[];
+      if (mainTasks.length > 0) {
         const subagent = mainTasks.find((entry) => entry.taskId === id);
         if (subagent) {
           const isActive = ["queued", "running", "retrying"].includes(subagent.status);
@@ -771,6 +1023,9 @@ export class GatewayServer {
       }
       
       res.status(404).json({ ok: false, error: "Agent not found" });
+      } catch (err) {
+        res.status(500).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
+      }
     });
 
     // ============================================
@@ -854,11 +1109,13 @@ export class GatewayServer {
         const setupMessage = [
           "Telegram setup:",
           "1) Create a bot via @BotFather (/newbot) and copy the token",
-          "2) Add to ant.config.json:",
-          '   \"telegram\": { \"enabled\": true, \"botToken\": \"<token>\", \"dmPolicy\": \"pairing\", \"mode\": \"polling\" }',
-          "3) Restart ant",
-          "4) In Telegram, open the bot and send /pair",
-          "5) Approve the pairing code in the ANT UI: Tunnels -> Telegram -> Pairing",
+          "2) Put the token in .env (recommended):",
+          "   ANT_TELEGRAM_BOT_TOKEN=<token>",
+          "3) Enable Telegram in ant.config.json:",
+          "   \"telegram\": { \"enabled\": true, \"dmPolicy\": \"pairing\", \"mode\": \"polling\" }",
+          "4) Restart ant",
+          "5) In Telegram, open the bot and send /pair",
+          "6) Approve the pairing code in the ANT UI: Tunnels -> Telegram -> Pairing",
         ].join("\n");
 
         channels.push({
@@ -1275,7 +1532,11 @@ export class GatewayServer {
       
       try {
         const content = fsSync.readFileSync(logPath, "utf-8");
-        const lines = content.split("\n").filter(Boolean).reverse(); // Most recent first
+        const lines = content
+          .split("\n")
+          .filter(Boolean)
+          .filter((line) => shouldIncludeGatewayLogLine(line))
+          .reverse(); // Most recent first
         
         const total = lines.length;
         const data = lines.slice(offset, offset + limit);
@@ -1303,26 +1564,16 @@ export class GatewayServer {
         return;
       }
 
-      const shouldSkipLogLine = (line: string): boolean => {
-        try {
-          const entry = JSON.parse(line) as { level?: number; msg?: string; component?: string; module?: string };
-          if ((entry.component === "adapter" && entry.module === "whatsapp-client") && (entry.level ?? 0) <= 20) {
-            return true;
-          }
-        } catch {
-          // Ignore parse errors
-        }
-        return false;
-      };
-
       // Send last 50 lines first
       try {
         const content = fsSync.readFileSync(logPath, "utf-8");
-        const lines = content.split("\n").filter(Boolean).slice(-50);
+        const lines = content
+          .split("\n")
+          .filter(Boolean)
+          .filter((line) => shouldIncludeGatewayLogLine(line))
+          .slice(-50);
         for (const line of lines) {
-          if (!shouldSkipLogLine(line)) {
-            res.write(`event: log\ndata: ${line}\n\n`);
-          }
+          res.write(`event: log\ndata: ${line}\n\n`);
         }
       } catch (err) {
         this.logger.error({ error: err instanceof Error ? err.message : String(err) }, "Failed to read logs");
@@ -1343,11 +1594,12 @@ export class GatewayServer {
               const newContent = buffer.toString("utf-8");
               const newLines = newContent.split("\n").filter(Boolean);
 
-                for (const line of newLines) {
-                  if (!shouldSkipLogLine(line)) {
-                    res.write(`event: log\ndata: ${line}\n\n`);
-                  }
+              for (const line of newLines) {
+                if (!shouldIncludeGatewayLogLine(line)) {
+                  continue;
                 }
+                res.write(`event: log\ndata: ${line}\n\n`);
+              }
               lastSize = stats.size;
             } else {
               lastSize = stats.size;
@@ -1404,14 +1656,23 @@ export class GatewayServer {
           ? Boolean(whatsappAdapter.isConnected())
           : true;
 
-      const memoryReady = this.memoryManager ? this.memoryManager.isReady?.() ?? true : true;
+      let memoryReady = this.memoryManager ? this.memoryManager.isReady?.() ?? true : true;
+      if (!this.memoryManager && this.bridge) {
+        try {
+          memoryReady = await this.bridge.request<boolean>("memory.ready");
+        } catch {
+          memoryReady = false;
+        }
+      }
 
       let providersReady = true;
-      if (this.agentEngine) {
+      if (this.agentEngine || this.bridge) {
         try {
           const timeoutMs = 2500;
-          providersReady = await Promise.race([
-            this.agentEngine.hasHealthyProvider(),
+          providersReady = await Promise.race<boolean>([
+            this.agentEngine
+              ? this.agentEngine.hasHealthyProvider()
+              : this.bridge!.request<boolean>("agent.hasHealthyProvider"),
             new Promise<boolean>((resolve) => {
               const timer = setTimeout(() => resolve(false), timeoutMs);
               timer.unref?.();
@@ -1433,36 +1694,21 @@ export class GatewayServer {
       res.status(allReady ? 200 : 503).json({ ok: allReady, checks });
     });
 
+    app.get("/api/worker/health", async (_req, res) => {
+      if (!this.bridge) {
+        res.status(503).json({ ok: false, error: "Worker bridge not available" });
+        return;
+      }
+      try {
+        const health = await this.bridge.request("worker.health");
+        res.json({ ok: true, health });
+      } catch (err) {
+        res.status(500).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
+      }
+    });
+
     app.get("/api/health", (req, res) => {
-      const memUsage = process.memoryUsage();
-      const totalMem = os.totalmem();
-      const freeMem = os.freemem();
-      
-      // Calculate CPU usage (simplified)
-      const cpuUsage = os.loadavg()[0] || 0;
-      const cpuCount = os.cpus().length || 1;
-      const cpuPercent = Math.min(100, Math.round((cpuUsage / cpuCount) * 100));
-      
-      // Calculate memory percentage
-      const memPercent = Math.round(((totalMem - freeMem) / totalMem) * 100);
-      
-      // Error rate (errors per minute)
-      const now = Date.now();
-      const timeSinceLastError = now - this.lastErrorTime;
-      const errorRate = timeSinceLastError < 60000 ? this.errorCount : 0;
-      
-      const health: SystemHealth = {
-        cpu: cpuPercent,
-        memory: memPercent,
-        disk: 0, // Would need additional library to calculate
-        uptime: Date.now() - this.startTime,
-        lastRestart: this.startTime,
-        queueDepth: this.router?.getSessionQueueStats().queued ?? 0,
-        activeConnections: this.connections.size,
-        totalErrors: this.errorCount,
-        errorRate: errorRate,
-      };
-      
+      const health = this.buildHealthSnapshot();
       res.json({ ok: true, health });
     });
 
@@ -1553,26 +1799,33 @@ export class GatewayServer {
     
     // GET /api/memory/stats
     app.get("/api/memory/stats", async (req, res) => {
-      if (!this.memoryManager) {
-        res.json({ 
-          ok: true, 
-          stats: { 
-            enabled: false, 
-            fileCount: 0, 
-            lastRunAt: 0,
-            categories: {},
-            totalSize: 0,
-          } 
-        });
-        return;
-      }
-      
       try {
+        if (!this.memoryManager && this.bridge) {
+          const stats = await this.bridge.request("memory.stats");
+          res.json({ ok: true, stats });
+          return;
+        }
+        if (!this.memoryManager) {
+          res.json({ 
+            ok: true, 
+            stats: { 
+              enabled: false, 
+              fileCount: 0, 
+              chunkCount: 0,
+              lastRunAt: 0,
+              categories: {},
+              totalSize: 0,
+            } 
+          });
+          return;
+        }
+
         const rawStats = this.memoryManager.getMemoryStats();
         const stats = {
           enabled: rawStats.enabled,
           lastRunAt: Date.now(),
           fileCount: rawStats.fileCount,
+          chunkCount: rawStats.chunkCount,
           totalSize: rawStats.totalTextBytes,
           categories: rawStats.categories,
         };
@@ -1594,14 +1847,17 @@ export class GatewayServer {
         res.status(400).json({ ok: false, error: "Query parameter 'q' is required" });
         return;
       }
-      
-      if (!this.memoryManager) {
-        res.json({ ok: true, results: [], query });
-        return;
-      }
-      
+
       try {
-        const results = await this.memoryManager.search(query);
+        let results: any[] = [];
+        if (this.memoryManager) {
+          results = await this.memoryManager.search(query);
+        } else if (this.bridge) {
+          results = await this.bridge.request("memory.search", { query });
+        } else {
+          res.json({ ok: true, results: [], query });
+          return;
+        }
         
         // Transform results to match UI expected format
         const memories = results.map((r, i) => ({
@@ -1628,18 +1884,23 @@ export class GatewayServer {
 
     // GET /api/memory/index
     app.get("/api/memory/index", async (req, res) => {
-      if (!this.memoryManager) {
-        res.json({ ok: true, memories: [], total: 0 });
-        return;
-      }
-      
       try {
         const limit = Math.min(Math.max(parseInt(req.query.limit as string) || 200, 1), 1000);
         const offset = Math.max(parseInt(req.query.offset as string) || 0, 0);
         const category = typeof req.query.category === "string" ? req.query.category : undefined;
         const source = typeof req.query.source === "string" ? req.query.source : undefined;
-
-        const chunks = this.memoryManager.listMemoryChunks({ limit, offset, category, source: source as any });
+        let chunks: any[] = [];
+        let total = 0;
+        if (this.memoryManager) {
+          chunks = this.memoryManager.listMemoryChunks({ limit, offset, category, source: source as any });
+          total = this.memoryManager.countMemoryChunks({ category, source: source as any });
+        } else if (this.bridge) {
+          chunks = await this.bridge.request("memory.chunks", { limit, offset, category, source });
+          total = await this.bridge.request<number>("memory.countChunks", { category, source });
+        } else {
+          res.json({ ok: true, memories: [], total: 0, limit, offset });
+          return;
+        }
 
         const memories = chunks.map((chunk) => ({
           id: chunk.id,
@@ -1653,7 +1914,7 @@ export class GatewayServer {
           references: [`${chunk.path}:${chunk.startLine}-${chunk.endLine}`],
         }));
 
-        res.json({ ok: true, memories, total: memories.length });
+        res.json({ ok: true, memories, total, limit, offset });
       } catch (err) {
         res.status(500).json({ 
           ok: false, 
@@ -1670,19 +1931,21 @@ export class GatewayServer {
         res.status(400).json({ ok: false, error: "Content is required" });
         return;
       }
-      
-      if (!this.memoryManager) {
-        res.status(503).json({ ok: false, error: "Memory manager not available" });
-        return;
-      }
-      
+
       try {
         const formatted = typeof category === "string" && category.trim()
           ? `[${category.trim()}]\n${String(content)}`
           : String(content);
 
-        await this.memoryManager.update(formatted);
-        
+        if (this.memoryManager) {
+          await this.memoryManager.update(formatted);
+        } else if (this.bridge) {
+          await this.bridge.request("memory.update", { content: formatted });
+        } else {
+          res.status(503).json({ ok: false, error: "Memory manager not available" });
+          return;
+        }
+
         res.json({ 
           ok: true, 
           id: `mem-${Date.now()}`, 
@@ -1701,17 +1964,20 @@ export class GatewayServer {
     // ============================================
     
     // GET /api/jobs (paginated)
-    app.get("/api/jobs", (req, res) => {
-      if (!this.scheduler) {
-        res.json({ ok: true, jobs: [], data: [], total: 0, limit: 20, offset: 0 });
-        return;
-      }
-      
+    app.get("/api/jobs", async (req, res) => {
       const limit = Math.min(Math.max(parseInt(req.query.limit as string) || 20, 1), 100);
       const offset = Math.max(parseInt(req.query.offset as string) || 0, 0);
-      
+
       try {
-        const jobs = this.scheduler.listJobs();
+        let jobs: any[] = [];
+        if (this.scheduler) {
+          jobs = this.scheduler.listJobs();
+        } else if (this.bridge) {
+          jobs = await this.bridge.request<any[]>("scheduler.list");
+        } else {
+          res.json({ ok: true, jobs: [], data: [], total: 0, limit, offset });
+          return;
+        }
         
         // Transform to UI expected format
         const allJobs = jobs.map((job) => ({
@@ -1730,7 +1996,7 @@ export class GatewayServer {
               ? { tool: (job.trigger as any).tool, args: (job.trigger as any).args }
               : { url: (job.trigger as any).url },
           },
-          actions: (job.actions || []).map((a) => ({
+          actions: (job.actions || []).map((a: any) => ({
             type: a.type as "memory_update" | "send_message" | "log_event",
             data: a,
           })),
@@ -1756,43 +2022,71 @@ export class GatewayServer {
     });
 
     // GET /api/jobs/:id
-    app.get("/api/jobs/:id", (req, res) => {
-      if (!this.scheduler) {
-        res.status(503).json({ ok: false, error: "Scheduler not available" });
-        return;
+    app.get("/api/jobs/:id", async (req, res) => {
+      try {
+        let job: any = null;
+        if (this.scheduler) {
+          job = this.scheduler.getJob(req.params.id);
+        } else if (this.bridge) {
+          job = await this.bridge.request<any>("scheduler.get", { id: req.params.id });
+        } else {
+          res.status(503).json({ ok: false, error: "Scheduler not available" });
+          return;
+        }
+
+        if (!job) {
+          res.status(404).json({ ok: false, error: "Job not found" });
+          return;
+        }
+
+        res.json({ ok: true, job });
+      } catch (err) {
+        res.status(500).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
       }
-      
-      const job = this.scheduler.getJob(req.params.id);
-      if (!job) {
-        res.status(404).json({ ok: false, error: "Job not found" });
-        return;
-      }
-      
-      res.json({ ok: true, job });
     });
 
     // POST /api/jobs/:id/toggle
     app.post("/api/jobs/:id/toggle", async (req, res) => {
-      if (!this.scheduler) {
-        res.status(503).json({ ok: false, error: "Scheduler not available" });
-        return;
-      }
-      
-      const job = this.scheduler.getJob(req.params.id);
-      if (!job) {
-        res.status(404).json({ ok: false, error: "Job not found" });
-        return;
-      }
-      
       try {
-        if (job.enabled) {
-          await this.scheduler.disableJob(req.params.id);
-          await this.events.jobDisabled({ jobId: job.id, name: job.name });
+        let job: any = null;
+        if (this.scheduler) {
+          job = this.scheduler.getJob(req.params.id);
+        } else if (this.bridge) {
+          job = await this.bridge.request<any>("scheduler.get", { id: req.params.id });
         } else {
-          await this.scheduler.enableJob(req.params.id);
-          await this.events.jobEnabled({ jobId: job.id, name: job.name });
+          res.status(503).json({ ok: false, error: "Scheduler not available" });
+          return;
         }
-        res.json({ ok: true });
+
+        if (!job) {
+          res.status(404).json({ ok: false, error: "Job not found" });
+          return;
+        }
+
+        if (this.scheduler) {
+          if (job.enabled) {
+            await this.scheduler.disableJob(req.params.id);
+            await this.events.jobDisabled({ jobId: job.id, name: job.name });
+          } else {
+            await this.scheduler.enableJob(req.params.id);
+            await this.events.jobEnabled({ jobId: job.id, name: job.name });
+          }
+          res.json({ ok: true });
+          return;
+        }
+
+        if (this.bridge) {
+          const updated = await this.bridge.request<{ enabled?: boolean } | null>("scheduler.toggle", { id: req.params.id });
+          if (updated?.enabled) {
+            await this.events.jobEnabled({ jobId: job.id, name: job.name });
+          } else {
+            await this.events.jobDisabled({ jobId: job.id, name: job.name });
+          }
+          res.json({ ok: true });
+          return;
+        }
+
+        res.status(503).json({ ok: false, error: "Scheduler not available" });
       } catch (err) {
         res.status(500).json({ 
           ok: false, 
@@ -1803,26 +2097,32 @@ export class GatewayServer {
 
     // POST /api/jobs/:id/run
     app.post("/api/jobs/:id/run", async (req, res) => {
-      if (!this.scheduler) {
-        res.status(503).json({ ok: false, error: "Scheduler not available" });
-        return;
-      }
-      
-      const job = this.scheduler.getJob(req.params.id);
-      if (!job) {
-        res.status(404).json({ ok: false, error: "Job not found" });
-        return;
-      }
-      
+      let job: any = null;
       try {
+        if (this.scheduler) {
+          job = this.scheduler.getJob(req.params.id);
+        } else if (this.bridge) {
+          job = await this.bridge.request<any>("scheduler.get", { id: req.params.id });
+        } else {
+          res.status(503).json({ ok: false, error: "Scheduler not available" });
+          return;
+        }
+
+        if (!job) {
+          res.status(404).json({ ok: false, error: "Job not found" });
+          return;
+        }
+
         await this.events.jobStarted({
           jobId: job.id,
           name: job.name,
           schedule: job.schedule,
           triggeredAt: Date.now(),
         });
-        
-        const result = await this.scheduler.runJob(req.params.id);
+
+        const result = this.scheduler
+          ? await this.scheduler.runJob(req.params.id)
+          : await this.bridge!.request<any>("scheduler.run", { id: req.params.id });
         
         if (result.status === "success") {
           await this.events.jobCompleted({
@@ -1865,27 +2165,140 @@ export class GatewayServer {
 
     // POST /api/jobs
     app.post("/api/jobs", async (req, res) => {
-      if (!this.scheduler) {
-        res.status(503).json({ ok: false, error: "Scheduler not available" });
-        return;
-      }
-      
       const { name, schedule, trigger, actions } = req.body;
+
+      const nameStr = typeof name === "string" ? name.trim() : "";
+      const scheduleStr = typeof schedule === "string" ? schedule.trim() : "";
       
-      if (!name || !schedule) {
+      if (!nameStr || !scheduleStr) {
         res.status(400).json({ ok: false, error: "Name and schedule are required" });
         return;
       }
       
       try {
-        const job = await this.scheduler.addJob({
+        const normalizeTrigger = (raw: unknown): JobTrigger => {
+          const rawObj =
+            raw && typeof raw === "object" && !Array.isArray(raw) ? (raw as Record<string, unknown>) : null;
+          const type = rawObj && typeof rawObj.type === "string" ? rawObj.type : "agent_ask";
+          const data =
+            rawObj && rawObj.data && typeof rawObj.data === "object" && !Array.isArray(rawObj.data)
+              ? (rawObj.data as Record<string, unknown>)
+              : null;
+          const src = data ?? rawObj ?? {};
+
+          if (type === "agent_ask") {
+            const prompt = typeof (src as any).prompt === "string" ? String((src as any).prompt) : "";
+            return { type: "agent_ask", prompt };
+          }
+
+          if (type === "tool_call") {
+            const tool = typeof (src as any).tool === "string" ? String((src as any).tool) : "";
+            const args = (src as any).args;
+            if (!tool) throw new Error("tool_call trigger requires data.tool");
+            const normalizedArgs =
+              args && typeof args === "object" && !Array.isArray(args) ? (args as Record<string, unknown>) : {};
+            return { type: "tool_call", tool, args: normalizedArgs };
+          }
+
+          if (type === "webhook") {
+            const url = typeof (src as any).url === "string" ? String((src as any).url) : "";
+            if (!url) throw new Error("webhook trigger requires data.url");
+            const methodRaw = typeof (src as any).method === "string" ? String((src as any).method) : undefined;
+            const method =
+              methodRaw && ["GET", "POST", "PUT"].includes(methodRaw)
+                ? (methodRaw as "GET" | "POST" | "PUT")
+                : undefined;
+            const headersRaw = (src as any).headers;
+            let headers: Record<string, string> | undefined;
+            if (headersRaw && typeof headersRaw === "object" && !Array.isArray(headersRaw)) {
+              const out: Record<string, string> = {};
+              for (const [k, v] of Object.entries(headersRaw as Record<string, unknown>)) {
+                if (typeof v === "string") out[k] = v;
+              }
+              headers = Object.keys(out).length > 0 ? out : undefined;
+            }
+            const body = (src as any).body;
+            return { type: "webhook", url, method, headers, body };
+          }
+
+          throw new Error(`Unsupported trigger type: ${type}`);
+        };
+
+        const normalizeActions = (raw: unknown): JobAction[] => {
+          if (!Array.isArray(raw)) return [];
+          const out: JobAction[] = [];
+          const allowedChannels: Channel[] = ["whatsapp", "cli", "web", "telegram", "discord"];
+          const allowedLogLevels = new Set(["info", "warn", "error"]);
+          for (const item of raw) {
+            const itemObj =
+              item && typeof item === "object" && !Array.isArray(item) ? (item as Record<string, unknown>) : null;
+            const data =
+              itemObj && itemObj.data && typeof itemObj.data === "object" && !Array.isArray(itemObj.data)
+                ? (itemObj.data as Record<string, unknown>)
+                : null;
+            const src = data ?? itemObj;
+            const type = src && typeof (src as any).type === "string" ? String((src as any).type) : "";
+            if (!type) continue;
+
+            if (type === "memory_update") {
+              const key = typeof (src as any).key === "string" ? String((src as any).key) : undefined;
+              const tagsRaw = (src as any).tags;
+              const tags = Array.isArray(tagsRaw) ? tagsRaw.filter((t) => typeof t === "string") : undefined;
+              out.push({ type: "memory_update", key, tags });
+              continue;
+            }
+
+            if (type === "send_message") {
+              const channel = typeof (src as any).channel === "string" ? String((src as any).channel) : "";
+              const recipient = typeof (src as any).recipient === "string" ? String((src as any).recipient) : "";
+              if (!allowedChannels.includes(channel as Channel) || !recipient) continue;
+              out.push({ type: "send_message", channel: channel as Channel, recipient });
+              continue;
+            }
+
+            if (type === "log_event") {
+              const level = typeof (src as any).level === "string" ? String((src as any).level) : undefined;
+              const prefix = typeof (src as any).prefix === "string" ? String((src as any).prefix) : undefined;
+              out.push({
+                type: "log_event",
+                level: level && allowedLogLevels.has(level) ? (level as "info" | "warn" | "error") : undefined,
+                prefix,
+              });
+              continue;
+            }
+          }
+          return out;
+        };
+
+        let normalizedTrigger: JobTrigger;
+        let normalizedActions: JobAction[];
+        try {
+          normalizedTrigger = normalizeTrigger(trigger);
+          normalizedActions = normalizeActions(actions);
+        } catch (err) {
+          res.status(400).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
+          return;
+        }
+
+        const payload = {
           id: `job-${Date.now()}`,
-          name,
-          schedule,
-          trigger: trigger || { type: "agent_ask", prompt: "" },
-          actions: actions || [],
+          name: nameStr,
+          schedule: scheduleStr,
+          trigger: normalizedTrigger,
+          actions: normalizedActions,
           enabled: true,
-        });
+        };
+
+        const job = (this.scheduler
+          ? await this.scheduler.addJob(payload)
+          : this.bridge
+            ? await this.bridge.request<any>("scheduler.add", payload)
+            : null) as any;
+
+        if (!job) {
+          res.status(503).json({ ok: false, error: "Scheduler not available" });
+          return;
+        }
         
         await this.events.jobCreated({
           jobId: job.id,
@@ -1905,19 +2318,25 @@ export class GatewayServer {
 
     // DELETE /api/jobs/:id
     app.delete("/api/jobs/:id", async (req, res) => {
-      if (!this.scheduler) {
-        res.status(503).json({ ok: false, error: "Scheduler not available" });
-        return;
-      }
-      
-      const job = this.scheduler.getJob(req.params.id);
-      if (!job) {
-        res.status(404).json({ ok: false, error: "Job not found" });
-        return;
-      }
-      
       try {
-        const removed = await this.scheduler.removeJob(req.params.id);
+        let job: any = null;
+        if (this.scheduler) {
+          job = this.scheduler.getJob(req.params.id);
+        } else if (this.bridge) {
+          job = await this.bridge.request("scheduler.get", { id: req.params.id });
+        } else {
+          res.status(503).json({ ok: false, error: "Scheduler not available" });
+          return;
+        }
+
+        if (!job) {
+          res.status(404).json({ ok: false, error: "Job not found" });
+          return;
+        }
+
+        const removed = this.scheduler
+          ? await this.scheduler.removeJob(req.params.id)
+          : await this.bridge!.request("scheduler.remove", { id: req.params.id });
         if (!removed) {
           res.status(404).json({ ok: false, error: "Job not found" });
           return;
@@ -2150,36 +2569,43 @@ export class GatewayServer {
     // ============================================
     
     // List Main Agent tasks
-    app.get("/api/main-agent/tasks", async (req, res) => {
-      if (!this.mainAgent) {
-        res.status(503).json({ ok: false, error: "Main Agent not available" });
-        return;
+    app.get("/api/main-agent/tasks", async (_req, res) => {
+      try {
+        const tasks = this.mainAgent
+          ? await this.mainAgent.getAllTasks()
+          : this.bridge
+            ? await this.bridge.request("mainAgent.tasks")
+            : null;
+        if (!tasks) {
+          res.status(503).json({ ok: false, error: "Main Agent not available" });
+          return;
+        }
+        res.json({ ok: true, tasks });
+      } catch (err) {
+        res.status(500).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
       }
-      const tasks = await this.mainAgent.getAllTasks();
-      res.json({ ok: true, tasks });
     });
 
     // Get specific Main Agent task
     app.get("/api/main-agent/tasks/:id", async (req, res) => {
-      if (!this.mainAgent) {
-        res.status(503).json({ ok: false, error: "Main Agent not available" });
-        return;
+      try {
+        const task = this.mainAgent
+          ? await this.mainAgent.getTask(req.params.id)
+          : this.bridge
+            ? await this.bridge.request("mainAgent.task", { id: req.params.id })
+            : null;
+        if (!task) {
+          res.status(404).json({ ok: false, error: "Task not found" });
+          return;
+        }
+        res.json({ ok: true, task });
+      } catch (err) {
+        res.status(500).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
       }
-      const task = await this.mainAgent.getTask(req.params.id);
-      if (!task) {
-        res.status(404).json({ ok: false, error: "Task not found" });
-        return;
-      }
-      res.json({ ok: true, task });
     });
 
     // Assign new task to Main Agent
     app.post("/api/main-agent/tasks", async (req, res) => {
-      if (!this.mainAgent) {
-        res.status(503).json({ ok: false, error: "Main Agent not available" });
-        return;
-      }
-
       const { description } = req.body;
       if (!description) {
         res.status(400).json({ ok: false, error: "Description is required" });
@@ -2187,7 +2613,15 @@ export class GatewayServer {
       }
 
       try {
-        const taskId = await this.mainAgent.assignTask(description);
+        const taskId = this.mainAgent
+          ? await this.mainAgent.assignTask(description)
+          : this.bridge
+            ? await this.bridge.request("mainAgent.assign", { description })
+            : null;
+        if (!taskId) {
+          res.status(503).json({ ok: false, error: "Main Agent not available" });
+          return;
+        }
         res.json({ ok: true, taskId, status: "pending" });
       } catch (err) {
         res.status(500).json({ 
@@ -2197,24 +2631,44 @@ export class GatewayServer {
       }
     });
 
-    app.post("/api/main-agent/pause", (_req, res) => {
-      if (!this.mainAgent) {
+    app.post("/api/main-agent/pause", async (_req, res) => {
+      try {
+        if (this.mainAgent) {
+          this.mainAgent.pause();
+          this.setMainAgentRunning(false);
+          res.json({ ok: true });
+          return;
+        }
+        if (this.bridge) {
+          await this.bridge.request("mainAgent.pause");
+          this.setMainAgentRunning(false);
+          res.json({ ok: true });
+          return;
+        }
         res.status(503).json({ ok: false, error: "Main Agent not available" });
-        return;
+      } catch (err) {
+        res.status(500).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
       }
-      this.mainAgent.pause();
-      this.setMainAgentRunning(false);
-      res.json({ ok: true });
     });
 
-    app.post("/api/main-agent/resume", (_req, res) => {
-      if (!this.mainAgent) {
+    app.post("/api/main-agent/resume", async (_req, res) => {
+      try {
+        if (this.mainAgent) {
+          this.mainAgent.resume();
+          this.setMainAgentRunning(true);
+          res.json({ ok: true });
+          return;
+        }
+        if (this.bridge) {
+          await this.bridge.request("mainAgent.resume");
+          this.setMainAgentRunning(true);
+          res.json({ ok: true });
+          return;
+        }
         res.status(503).json({ ok: false, error: "Main Agent not available" });
-        return;
+      } catch (err) {
+        res.status(500).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
       }
-      this.mainAgent.resume();
-      this.setMainAgentRunning(true);
-      res.json({ ok: true });
     });
   }
 
@@ -2346,7 +2800,7 @@ export class GatewayServer {
    * Run a lightweight startup health check through the agent engine
    */
   async runStartupHealthCheck(options?: { prompt?: string; timeoutMs?: number; delayMs?: number }): Promise<void> {
-    if (!this.agentEngine) {
+    if (!this.agentEngine && !this.bridge) {
       this.startupHealthCheck = {
         lastCheckAt: Date.now(),
         ok: false,
@@ -2379,12 +2833,23 @@ export class GatewayServer {
         scope: "healthcheck:startup",
       });
       const result = await Promise.race([
-        this.agentEngine.execute({
-          sessionKey,
-          query: prompt,
-          channel: "web",
-          chatId: sessionKey,
-        }),
+        this.agentEngine
+          ? this.agentEngine.execute({
+              sessionKey,
+              query: prompt,
+              channel: "web",
+              chatId: sessionKey,
+              promptMode: "minimal",
+            })
+          : this.bridge!.request("agent.execute", {
+              input: {
+                sessionKey,
+                query: prompt,
+                channel: "web",
+                chatId: sessionKey,
+                promptMode: "minimal",
+              },
+            }),
         timeout,
       ]);
 
@@ -2653,24 +3118,40 @@ export class GatewayServer {
    * Send full status snapshot to a single connection
    */
   private async sendStatusSnapshot(ws: WebSocket): Promise<void> {
-    const status = await this.buildStatusResponse();
-    this.send(ws, {
-      id: this.generateId(),
-      type: "event",
-      payload: {
-        type: "status_snapshot",
-        data: { data: status },
+    try {
+      const status = await this.buildStatusResponse();
+      this.send(ws, {
+        id: this.generateId(),
+        type: "event",
+        payload: {
+          type: "status_snapshot",
+          data: { data: status },
+          timestamp: Date.now(),
+        },
         timestamp: Date.now(),
-      },
-      timestamp: Date.now(),
-    });
+      });
+    } catch (err) {
+      this.logger.warn(
+        { error: err instanceof Error ? err.message : String(err) },
+        "Failed to send status snapshot"
+      );
+    }
   }
 
   /**
    * Broadcast status deltas to all connections
    */
   private async broadcastStatusDelta(): Promise<void> {
-    const status = await this.buildStatusResponse();
+    let status: Record<string, unknown>;
+    try {
+      status = await this.buildStatusResponse();
+    } catch (err) {
+      this.logger.warn(
+        { error: err instanceof Error ? err.message : String(err) },
+        "Failed to build status delta"
+      );
+      return;
+    }
     if (!this.lastStatus) {
       this.lastStatus = status;
       for (const { ws } of this.connections.values()) {
@@ -2726,9 +3207,40 @@ export class GatewayServer {
   }
 
   private async buildStatusResponse(): Promise<Record<string, unknown>> {
-    const mainAgentTasks = (this.mainAgent ? await this.mainAgent.getAllTasks() : []) as MainAgentTask[];
+    const bridgeRequestOrDefault = async <T>(
+      type: string,
+      fallback: T,
+      payload?: unknown
+    ): Promise<T> => {
+      if (!this.bridge) return fallback;
+      try {
+        return await this.bridge.request<T>(type, payload);
+      } catch (err) {
+        this.logger.debug(
+          { type, error: err instanceof Error ? err.message : String(err) },
+          "Bridge request failed during status build"
+        );
+        return fallback;
+      }
+    };
+
+    let mainAgentEnabled = this.mainAgent?.config?.mainAgent?.enabled ?? false;
+    let mainAgentRunning = this.mainAgentRunning;
+    if (!this.mainAgent && this.bridge) {
+      const status = await bridgeRequestOrDefault<{ enabled?: boolean; running?: boolean }>(
+        "mainAgent.status",
+        {}
+      );
+      if (typeof status?.enabled === "boolean") mainAgentEnabled = status.enabled;
+      if (typeof status?.running === "boolean") mainAgentRunning = status.running;
+    }
+
+    const mainAgentTasks = (this.mainAgent
+      ? await this.mainAgent.getAllTasks()
+      : await bridgeRequestOrDefault<MainAgentTask[]>("mainAgent.tasks", [])) as MainAgentTask[];
     const subagents = mainAgentTasks
       .filter((task) => task.parentTaskId)
+      .filter((task) => ["queued", "running", "retrying"].includes(task.status))
       .map((task) => {
         const startedAt =
           task.history.find((entry: { state: string; at: number }) => entry.state === "running")?.at ??
@@ -2748,7 +3260,10 @@ export class GatewayServer {
           endedAt,
         };
       });
-    const activeRuns = listActiveRuns().map((run) => ({
+    const activeRunsRaw = this.agentEngine
+      ? listActiveRuns()
+      : await bridgeRequestOrDefault<any[]>("activeRuns.list", []);
+    const activeRuns = (activeRunsRaw as any[]).map((run) => ({
       runId: run.runId,
       sessionKey: run.sessionKey,
       agentType: run.agentType,
@@ -2767,19 +3282,45 @@ export class GatewayServer {
         error: task.error,
       }));
 
+    const providers = this.antConfig
+      ? Object.entries(this.antConfig.resolved.providers.items)
+          .sort(([a], [b]) => a.localeCompare(b))
+          .map(([id, provider]) => ({
+            label: id,
+            id,
+            type: provider.type,
+            model: provider.model,
+            baseUrl: provider.baseUrl ?? "",
+            cliProvider: provider.type === "cli" ? provider.cliProvider : undefined,
+          }))
+      : [];
+
+    const routing = this.antConfig?.resolved.routing ?? {};
+
+    const queue = this.router
+      ? this.router.getQueueLaneSnapshots().map((lane) => ({
+          lane: lane.lane,
+          queued: lane.queued,
+          active: lane.processing,
+          maxConcurrent: lane.maxConcurrent,
+          oldestEnqueuedAt: lane.oldestEnqueuedAt,
+        }))
+      : [];
+
     return {
       ok: true,
       time: Date.now(),
       runtime: {
-        providers: [],
+        providers,
+        routing,
       },
-      queue: [],
+      queue,
       running,
       activeRuns,
       subagents,
       mainAgent: {
-        enabled: this.mainAgent?.config?.mainAgent?.enabled ?? false,
-        running: this.mainAgentRunning,
+        enabled: mainAgentEnabled,
+        running: mainAgentRunning,
         tasks: mainAgentTasks.map((task) => ({
           id: task.taskId,
           description: task.description,
@@ -2798,15 +3339,7 @@ export class GatewayServer {
         latencyMs: this.startupHealthCheck.latencyMs ?? null,
         responsePreview: this.startupHealthCheck.responsePreview ?? null,
       },
-      health: {
-        cpu: 0,
-        memory: process.memoryUsage().heapUsed,
-        disk: 0,
-        uptime: Date.now() - this.startTime,
-        lastRestart: this.startTime,
-        queueDepth: this.router?.getSessionQueueStats().queued ?? 0,
-        activeConnections: this.connections.size,
-      },
+      health: this.buildHealthSnapshot(),
     };
   }
 

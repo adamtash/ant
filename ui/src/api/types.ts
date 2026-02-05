@@ -10,7 +10,7 @@
 export type ProviderInfo = {
   label: string;
   id: string;
-  type: 'openai' | 'cli';
+  type: 'openai' | 'cli' | 'ollama';
   model: string;
   baseUrl: string;
   cliProvider?: string;
@@ -88,33 +88,26 @@ export type ToolCall = {
 
 export type Task = {
   id: string;
-  prompt: string;
-  status: 'queued' | 'running' | 'completed' | 'error' | 'cancelled';
-  startedAt?: number;
-  completedAt?: number;
-  duration?: number;
-  toolCalls: ToolCall[];
-  result?: string;
-  error?: {
-    message: string;
-    stack: string;
-    code: string;
-  };
-  subagents: Agent[];
-  channel: 'whatsapp' | 'cli' | 'web' | 'telegram' | 'discord';
+  status: 'queued' | 'running' | 'completed' | 'failed';
+  description: string;
   sessionKey: string;
-  iterations: number;
+  chatId: string;
+  createdAt: number;
+  startedAt?: number;
+  endedAt?: number;
+  result?: unknown;
+  error?: string;
 };
 
 export type TasksResponse = {
   ok: true;
   tasks: Task[];
+  total: number;
+  limit: number;
+  offset: number;
 };
 
-export type TaskDetailResponse = {
-  ok: true;
-  task: Task;
-};
+export type TaskDetailResponse = Task;
 
 // ============================================
 // Agent Types
@@ -156,6 +149,69 @@ export type AgentDetailResponse = {
 };
 
 // ============================================
+// Main Agent Task Types
+// ============================================
+
+export type MainAgentTaskState =
+  | "pending"
+  | "queued"
+  | "running"
+  | "succeeded"
+  | "failed"
+  | "retrying"
+  | "canceled";
+
+export type MainAgentTaskLane = "main" | "autonomous" | "maintenance";
+export type MainAgentTaskPhase = "planning" | "executing" | "verifying";
+
+export interface MainAgentTaskEntry {
+  taskId: string;
+  parentTaskId?: string;
+  createdAt: number;
+  updatedAt: number;
+  status: MainAgentTaskState;
+  description: string;
+  sessionKey: string;
+  subagentSessionKey?: string;
+  lane: MainAgentTaskLane;
+  phase?: MainAgentTaskPhase;
+  progress?: {
+    completed: number;
+    total: number;
+    lastUpdate: number;
+    message?: string;
+  };
+  retries: {
+    attempted: number;
+    maxAttempts: number;
+    nextRetryAt?: number;
+    backoffMs?: number;
+  };
+  timeout?: {
+    startedAt: number;
+    maxDurationMs: number;
+    willExpireAt: number;
+  };
+  result?: {
+    content: string;
+    toolsUsed: string[];
+    iterations: number;
+    providerId?: string;
+    model?: string;
+  };
+  error?: string;
+  metadata: {
+    channel: "whatsapp" | "cli" | "web" | "telegram" | "discord";
+    priority: "high" | "normal" | "low";
+    tags: string[];
+  };
+  history: Array<{ state: MainAgentTaskState; at: number; reason?: string }>;
+}
+
+export type MainAgentTasksResponse = { ok: true; tasks: MainAgentTaskEntry[] };
+export type MainAgentTaskResponse = { ok: true; task: MainAgentTaskEntry };
+
+// ============================================
 // Memory Types
 // ============================================
 
@@ -183,6 +239,8 @@ export type MemoryIndexResponse = {
   ok: true;
   memories: Memory[];
   total: number;
+  limit?: number;
+  offset?: number;
 };
 
 export type MemoryStatsResponse = {
@@ -191,6 +249,7 @@ export type MemoryStatsResponse = {
     enabled: boolean;
     lastRunAt: number;
     fileCount: number;
+    chunkCount?: number;
     totalSize?: number;
     categories?: Record<string, number>;
   };
@@ -216,11 +275,13 @@ export type Skill = {
 export type SkillsResponse = {
   ok: true;
   skills: Skill[];
+  categories?: string[];
 };
 
 export type SkillDetailResponse = {
   ok: true;
   skill: Skill;
+  source?: string;
 };
 
 // ============================================
@@ -254,6 +315,9 @@ export type CronJob = {
 export type JobsResponse = {
   ok: true;
   jobs: CronJob[];
+  total?: number;
+  limit?: number;
+  offset?: number;
 };
 
 export type JobDetailResponse = {
@@ -285,6 +349,9 @@ export type SessionMessage = {
 export type SessionsResponse = {
   ok: true;
   sessions: Session[];
+  total?: number;
+  limit?: number;
+  offset?: number;
 };
 
 export type SessionDetailResponse = {
@@ -356,6 +423,8 @@ export type SystemHealth = {
   lastRestart: number;
   queueDepth: number;
   activeConnections: number;
+  totalErrors?: number;
+  errorRate?: number;
 };
 
 export type HealthResponse = {
@@ -370,10 +439,17 @@ export type HealthResponse = {
 export type StatusResponse = {
   ok: true;
   time: number;
-  runtime: { providers: ProviderInfo[] };
+  runtime: { providers: ProviderInfo[]; routing?: Record<string, unknown> };
   queue: QueueLaneSnapshot[];
   running: MainTaskStatus[];
   subagents: SubagentRecord[];
+  activeRuns?: Array<{
+    runId: string;
+    sessionKey: string;
+    agentType: string;
+    startedAt: number;
+    metadata?: Record<string, unknown>;
+  }>;
   mainAgent?: {
     enabled: boolean;
     running: boolean;
@@ -389,6 +465,13 @@ export type StatusResponse = {
     lastError?: string | null;
   };
   health?: SystemHealth;
+  startupHealthCheck?: {
+    lastCheckAt?: number | null;
+    ok?: boolean | null;
+    error?: string | null;
+    latencyMs?: number | null;
+    responsePreview?: string | null;
+  };
 };
 
 // ============================================
@@ -407,6 +490,26 @@ export type ConfigValidationResponse = {
     path: string;
     message: string;
   }>;
+};
+
+export type EnvResponse = {
+  ok: true;
+  path: string;
+  exists: boolean;
+  keys: Record<
+    string,
+    {
+      fileSet: boolean;
+      envSet: boolean;
+    }
+  >;
+};
+
+export type EnvUpdateResponse = {
+  ok: true;
+  path: string;
+  changedKeys: string[];
+  requiresRestart: boolean;
 };
 
 // ============================================
@@ -438,7 +541,10 @@ export type WhatsAppStatusResponse = {
 
 export type LogsResponse = {
   ok: true;
-  lines: string[];
+  data: string[];
+  total: number;
+  limit: number;
+  offset: number;
 };
 
 export type LogEntry = {

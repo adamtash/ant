@@ -2,6 +2,8 @@
 
 This file tracks all actions and observations from the Main Agent's continuous duty cycles.
 
+> NOTE: the runtime writes the active log to `mainAgent.logFile` (default `.ant/AGENT_LOG.md`, resolved under `stateDir`). This repo copy is a checked-in snapshot/example; see `docs/agent-files.md`.
+
 ## Log Format
 
 Each entry follows this structure:

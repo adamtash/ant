@@ -5,6 +5,9 @@
  * tool system, and channel interfaces.
  */
 
+import type { AntConfig } from "../config.js";
+import type { MemoryManager } from "../memory/manager.js";
+
 // ============================================================================
 // Message Types
 // ============================================================================
@@ -124,6 +127,7 @@ export interface ToolMeta {
 }
 
 export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
+export type PromptMode = "full" | "minimal" | "none";
 
 /**
  * Tool context passed to every tool execution
@@ -135,6 +139,9 @@ export interface ToolContext {
   chatId?: string;
   logger: Logger;
   config: AgentConfig;
+  antConfig?: AntConfig;
+  memoryManager?: MemoryManager;
+  notifyOwners?: (message: string) => Promise<void>;
 }
 
 /**
@@ -172,6 +179,7 @@ export interface AgentInput {
   history?: Message[];
   runId?: string;
   toolPolicy?: string;
+  promptMode?: PromptMode;
 }
 
 /**

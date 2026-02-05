@@ -378,20 +378,27 @@ export class Ant {
 
     // Boundary handling
     const margin = 20;
-    if (this.position.x < margin) {
-      this.position.x = margin;
+    const halfWidth = bounds.width / 2;
+    const halfHeight = bounds.height / 2;
+    const minX = -halfWidth + margin;
+    const maxX = halfWidth - margin;
+    const minY = -halfHeight + margin;
+    const maxY = halfHeight - margin;
+
+    if (this.position.x < minX) {
+      this.position.x = minX;
       this.targetDirection = Math.PI - this.targetDirection;
     }
-    if (this.position.x > bounds.width - margin) {
-      this.position.x = bounds.width - margin;
+    if (this.position.x > maxX) {
+      this.position.x = maxX;
       this.targetDirection = Math.PI - this.targetDirection;
     }
-    if (this.position.y < margin) {
-      this.position.y = margin;
+    if (this.position.y < minY) {
+      this.position.y = minY;
       this.targetDirection = -this.targetDirection;
     }
-    if (this.position.y > bounds.height - margin) {
-      this.position.y = bounds.height - margin;
+    if (this.position.y > maxY) {
+      this.position.y = maxY;
       this.targetDirection = -this.targetDirection;
     }
   }

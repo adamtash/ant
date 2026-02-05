@@ -1,8 +1,14 @@
 {
-  "workspaceDir": "~",
+  "workspaceDir": ".",
   "providers": {
-    "default": "codex",
+    "default": "copilot",
     "items": {
+      "lmstudio": {
+        "type": "openai",
+        "baseUrl": "http://localhost:1234/v1",
+        "model": "local-model",
+        "embeddingsModel": "text-embedding-nomic-embed-text-v1.5"
+      },
       "codex": {
         "type": "cli",
         "cliProvider": "codex",
@@ -22,10 +28,10 @@
         "model": "gpt-5-mini",
         "args": [
           "--yolo",
+          "--model",
+          "gpt-5-mini",
           "--no-ask-user",
-          "--silent",
-          "--no-color",
-          "--allow-all-tools"
+          "--silent"
         ]
       },
       "kimi": {
@@ -46,8 +52,10 @@
     "discovery": {
       "enabled": true,
       "researchIntervalHours": 24,
-      "healthCheckIntervalMinutes": 15,
-      "minBackupProviders": 2,
+      "healthCheckIntervalMinutes": 120,
+      "minBackupProviders": 1,
+      "minCandidates": 1,
+      "logMode": "daily-rollup",
       "trustSources": []
     },
     "local": {
@@ -65,20 +73,21 @@
         ]
       },
       "lmstudio": {
-        "enabled": false,
+        "enabled": true,
         "endpoint": "http://localhost:1234/v1",
         "fastModels": [
-          "nvidia/nemotron-3-nano",
-          "zai-org/glm-4.7-flash"
+          "zai-org/glm-4.7-flash",
+          "openai/gpt-oss-20b",
+          "nvidia/nemotron-3-nano"
         ]
       }
     }
   },
   "routing": {
-    "chat": "codex",
-    "tools": "codex",
+    "chat": "copilot",
+    "tools": "copilot",
     "embeddings": "lmstudio",
-    "parentForCli": "codex"
+    "parentForCli": "copilot"
   },
   "ui": {
     "enabled": true,
@@ -86,7 +95,7 @@
     "port": 5117,
     "autoOpen": true,
     "openUrl": "http://127.0.0.1:5117",
-    "staticDir": "/Users/a/Projects/ant-cli/ui/dist"
+    "staticDir": "ui/dist"
   },
   "telegram": {
     "enabled": true,
@@ -95,7 +104,7 @@
     "dmPolicy": "pairing"
   },
   "whatsapp": {
-    "sessionDir": "./.ant/whatsapp",
+    "sessionDir": ".ant/whatsapp",
     "respondToGroups": false,
     "mentionOnly": true,
     "botName": "ant",
@@ -111,8 +120,21 @@
   "memory": {
     "enabled": true,
     "indexSessions": true,
-    "sqlitePath": "./.ant/memory.sqlite",
-    "embeddingsModel": "qwen3-embedding-0.6b-dwq"
+    "retentionDays": 30,
+    "sqlitePath": ".ant/memory.sqlite",
+    "embeddingsModel": "text-embedding-nomic-embed-text-v1.5",
+    "sessions": {
+      "includeRoles": ["user", "assistant"],
+      "maxMessages": 1000,
+      "maxBytes": 2000000,
+      "minChars": 4,
+      "excludePatterns": [
+        "^\\s*Tool result:",
+        "^\\s*System:",
+        "^\\s*Tool call:",
+        "^\\s*\\[Old tool result content cleared\\]"
+      ]
+    }
   },
   "agent": {
     "systemPrompt": "",
@@ -143,10 +165,10 @@
         "command": "copilot",
         "args": [
           "--yolo",
+          "--model",
+          "gpt-5-mini",
           "--no-ask-user",
-          "--silent",
-          "--no-color",
-          "--allow-all-tools"
+          "--silent"
         ]
       },
       "claude": {
@@ -165,7 +187,7 @@
   },
   "scheduler": {
     "enabled": true,
-    "storePath": "./.ant/jobs.json",
+    "storePath": ".ant/jobs.json",
     "timezone": "UTC"
   },
   "monitoring": {
@@ -184,23 +206,55 @@
   "logging": {
     "level": "warn",
     "fileLevel": "trace",
-    "filePath": "./.ant/ant.log"
+    "filePath": ".ant/ant.log"
   },
   "mainAgent": {
     "enabled": true,
     "intervalMs": 300000,
-    "dutiesFile": "AGENT_DUTIES.md"
+    "errorScanIntervalMs": 30000,
+    "notifySessions": [],
+    "notifyOn": {
+      "errors": true,
+      "incidentResults": true,
+      "providers": true,
+      "improvements": true
+    },
+    "dutiesFile": "AGENT_DUTIES.md",
+    "logFile": ".ant/AGENT_LOG.md"
   },
   "runtime": {
+    "mode": "split",
+    "supervisor": {
+      "enabled": true,
+      "restartDelayMs": 1000,
+      "maxRestarts": 10,
+      "restartWindowMs": 60000
+    },
+    "worker": {
+      "heartbeatPath": ".ant/heartbeat.worker",
+      "heartbeatIntervalMs": 5000,
+      "maxHeartbeatAgeMs": 20000,
+      "requestTimeoutMs": 300000
+    },
+    "selfBuild": {
+      "enabled": true,
+      "maxFixAttempts": 1,
+      "notifyOwnersOnFailure": true,
+      "commands": {
+        "build": "npm run build",
+        "uiBuild": "npm run ui:build",
+        "typecheck": "npm run typecheck",
+        "test": "npm test",
+        "diagnostics": "ant diagnostics test-all"
+      }
+    },
     "restart": {
       "command": "npm",
       "args": [
         "run",
         "dev",
         "--",
-        "run",
-        "-c",
-        "ant.config.json"
+        "run"
       ]
     }
   }

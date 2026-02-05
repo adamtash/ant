@@ -1,458 +1,446 @@
 /**
- * War Room Page
- * Error monitoring and system health with Recharts visualizations
+ * War Room
+ * Incidents + health (backend-transparent)
  */
 
-import React, { useMemo } from 'react';
-import { motion } from 'framer-motion';
+import React, { useMemo, useState } from "react";
+import { useQuery } from "@tanstack/react-query";
+import type { ColumnDef } from "@tanstack/react-table";
 import {
-  AreaChart,
   Area,
+  AreaChart,
+  CartesianGrid,
+  ResponsiveContainer,
+  Tooltip,
   XAxis,
   YAxis,
-  CartesianGrid,
-  Tooltip,
-  ResponsiveContainer,
-  PieChart,
-  Pie,
-  Cell,
-  BarChart,
-  Bar,
-} from 'recharts';
-import { Card, Badge, Button } from '../components/base';
-import { useSystemStore } from '../stores/systemStore';
-import { useColonyStore } from '../stores/colonyStore';
+} from "recharts";
+import { Badge, Button, Card, Input, Modal, Skeleton } from "../components/base";
+import { DataTable, JsonPanel } from "../components/ops";
+import { getErrorStats, getHealth, getProviderHealth } from "../api/client";
+import type { SystemEvent } from "../api/types";
+import { useEventsStore } from "../state/eventsStore";
+import { useSelectionStore } from "../state/selectionStore";
 
-// Color palette for charts
-const CHART_COLORS = {
-  critical: '#EF4444',
-  error: '#DC2626',
-  warn: '#F59E0B',
-  info: '#10B981',
-  background: '#0B1120',
-  grid: '#1E293B',
-  text: '#94A3B8',
-};
+type Incident = SystemEvent;
+
+function severityVariant(sev: Incident["severity"]): "soldier" | "queen" | "default" {
+  if (sev === "critical" || sev === "error") return "soldier";
+  if (sev === "warn") return "queen";
+  return "default";
+}
+
+function extractMessage(ev: Incident): string {
+  const data = ev.data as any;
+  const msg =
+    data?.message ??
+    data?.error ??
+    data?.msg ??
+    data?.reason ??
+    data?.details ??
+    data?.stack ??
+    null;
+  if (typeof msg === "string") return msg;
+  try {
+    return JSON.stringify(msg ?? data ?? ev, null, 2);
+  } catch {
+    return String(msg ?? ev.type);
+  }
+}
+
+function formatTime(ts: number): string {
+  return new Date(ts).toLocaleTimeString(undefined, {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+}
 
 export const WarRoom: React.FC = () => {
-  const { events, totalErrors, health } = useSystemStore();
-  const { alarms } = useColonyStore();
+  const events = useEventsStore((s) => s.events);
+  const clearEvents = useEventsStore((s) => s.clear);
+  const select = useSelectionStore((s) => s.select);
 
-  // Filter error events
-  const errorEvents = events.filter(
-    (e) => e.severity === 'error' || e.severity === 'critical'
-  );
+  const [query, setQuery] = useState("");
+  const [severity, setSeverity] = useState<Incident["severity"] | "all">("all");
+  const [rawOpen, setRawOpen] = useState(false);
 
-  // Generate time series data for the last hour (grouped by minute)
-  const timeSeriesData = useMemo(() => {
+  const healthQuery = useQuery({
+    queryKey: ["health"],
+    queryFn: getHealth,
+    refetchInterval: 5000,
+  });
+  const errorStatsQuery = useQuery({
+    queryKey: ["errorStats"],
+    queryFn: getErrorStats,
+    refetchInterval: 5000,
+  });
+  const providerHealthQuery = useQuery({
+    queryKey: ["providerHealth"],
+    queryFn: getProviderHealth,
+    refetchInterval: 10_000,
+  });
+
+  const incidents = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    const base = events
+      .filter(
+        (e) =>
+          e.type === "error_occurred" ||
+          e.severity === "error" ||
+          e.severity === "critical" ||
+          e.severity === "warn"
+      )
+      .sort((a, b) => b.timestamp - a.timestamp);
+
+    return base
+      .filter((e) => (severity === "all" ? true : e.severity === severity))
+      .filter((e) => {
+        if (!q) return true;
+        const msg = extractMessage(e).toLowerCase();
+        return (
+          msg.includes(q) ||
+          e.type.toLowerCase().includes(q) ||
+          (e.sessionKey ?? "").toLowerCase().includes(q) ||
+          (e.channel ?? "").toLowerCase().includes(q) ||
+          (e.source ?? "").toLowerCase().includes(q)
+        );
+      })
+      .slice(0, 500);
+  }, [events, query, severity]);
+
+  const lastHourSeries = useMemo(() => {
     const now = Date.now();
-    const hourAgo = now - 60 * 60 * 1000;
-    const minuteBuckets: Record<string, { errors: number; warns: number }> = {};
-
-    // Initialize buckets for last 60 minutes
+    const start = now - 60 * 60 * 1000;
+    const buckets = new Map<string, { errors: number; warns: number }>();
     for (let i = 0; i < 60; i++) {
-      const bucketTime = new Date(hourAgo + i * 60 * 1000);
-      const key = `${bucketTime.getHours()}:${String(bucketTime.getMinutes()).padStart(2, '0')}`;
-      minuteBuckets[key] = { errors: 0, warns: 0 };
+      const t = new Date(start + i * 60 * 1000);
+      const label = `${t.getHours()}:${String(t.getMinutes()).padStart(2, "0")}`;
+      buckets.set(label, { errors: 0, warns: 0 });
     }
 
-    // Count events into buckets
-    events.forEach((event) => {
-      if (event.timestamp >= hourAgo) {
-        const eventDate = new Date(event.timestamp);
-        const key = `${eventDate.getHours()}:${String(eventDate.getMinutes()).padStart(2, '0')}`;
-        if (minuteBuckets[key]) {
-          if (event.severity === 'error' || event.severity === 'critical') {
-            minuteBuckets[key].errors++;
-          } else if (event.severity === 'warn') {
-            minuteBuckets[key].warns++;
-          }
-        }
-      }
-    });
+    for (const ev of events) {
+      if (ev.timestamp < start) continue;
+      const t = new Date(ev.timestamp);
+      const label = `${t.getHours()}:${String(t.getMinutes()).padStart(2, "0")}`;
+      const bucket = buckets.get(label);
+      if (!bucket) continue;
+      if (ev.severity === "error" || ev.severity === "critical") bucket.errors += 1;
+      if (ev.severity === "warn") bucket.warns += 1;
+    }
 
-    return Object.entries(minuteBuckets).map(([time, data]) => ({
-      time,
-      errors: data.errors,
-      warns: data.warns,
-    }));
+    return Array.from(buckets.entries()).map(([time, v]) => ({ time, ...v }));
   }, [events]);
 
-  // Error type distribution
-  const errorDistribution = useMemo(() => {
-    const distribution: Record<string, number> = {};
-    errorEvents.forEach((event) => {
-      const type = event.type.replace(/_/g, ' ');
-      distribution[type] = (distribution[type] || 0) + 1;
-    });
+  const incidentsLast5m = useMemo(() => {
+    const cut = Date.now() - 5 * 60 * 1000;
+    return events.filter(
+      (e) =>
+        e.timestamp >= cut && (e.severity === "error" || e.severity === "critical")
+    ).length;
+  }, [events]);
 
-    return Object.entries(distribution)
-      .map(([name, value]) => ({ name, value }))
-      .sort((a, b) => b.value - a.value)
-      .slice(0, 5);
-  }, [errorEvents]);
+  const totalErrors =
+    typeof (healthQuery.data as any)?.health?.totalErrors === "number"
+      ? (healthQuery.data as any).health.totalErrors
+      : (errorStatsQuery.data as any)?.stats?.totalErrors ?? 0;
+  const errorRate =
+    typeof (healthQuery.data as any)?.health?.errorRate === "number"
+      ? (healthQuery.data as any).health.errorRate
+      : (errorStatsQuery.data as any)?.stats?.errorRate ?? 0;
 
-  // System health data for bar chart
-  const healthData = [
-    { name: 'CPU', value: health.cpu, color: health.cpu > 80 ? CHART_COLORS.error : CHART_COLORS.info },
-    { name: 'Memory', value: health.memory, color: health.memory > 80 ? CHART_COLORS.error : CHART_COLORS.info },
-    { name: 'Disk', value: health.disk, color: health.disk > 90 ? CHART_COLORS.error : CHART_COLORS.info },
-  ];
+  const threatLevel = (() => {
+    if (incidentsLast5m >= 6 || errorRate >= 6) return "critical";
+    if (incidentsLast5m >= 3 || errorRate >= 3) return "high";
+    if (incidentsLast5m >= 1 || errorRate >= 1) return "elevated";
+    return "normal";
+  })();
 
-  const getSeverityColor = (severity: string) => {
-    switch (severity) {
-      case 'critical':
-        return 'soldier';
-      case 'error':
-        return 'soldier';
-      case 'warn':
-        return 'queen';
-      default:
-        return 'default';
-    }
-  };
+  const columns = useMemo<Array<ColumnDef<Incident>>>(
+    () => [
+      {
+        header: "When",
+        accessorKey: "timestamp",
+        cell: (ctx) => (
+          <span className="text-xs text-gray-400">
+            {formatTime(ctx.row.original.timestamp)}
+          </span>
+        ),
+      },
+      {
+        header: "Severity",
+        accessorKey: "severity",
+        cell: (ctx) => (
+          <Badge
+            variant={severityVariant(ctx.row.original.severity)}
+            size="sm"
+            dot
+            pulse={ctx.row.original.severity !== "info"}
+          >
+            {ctx.row.original.severity}
+          </Badge>
+        ),
+      },
+      {
+        header: "Type",
+        accessorKey: "type",
+        cell: (ctx) => (
+          <span className="text-xs font-mono text-gray-300">
+            {ctx.row.original.type}
+          </span>
+        ),
+      },
+      {
+        header: "Message",
+        accessorKey: "data",
+        cell: (ctx) => (
+          <div className="min-w-0">
+            <div className="truncate text-gray-100">
+              {extractMessage(ctx.row.original)}
+            </div>
+            {(ctx.row.original.sessionKey || ctx.row.original.channel) && (
+              <div className="mt-0.5 text-[11px] text-gray-500 font-mono truncate">
+                {(ctx.row.original.sessionKey ?? "").slice(0, 48)}
+                {ctx.row.original.channel ? ` · ${ctx.row.original.channel}` : ""}
+              </div>
+            )}
+          </div>
+        ),
+      },
+      {
+        header: "Source",
+        accessorKey: "source",
+        cell: (ctx) => (
+          <span className="text-xs text-gray-400">{ctx.row.original.source}</span>
+        ),
+      },
+    ],
+    []
+  );
 
-  const formatTime = (timestamp: number) => {
-    return new Date(timestamp).toLocaleTimeString('en-US', {
-      hour: '2-digit',
-      minute: '2-digit',
-      second: '2-digit',
-    });
-  };
+  if (providerHealthQuery.isLoading && events.length === 0) {
+    return (
+      <div className="p-6 space-y-4">
+        <Skeleton variant="rectangular" height={120} />
+        <Skeleton variant="rectangular" height={420} />
+      </div>
+    );
+  }
 
-  const threatLevel =
-    totalErrors > 10
-      ? 'critical'
-      : totalErrors > 5
-      ? 'high'
-      : totalErrors > 0
-      ? 'elevated'
-      : 'normal';
-
-  const PIE_COLORS = ['#EF4444', '#DC2626', '#F59E0B', '#10B981', '#3B82F6'];
+  const providerSummary = (providerHealthQuery.data as any)?.summary as any;
+  const providers = ((providerHealthQuery.data as any)?.providers ?? []) as any[];
 
   return (
     <div className="h-full flex flex-col">
-      {/* Header */}
       <header className="flex items-center justify-between p-4 border-b border-chamber-wall">
         <div>
           <h1 className="text-2xl font-bold text-white flex items-center gap-3">
             <span className="text-3xl">🛡️</span>
             War Room
           </h1>
-          <p className="text-sm text-gray-400">Error Monitoring & Defense</p>
+          <p className="text-sm text-gray-400">
+            Incidents, Error Rate, Provider Defense
+          </p>
         </div>
         <div className="flex items-center gap-2">
           <Badge
-            variant={threatLevel === 'normal' ? 'nurse' : 'soldier'}
+            variant={threatLevel === "normal" ? "nurse" : "soldier"}
             dot
-            pulse={threatLevel !== 'normal'}
+            pulse={threatLevel !== "normal"}
           >
-            Threat: {threatLevel.charAt(0).toUpperCase() + threatLevel.slice(1)}
+            Threat: {threatLevel}
           </Badge>
+          <Button variant="secondary" size="sm" onClick={() => setRawOpen(true)}>
+            Transparency
+          </Button>
+          <Button variant="ghost" size="sm" onClick={clearEvents}>
+            Clear feed
+          </Button>
         </div>
       </header>
 
-      {/* Content */}
-      <div className="flex-1 overflow-y-auto p-4">
-        {/* Stats row */}
-        <div className="grid grid-cols-4 gap-4 mb-6">
-          {/* Threat meter */}
+      <div className="flex-1 overflow-y-auto p-4 space-y-4">
+        <div className="grid grid-cols-4 gap-4">
           <Card>
-            <h3 className="text-sm font-medium text-gray-400 mb-2">
-              Threat Level
-            </h3>
-            <div
-              className={`text-3xl font-bold ${
-                threatLevel === 'critical'
-                  ? 'text-soldier-alert'
-                  : threatLevel === 'high'
-                  ? 'text-soldier-rust'
-                  : threatLevel === 'elevated'
-                  ? 'text-queen-amber'
-                  : 'text-nurse-green'
-              }`}
-            >
-              {threatLevel.toUpperCase()}
-            </div>
-            <div className="mt-3 h-2 bg-chamber-dark rounded-full overflow-hidden">
-              <motion.div
-                className={`h-full ${
-                  threatLevel === 'critical'
-                    ? 'bg-soldier-alert'
-                    : threatLevel === 'high'
-                    ? 'bg-soldier-rust'
-                    : threatLevel === 'elevated'
-                    ? 'bg-queen-amber'
-                    : 'bg-nurse-green'
-                }`}
-                initial={{ width: 0 }}
-                animate={{ width: `${Math.min(100, totalErrors * 10)}%` }}
-              />
+            <div className="text-sm text-gray-400">Incidents (5m)</div>
+            <div className="mt-1 text-3xl font-bold text-white">{incidentsLast5m}</div>
+            <div className="mt-2 text-xs text-gray-500">from realtime events</div>
+          </Card>
+          <Card>
+            <div className="text-sm text-gray-400">Error rate</div>
+            <div className="mt-1 text-3xl font-bold text-white">{errorRate}/m</div>
+            <div className="mt-2 text-xs text-gray-500">
+              from `/api/health` / `/api/errors/stats`
             </div>
           </Card>
-
-          {/* Active soldiers */}
           <Card>
-            <h3 className="text-sm font-medium text-gray-400 mb-2">
-              Active Soldiers
-            </h3>
-            <div className="text-3xl font-bold text-soldier-rust">
-              {alarms.size}
-            </div>
-            <p className="text-sm text-gray-500 mt-1">Patrolling perimeter</p>
+            <div className="text-sm text-gray-400">Total errors</div>
+            <div className="mt-1 text-3xl font-bold text-white">{totalErrors}</div>
+            <div className="mt-2 text-xs text-gray-500">gateway counter</div>
           </Card>
-
-          {/* Total errors */}
           <Card>
-            <h3 className="text-sm font-medium text-gray-400 mb-2">
-              Total Errors
-            </h3>
-            <div className="text-3xl font-bold text-white">{totalErrors}</div>
-            <p className="text-sm text-gray-500 mt-1">Since last reset</p>
-          </Card>
-
-          {/* Queue depth */}
-          <Card>
-            <h3 className="text-sm font-medium text-gray-400 mb-2">
-              Queue Depth
-            </h3>
-            <div className="text-3xl font-bold text-architect-sky">
-              {health.queueDepth}
+            <div className="text-sm text-gray-400">Providers</div>
+            <div className="mt-1 text-3xl font-bold text-white">
+              {providerSummary?.healthy ?? 0}/{providerSummary?.total ?? providers.length}
             </div>
-            <p className="text-sm text-gray-500 mt-1">Messages waiting</p>
+            <div className="mt-2 text-xs text-gray-500">healthy / total</div>
           </Card>
         </div>
 
-        {/* Charts row */}
-        <div className="grid grid-cols-2 gap-4 mb-6">
-          {/* Error rate over time */}
-          <Card>
-            <h3 className="text-lg font-semibold text-white mb-4">
-              Error Rate (Last Hour)
-            </h3>
-            <div className="h-48">
-              <ResponsiveContainer width="100%" height="100%">
-                <AreaChart data={timeSeriesData}>
-                  <defs>
-                    <linearGradient id="errorGradient" x1="0" y1="0" x2="0" y2="1">
-                      <stop offset="5%" stopColor={CHART_COLORS.error} stopOpacity={0.8} />
-                      <stop offset="95%" stopColor={CHART_COLORS.error} stopOpacity={0} />
-                    </linearGradient>
-                    <linearGradient id="warnGradient" x1="0" y1="0" x2="0" y2="1">
-                      <stop offset="5%" stopColor={CHART_COLORS.warn} stopOpacity={0.8} />
-                      <stop offset="95%" stopColor={CHART_COLORS.warn} stopOpacity={0} />
-                    </linearGradient>
-                  </defs>
-                  <CartesianGrid strokeDasharray="3 3" stroke={CHART_COLORS.grid} />
-                  <XAxis
-                    dataKey="time"
-                    stroke={CHART_COLORS.text}
-                    fontSize={10}
-                    tickLine={false}
-                    interval={9}
+        <div className="grid grid-cols-12 gap-4">
+          <div className="col-span-8 space-y-3">
+            <Card>
+              <div className="flex items-center justify-between gap-3">
+                <div>
+                  <div className="text-lg font-semibold text-white">Incident Feed</div>
+                  <div className="text-xs text-gray-500">
+                    Click a row to open the inspector.
+                  </div>
+                </div>
+                <div className="flex items-center gap-2">
+                  <Input
+                    value={query}
+                    onChange={(e) => setQuery(e.target.value)}
+                    placeholder="Search message, type, sessionKey…"
+                    className="w-72"
                   />
-                  <YAxis
-                    stroke={CHART_COLORS.text}
-                    fontSize={10}
-                    tickLine={false}
-                    axisLine={false}
-                  />
-                  <Tooltip
-                    contentStyle={{
-                      backgroundColor: CHART_COLORS.background,
-                      border: `1px solid ${CHART_COLORS.grid}`,
-                      borderRadius: '8px',
-                    }}
-                    labelStyle={{ color: CHART_COLORS.text }}
-                  />
-                  <Area
-                    type="monotone"
-                    dataKey="errors"
-                    stroke={CHART_COLORS.error}
-                    fillOpacity={1}
-                    fill="url(#errorGradient)"
-                    name="Errors"
-                  />
-                  <Area
-                    type="monotone"
-                    dataKey="warns"
-                    stroke={CHART_COLORS.warn}
-                    fillOpacity={1}
-                    fill="url(#warnGradient)"
-                    name="Warnings"
-                  />
-                </AreaChart>
-              </ResponsiveContainer>
-            </div>
-          </Card>
+                  <select
+                    value={severity}
+                    onChange={(e) => setSeverity(e.target.value as any)}
+                    className="bg-chamber-dark border border-chamber-wall rounded-lg px-3 py-2 text-sm text-white"
+                  >
+                    <option value="all">All severities</option>
+                    <option value="critical">critical</option>
+                    <option value="error">error</option>
+                    <option value="warn">warn</option>
+                    <option value="info">info</option>
+                  </select>
+                </div>
+              </div>
 
-          {/* Error distribution */}
-          <Card>
-            <h3 className="text-lg font-semibold text-white mb-4">
-              Error Distribution
-            </h3>
-            <div className="h-48 flex items-center">
-              {errorDistribution.length > 0 ? (
+              <div className="mt-3">
+                <DataTable
+                  data={incidents}
+                  columns={columns}
+                  dense
+                  onRowClick={(row) => select({ type: "error", id: row.id })}
+                  empty={<div className="text-sm text-gray-500">No incidents captured yet.</div>}
+                />
+              </div>
+            </Card>
+
+            <Card>
+              <div className="text-lg font-semibold text-white mb-2">
+                Error/Warn rate (last hour)
+              </div>
+              <div className="h-64">
                 <ResponsiveContainer width="100%" height="100%">
-                  <PieChart>
-                    <Pie
-                      data={errorDistribution}
-                      cx="50%"
-                      cy="50%"
-                      innerRadius={40}
-                      outerRadius={70}
-                      paddingAngle={5}
-                      dataKey="value"
-                    >
-                      {errorDistribution.map((_, index) => (
-                        <Cell
-                          key={`cell-${index}`}
-                          fill={PIE_COLORS[index % PIE_COLORS.length]}
-                        />
-                      ))}
-                    </Pie>
-                    <Tooltip
-                      contentStyle={{
-                        backgroundColor: CHART_COLORS.background,
-                        border: `1px solid ${CHART_COLORS.grid}`,
-                        borderRadius: '8px',
-                      }}
-                      labelStyle={{ color: CHART_COLORS.text }}
+                  <AreaChart
+                    data={lastHourSeries}
+                    margin={{ left: 6, right: 6, top: 10, bottom: 0 }}
+                  >
+                    <CartesianGrid strokeDasharray="3 3" stroke="#1E293B" />
+                    <XAxis dataKey="time" tick={{ fontSize: 10, fill: "#94A3B8" }} interval={9} />
+                    <YAxis tick={{ fontSize: 10, fill: "#94A3B8" }} allowDecimals={false} />
+                    <Tooltip />
+                    <Area
+                      type="monotone"
+                      dataKey="warns"
+                      stroke="#F59E0B"
+                      fill="#F59E0B"
+                      fillOpacity={0.25}
                     />
-                  </PieChart>
+                    <Area
+                      type="monotone"
+                      dataKey="errors"
+                      stroke="#EF4444"
+                      fill="#EF4444"
+                      fillOpacity={0.25}
+                    />
+                  </AreaChart>
                 </ResponsiveContainer>
-              ) : (
-                <div className="w-full text-center text-gray-500">
-                  <span className="text-4xl">✅</span>
-                  <p className="mt-2">No errors to display</p>
-                </div>
-              )}
-              {errorDistribution.length > 0 && (
-                <div className="flex-shrink-0 space-y-2">
-                  {errorDistribution.map((item, i) => (
-                    <div key={item.name} className="flex items-center gap-2 text-xs">
-                      <span
-                        className="w-3 h-3 rounded"
-                        style={{ backgroundColor: PIE_COLORS[i % PIE_COLORS.length] }}
-                      />
-                      <span className="text-gray-400 truncate max-w-[120px]">
-                        {item.name}
-                      </span>
-                      <span className="text-white font-medium">{item.value}</span>
-                    </div>
-                  ))}
-                </div>
-              )}
-            </div>
-          </Card>
-        </div>
-
-        {/* System health */}
-        <div className="grid grid-cols-3 gap-4 mb-6">
-          <Card className="col-span-1">
-            <h3 className="text-lg font-semibold text-white mb-4">
-              System Health
-            </h3>
-            <div className="h-40">
-              <ResponsiveContainer width="100%" height="100%">
-                <BarChart data={healthData} layout="vertical">
-                  <CartesianGrid strokeDasharray="3 3" stroke={CHART_COLORS.grid} />
-                  <XAxis
-                    type="number"
-                    domain={[0, 100]}
-                    stroke={CHART_COLORS.text}
-                    fontSize={10}
-                  />
-                  <YAxis
-                    type="category"
-                    dataKey="name"
-                    stroke={CHART_COLORS.text}
-                    fontSize={12}
-                    width={60}
-                  />
-                  <Tooltip
-                    contentStyle={{
-                      backgroundColor: CHART_COLORS.background,
-                      border: `1px solid ${CHART_COLORS.grid}`,
-                      borderRadius: '8px',
-                    }}
-                    formatter={(value: number) => [`${value}%`]}
-                  />
-                  <Bar dataKey="value" radius={4}>
-                    {healthData.map((entry, index) => (
-                      <Cell key={`cell-${index}`} fill={entry.color} />
-                    ))}
-                  </Bar>
-                </BarChart>
-              </ResponsiveContainer>
-            </div>
-          </Card>
-
-          {/* Error log */}
-          <Card className="col-span-2">
-            <div className="flex items-center justify-between mb-4">
-              <h3 className="text-lg font-semibold text-white">Error Log</h3>
-              <Button variant="ghost" size="sm">
-                Clear All
-              </Button>
-            </div>
-
-            {errorEvents.length === 0 ? (
-              <div className="text-center py-8">
-                <span className="text-4xl">✅</span>
-                <h3 className="text-lg font-semibold text-white mt-2">
-                  All Clear
-                </h3>
-                <p className="text-gray-400 text-sm">
-                  No errors detected. Colony is secure.
-                </p>
               </div>
-            ) : (
-              <div className="space-y-2 max-h-40 overflow-y-auto">
-                {errorEvents
-                  .slice(-10)
-                  .reverse()
-                  .map((event, i) => (
-                    <motion.div
-                      key={event.id}
-                      initial={{ opacity: 0, x: -20 }}
-                      animate={{ opacity: 1, x: 0 }}
-                      transition={{ delay: i * 0.02 }}
-                      className="p-2 bg-chamber-dark rounded-lg border border-soldier-rust/30"
+            </Card>
+          </div>
+
+          <div className="col-span-4 space-y-4">
+            <Card>
+              <div className="flex items-center justify-between">
+                <div className="text-lg font-semibold text-white">Provider Health</div>
+                <Badge variant="default">{providers.length}</Badge>
+              </div>
+              <div className="mt-3 space-y-2">
+                {providers.length === 0 ? (
+                  <div className="text-sm text-gray-500">No providers.</div>
+                ) : (
+                  providers.slice(0, 8).map((p) => (
+                    <div
+                      key={p.id}
+                      className="p-2 rounded-lg border border-chamber-wall bg-chamber-dark"
                     >
-                      <div className="flex items-start justify-between">
-                        <div className="flex items-start gap-2">
-                          <span className="text-soldier-alert text-sm">⚠️</span>
-                          <div>
-                            <div className="text-xs font-medium text-white">
-                              {event.type.replace(/_/g, ' ').toUpperCase()}
-                            </div>
-                            <div className="text-xs text-gray-400 mt-0.5 truncate max-w-[300px]">
-                              {String((event.data as { message?: string })?.message || JSON.stringify(event.data)).slice(0, 120)}
-                              {String((event.data as { message?: string })?.message || JSON.stringify(event.data)).length > 120 && '...'}
-                            </div>
-                          </div>
+                      <div className="flex items-center justify-between gap-2">
+                        <div className="min-w-0">
+                          <div className="text-sm text-white truncate">{p.name ?? p.id}</div>
+                          <div className="text-[11px] text-gray-500 font-mono truncate">{p.model}</div>
                         </div>
-                        <div className="flex items-center gap-2">
-                          <span className="text-xs text-gray-500">
-                            {formatTime(event.timestamp)}
-                          </span>
-                          <Badge
-                            variant={getSeverityColor(event.severity)}
-                            size="sm"
-                          >
-                            {event.severity}
-                          </Badge>
-                        </div>
+                        <Badge
+                          variant={
+                            p.status === "healthy"
+                              ? "nurse"
+                              : p.status === "cooldown"
+                                ? "architect"
+                                : p.status === "degraded"
+                                  ? "queen"
+                                  : "soldier"
+                          }
+                          size="sm"
+                          dot
+                          pulse={p.status !== "healthy"}
+                        >
+                          {p.status}
+                        </Badge>
                       </div>
-                    </motion.div>
-                  ))}
+                      <div className="mt-1 text-[11px] text-gray-400 flex items-center gap-3">
+                        <span>req {p.stats?.requestCount ?? 0}</span>
+                        <span>err {Math.round(p.stats?.errorRate ?? 0)}%</span>
+                        {p.cooldown?.until ? <span>cooldown {formatTime(p.cooldown.until)}</span> : null}
+                      </div>
+                    </div>
+                  ))
+                )}
               </div>
-            )}
-          </Card>
+            </Card>
+
+            <Card>
+              <div className="text-lg font-semibold text-white">Defense Notes</div>
+              <div className="mt-2 text-sm text-gray-400 space-y-1">
+                <div>- Incidents are live events (no reconstruction).</div>
+                <div>- Click any incident to inspect raw payload + classify.</div>
+                <div>- Provider cooldowns come from `/api/providers/health`.</div>
+              </div>
+            </Card>
+          </div>
         </div>
       </div>
+
+      <Modal isOpen={rawOpen} onClose={() => setRawOpen(false)} title="Transparency" size="xl">
+        <div className="grid grid-cols-2 gap-4">
+          <JsonPanel
+            title="Errors stats"
+            endpoint="/api/errors/stats"
+            value={errorStatsQuery.data ?? { loading: true }}
+          />
+          <JsonPanel title="Health" endpoint="/api/health" value={healthQuery.data ?? { loading: true }} />
+          <div className="col-span-2">
+            <JsonPanel
+              title="Provider health"
+              endpoint="/api/providers/health"
+              value={providerHealthQuery.data ?? { loading: true }}
+            />
+          </div>
+        </div>
+      </Modal>
     </div>
   );
 };
+

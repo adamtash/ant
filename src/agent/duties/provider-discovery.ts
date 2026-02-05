@@ -92,6 +92,32 @@ function buildRemoteProviders(now: number): DiscoveredProviderRecord[] {
   return providers;
 }
 
+export function countRemoteDiscoveryCandidates(): number {
+  const globalModel = envStr("ANT_BACKUP_MODEL");
+  let count = 0;
+  for (const candidate of REMOTE_CANDIDATES) {
+    const apiKey = envStr(candidate.apiKeyEnv);
+    if (!apiKey) continue;
+    const model = envStr(candidate.modelEnv) || globalModel;
+    if (!model) continue;
+    count += 1;
+  }
+  return count;
+}
+
+export function countLocalDiscoveryCandidates(cfg: AntConfig): number {
+  const localCfg = cfg.resolved.providers.local;
+  if (!localCfg?.enabled) return 0;
+  let count = 0;
+  if (localCfg.ollama?.enabled) count += 1;
+  if (localCfg.lmstudio?.enabled) count += 1;
+  return count;
+}
+
+export function countDiscoveryCandidates(cfg: AntConfig): number {
+  return countLocalDiscoveryCandidates(cfg) + countRemoteDiscoveryCandidates();
+}
+
 export type ProviderDiscoverySummary = {
   added: string[];
   removed: string[];
@@ -172,4 +198,3 @@ export async function runProviderDiscovery(params: {
     runtimes: local.runtimes,
   };
 }
-

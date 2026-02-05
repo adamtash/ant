@@ -49,8 +49,11 @@ export class MainAgent {
   private autonomousRunning = false;
   private readonly agentId: string;
   private lastErrorScanAt = Date.now();
+  private errorScanTimer: NodeJS.Timeout | null = null;
+  private errorScanInFlight = false;
   private readonly errorInvestigationCooldownMs = 15 * 60 * 1000;
   private readonly investigatedErrors = new Map<string, number>();
+  private readonly incidentTasks = new Map<string, { summary: string }>();
   private readonly providerDiscovery: ProviderDiscoveryService;
   private survivalMode = false;
   private lastSurvivalAttemptAt = 0;
@@ -133,6 +136,7 @@ export class MainAgent {
   set config(next: AntConfig) {
     this._config = next;
     this.providerDiscovery.setConfig(next);
+    this.restartErrorScanLoop();
   }
 
   async start(): Promise<void> {
@@ -155,6 +159,7 @@ export class MainAgent {
     await this.sendStartupMessage();
     await this.runStartupHealthCheck();
 
+    this.restartErrorScanLoop();
     this.runCycle();
   }
 
@@ -162,6 +167,7 @@ export class MainAgent {
     this.running = false;
     this.paused = false;
     this.timeoutMonitor.stop();
+    this.stopErrorScanLoop();
     if (this.timer) clearTimeout(this.timer);
     this.logger.info("Main Agent loop stopped");
   }
@@ -207,13 +213,18 @@ export class MainAgent {
     return task.taskId;
   }
 
-  async assignMaintenanceTask(description: string, maxRetries?: number): Promise<string> {
+  async assignMaintenanceTask(
+    description: string,
+    maxRetries?: number,
+    opts?: { tags?: string[] },
+  ): Promise<string> {
     const retries = maxRetries ?? this.config.agentExecution?.tasks?.defaults?.maxRetries ?? 3;
     const sessionKey = buildAgentTaskSessionKey({
       agentId: this.agentId,
       taskId: crypto.randomUUID(),
     });
 
+    const tags = Array.isArray(opts?.tags) ? opts?.tags : ["investigation"];
     const task = await this.taskStore.create({
       description,
       sessionKey,
@@ -221,7 +232,7 @@ export class MainAgent {
       metadata: {
         channel: "cli",
         priority: "high",
-        tags: ["investigation"],
+        tags,
       },
       retries: { maxAttempts: retries },
       timeoutMs: this.config.agentExecution?.tasks?.defaults?.timeoutMs ?? 120_000,
@@ -259,6 +270,7 @@ export class MainAgent {
 
       await this.taskStore.setResult(task.taskId, result);
       await this.taskStore.updateStatus(task.taskId, "succeeded");
+      await this.maybeNotifyIncidentResult(task, { ok: true, result });
 
       return result;
     } catch (err) {
@@ -331,6 +343,7 @@ export class MainAgent {
     if (attempted >= maxAttempts) {
       await this.taskStore.update(task.taskId, { error });
       await this.taskStore.updateStatus(task.taskId, "failed", error);
+      await this.maybeNotifyIncidentResult(task, { ok: false, error });
       return;
     }
 
@@ -374,6 +387,7 @@ export class MainAgent {
   private async handleTimeout(task: TaskEntry, reason: string): Promise<void> {
     await this.taskStore.update(task.taskId, { error: reason });
     await this.taskStore.updateStatus(task.taskId, "failed", reason);
+    await this.maybeNotifyIncidentResult(task, { ok: false, error: reason });
 
     await createEventPublishers(getEventStream()).taskTimeout({
       taskId: task.taskId,
@@ -391,7 +405,6 @@ export class MainAgent {
 
     try {
       await this.runProviderMaintenance();
-      await this.scanForErrorsAndSpawnInvestigations();
       const active = await this.taskStore.getActiveTasks();
       if (active.length === 0 && !this.autonomousRunning) {
         this.autonomousRunning = true;
@@ -421,11 +434,11 @@ export class MainAgent {
       healthCheckIntervalMinutes:
         typeof discovery.healthCheckIntervalMinutes === "number" && discovery.healthCheckIntervalMinutes > 0
           ? discovery.healthCheckIntervalMinutes
-          : 15,
+          : 120,
       minBackupProviders:
         typeof discovery.minBackupProviders === "number" && discovery.minBackupProviders >= 0
           ? discovery.minBackupProviders
-          : 2,
+          : 1,
     };
   }
 
@@ -440,7 +453,10 @@ export class MainAgent {
       const shouldAttempt = now - this.lastSurvivalAttemptAt >= this.survivalAttemptCooldownMs;
       if (!this.survivalMode) {
         this.survivalMode = true;
-        await this.notifyOwners("⚠️ All providers appear down. Entering survival mode and attempting recovery.");
+        await this.notifyOwners(
+          "⚠️ All providers appear down. Entering survival mode and attempting recovery.",
+          { kind: "providers" },
+        );
       }
       if (shouldAttempt) {
         this.lastSurvivalAttemptAt = now;
@@ -453,14 +469,14 @@ export class MainAgent {
       const recovered = await this.agentEngine.hasHealthyProvider();
       if (recovered) {
         this.survivalMode = false;
-        await this.notifyOwners("✅ Provider recovery succeeded. Survival mode cleared.");
+        await this.notifyOwners("✅ Provider recovery succeeded. Survival mode cleared.", { kind: "providers" });
       }
       return;
     }
 
     if (this.survivalMode) {
       this.survivalMode = false;
-      await this.notifyOwners("✅ Providers recovered. Survival mode cleared.");
+      await this.notifyOwners("✅ Providers recovered. Survival mode cleared.", { kind: "providers" });
     }
 
     if (!settings.enabled) return;
@@ -469,7 +485,13 @@ export class MainAgent {
     if (now - this.lastProviderHealthCheckAt >= healthIntervalMs) {
       this.lastProviderHealthCheckAt = now;
       try {
-        await this.providerDiscovery.runHealthCheck();
+        const result = await this.providerDiscovery.runHealthCheck();
+        if (result.ok && result.removedIds && result.removedIds.length > 0) {
+          await this.notifyOwners(
+            `🩺 Provider health: removed failing providers: ${result.removedIds.join(", ")}`,
+            { kind: "providers" },
+          );
+        }
       } catch (err) {
         this.logger.debug({ error: err instanceof Error ? err.message : String(err) }, "Provider health check failed");
       }
@@ -481,10 +503,23 @@ export class MainAgent {
       try {
         const result = await this.providerDiscovery.runDiscovery({ mode: "scheduled" });
         if (result.ok && result.overlay) {
+          const added = result.summary?.added ?? [];
+          const removed = result.summary?.removed ?? [];
+          if (added.length > 0 || removed.length > 0) {
+            const parts: string[] = [];
+            if (added.length > 0) parts.push(`Added: ${added.join(", ")}`);
+            if (removed.length > 0) parts.push(`Removed: ${removed.join(", ")}`);
+            await this.notifyOwners(
+              `🛰️ Provider discovery update\n\n${parts.join("\n")}`,
+              { kind: "providers" },
+            );
+          }
+
           const providerCount = Object.keys(result.overlay.providers).length;
           if (providerCount < settings.minBackupProviders) {
             await this.notifyOwners(
-              `⚠️ Provider discovery: only ${providerCount}/${settings.minBackupProviders} backup providers verified. Set API key/model env vars or enable local runtimes.`
+              `⚠️ Provider discovery: only ${providerCount}/${settings.minBackupProviders} backup providers verified. Set API key/model env vars or enable local runtimes.`,
+              { kind: "providers" },
             );
           }
         }
@@ -553,20 +588,41 @@ export class MainAgent {
       this.investigatedErrors.set(key, now);
 
       const description = `${err.summary}\n\n${err.details}\n\n${(await import("./templates/investigation.js")).INVESTIGATION_SUBAGENT_PROMPT}`;
-      const taskId = await this.assignMaintenanceTask(description, 2);
+      const taskId = await this.assignMaintenanceTask(description, 2, { tags: ["incident", "investigation"] });
       spawned += 1;
 
+      this.incidentTasks.set(taskId, { summary: err.summary });
+
       await this.notifyOwners(
-        `🔍 Detected error. Starting investigation.\n\n*Task*: ${taskId}\n*Summary*: ${err.summary}`
+        `🔍 Detected error. Starting investigation.\n\n*Task*: ${taskId}\n*Summary*: ${err.summary}`,
+        { kind: "errors" },
       );
     }
   }
 
-  private async notifyOwners(message: string): Promise<void> {
+  private async notifyOwners(
+    message: string,
+    opts?: { kind?: keyof AntConfig["mainAgent"]["notifyOn"]; force?: boolean },
+  ): Promise<void> {
+    if (!this.sendMessage) return;
+    const kind = opts?.kind;
+    if (!opts?.force && kind && this.config.mainAgent?.notifyOn?.[kind] === false) {
+      return;
+    }
+
+    const explicit = this.config.mainAgent?.notifySessions ?? [];
     const ownerJids = this.config.whatsapp?.ownerJids || [];
     const startupRecipients = this.config.whatsapp?.startupRecipients || [];
-    const recipients = startupRecipients.length > 0 ? startupRecipients : ownerJids;
-    if (recipients.length === 0 || !this.sendMessage) return;
+    const fallback = startupRecipients.length > 0 ? startupRecipients : ownerJids;
+    const recipients = Array.from(
+      new Set(
+        [...explicit, ...fallback]
+          .map((value) => String(value || "").trim())
+          .filter(Boolean)
+      )
+    );
+
+    if (recipients.length === 0) return;
 
     for (const jid of recipients) {
       try {
@@ -575,6 +631,81 @@ export class MainAgent {
         this.logger.debug({ error: err instanceof Error ? err.message : String(err), jid }, "Failed to notify owner");
       }
     }
+  }
+
+  private restartErrorScanLoop(): void {
+    this.stopErrorScanLoop();
+    if (!this.running) return;
+    const intervalMs = this.config.mainAgent?.errorScanIntervalMs ?? 30_000;
+    this.errorScanTimer = setInterval(() => {
+      void this.tickErrorScan();
+    }, Math.max(1000, intervalMs));
+    this.errorScanTimer.unref?.();
+  }
+
+  private stopErrorScanLoop(): void {
+    if (this.errorScanTimer) {
+      clearInterval(this.errorScanTimer);
+      this.errorScanTimer = null;
+    }
+  }
+
+  private async tickErrorScan(): Promise<void> {
+    if (!this.running) return;
+    if (this.paused) return;
+    if (this.errorScanInFlight) return;
+    this.errorScanInFlight = true;
+    try {
+      await this.scanForErrorsAndSpawnInvestigations();
+    } finally {
+      this.errorScanInFlight = false;
+    }
+  }
+
+  private async maybeNotifyIncidentResult(
+    task: TaskEntry,
+    outcome: { ok: true; result: TaskResult } | { ok: false; error: string },
+  ): Promise<void> {
+    if (!this.config.mainAgent?.notifyOn?.incidentResults) return;
+    if (!task.metadata?.tags?.includes("incident")) return;
+
+    const tracked = this.incidentTasks.get(task.taskId);
+    const summary = tracked?.summary || "incident";
+
+    if (outcome.ok) {
+      this.incidentTasks.delete(task.taskId);
+      const snippet = summarizeText(outcome.result.content, 900);
+      const tools = outcome.result.toolsUsed?.length ? `\n*Tools*: ${outcome.result.toolsUsed.join(", ")}` : "";
+      await this.notifyOwners(
+        `✅ Investigation complete.\n\n*Task*: ${task.taskId}\n*Summary*: ${summary}${tools}\n\n${snippet}`,
+        { kind: "incidentResults" },
+      );
+      return;
+    }
+
+    this.incidentTasks.delete(task.taskId);
+    await this.notifyOwners(
+      `❌ Investigation failed.\n\n*Task*: ${task.taskId}\n*Summary*: ${summary}\n*Error*: ${outcome.error}`,
+      { kind: "incidentResults" },
+    );
+  }
+
+  private async maybeNotifyAutonomousUpdate(response: string): Promise<void> {
+    if (!this.config.mainAgent?.notifyOn?.improvements) return;
+    const raw = String(response || "");
+    if (!raw) return;
+    const shouldNotify =
+      raw.includes("<promise>ISSUES_FOUND</promise>") || raw.includes("<promise>IMPROVEMENT_IDEA</promise>");
+    if (!shouldNotify) return;
+
+    const match = raw.match(/<owner_update>\s*([\s\S]*?)\s*<\/owner_update>/i);
+    const update = (match?.[1] || "").trim();
+    const fallback = summarizeText(stripPromises(raw), 900);
+
+    await this.notifyOwners(
+      `🧠 Main Agent update\n\n${update || fallback}`,
+      { kind: "improvements" },
+    );
   }
 
   private async scanLogForErrors(
@@ -637,35 +768,14 @@ export class MainAgent {
   }
 
   private async sendStartupMessage(): Promise<void> {
-    const ownerJids = this.config.whatsapp?.ownerJids || [];
-    const startupRecipients = this.config.whatsapp?.startupRecipients || [];
-    const recipients = startupRecipients.length > 0 ? startupRecipients : ownerJids;
-
-    if (recipients.length === 0 || !this.sendMessage) {
-      this.logger.debug("No WhatsApp recipients configured for startup message");
-      return;
-    }
-
     const message = "🤖 *Queen Ant Started*\n\nAutonomous work mode is now active!";
-
-    for (const jid of recipients) {
-      try {
-        await this.sendMessage(jid, message);
-        this.logger.info({ jid }, "Startup message sent to owner");
-      } catch (err) {
-        this.logger.warn({ error: err, jid }, "Failed to send startup message to owner");
-      }
-    }
+    await this.notifyOwners(message, { force: true });
   }
 
   private async runStartupHealthCheck(): Promise<void> {
     if (this.startupHealthCheckDone) return;
 
     this.logger.info("Running startup health check...");
-
-    const ownerJids = this.config.whatsapp?.ownerJids || [];
-    const startupRecipients = this.config.whatsapp?.startupRecipients || [];
-    const recipients = startupRecipients.length > 0 ? startupRecipients : ownerJids;
 
     try {
       const duties = await this.loadDuties();
@@ -690,35 +800,14 @@ export class MainAgent {
       );
 
       this.startupHealthCheckDone = true;
-
-      if (recipients.length > 0 && this.sendMessage) {
-        const message = result.response || "🤖 Startup health check completed.";
-
-        for (const jid of recipients) {
-          try {
-            await this.sendMessage(jid, message);
-            this.logger.info({ jid }, "Startup health check sent to owner");
-          } catch (err) {
-            this.logger.warn({ error: err, jid }, "Failed to send health check to owner");
-          }
-        }
-      } else {
-        this.logger.info("No WhatsApp recipients configured for startup health check");
-      }
+      await this.notifyOwners(result.response || "🤖 Startup health check completed.", { force: true });
     } catch (err) {
       this.logger.error({ error: err }, "Startup health check failed");
 
-      if (recipients.length > 0 && this.sendMessage) {
-        const errorMessage = `🤖 *Startup Health Check*\n\n❌ Health check failed:\n${err instanceof Error ? err.message : String(err)}`;
-
-        for (const jid of recipients) {
-          try {
-            await this.sendMessage(jid, errorMessage);
-          } catch {
-            // Ignore send errors
-          }
-        }
-      }
+      await this.notifyOwners(
+        `🤖 *Startup Health Check*\n\n❌ Health check failed:\n${err instanceof Error ? err.message : String(err)}`,
+        { force: true },
+      );
     }
   }
 
@@ -730,7 +819,7 @@ export class MainAgent {
       scope: "system",
     });
     const result = await this.agentEngine.execute({
-      query: `Execute your duties as the Autonomous Main Agent.\n\nPHILOSOPHY: Work like an expert software engineer - investigate, fix, test, iterate.\n\nCurrent Duties:\n${duties}\n\nAUTONOMOUS WORKFLOW:\n1. CHECK: Run diagnostics to find issues\n   - Check logs for errors\n   - Test endpoints\n   - Verify WhatsApp connectivity\n\n2. INVESTIGATE: If issues found\n   - Read relevant code\n   - Analyze root cause\n   - Search memory for context\n\n3. FIX: Implement solution\n   - Make minimal changes\n   - Follow existing patterns\n   - Update tests if needed\n\n4. TEST: Verify the fix\n   - Run tests\n   - Check functionality\n   - Confirm resolution\n\n5. IMPROVE: Look for enhancements\n   - Code quality improvements\n   - Performance optimizations\n   - Better error handling\n\n6. REPORT: Log actions taken\n   - What was checked\n   - What was found\n   - What was done\n   - Results\n\nOutput <promise>DUTY_CYCLE_COMPLETE</promise> when finished.\nOutput <promise>ISSUES_FOUND</promise> if you found and fixed issues.`,
+      query: `Execute your duties as the Autonomous Main Agent.\n\nPHILOSOPHY: Work like an expert software engineer - investigate, fix, test, iterate.\n\nCurrent Duties:\n${duties}\n\nAUTONOMOUS WORKFLOW:\n1. CHECK: Run diagnostics to find issues\n   - Check logs for errors\n   - Test endpoints\n   - Verify WhatsApp connectivity\n\n2. INVESTIGATE: If issues found\n   - Read relevant code\n   - Analyze root cause\n   - Search memory for context\n\n3. FIX: Implement solution\n   - Make minimal changes\n   - Follow existing patterns\n   - Update tests if needed\n\n4. TEST: Verify the fix\n   - Run tests\n   - Check functionality\n   - Confirm resolution\n\n5. IMPROVE: Look for enhancements\n   - Code quality improvements\n   - Performance optimizations\n   - Better error handling\n\n6. REPORT: Log actions taken\n   - What was checked\n   - What was found\n   - What was done\n   - Results\n\nOUTPUT RULES:\n- Output <promise>DUTY_CYCLE_COMPLETE</promise> when finished.\n- Output <promise>ISSUES_FOUND</promise> if you found and fixed issues.\n- Output <promise>IMPROVEMENT_IDEA</promise> if you have a notable improvement idea worth notifying the owner.\n- If you output ISSUES_FOUND or IMPROVEMENT_IDEA, include a short owner update block:\n  <owner_update>\n  - 1-6 bullet points\n  </owner_update>\n  Do NOT include secrets or tokens.\n`,
       sessionKey,
       chatId: "system",
       channel: "cli",
@@ -744,6 +833,7 @@ export class MainAgent {
       result.model
     );
 
+    await this.maybeNotifyAutonomousUpdate(result.response);
     this.logger.info("Main Agent duty cycle complete");
   }
 
@@ -797,4 +887,15 @@ export class MainAgent {
       this.logger.warn({ error: err, sessionKey }, "Failed to persist Main Agent message");
     }
   }
+}
+
+function stripPromises(text: string): string {
+  return String(text || "").replace(/<promise>[^<]*<\/promise>/gi, "").trim();
+}
+
+function summarizeText(text: string, maxLen: number): string {
+  const normalized = String(text || "").replace(/\r\n/g, "\n").trim();
+  if (!normalized) return "";
+  if (normalized.length <= maxLen) return normalized;
+  return normalized.slice(0, maxLen).trimEnd() + "…";
 }

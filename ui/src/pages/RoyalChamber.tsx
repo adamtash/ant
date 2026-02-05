@@ -3,16 +3,18 @@
  * Main dashboard - the queen's view of the colony
  */
 
-import React, { useEffect, useState } from 'react';
+import React, { useEffect } from 'react';
 import { motion } from 'framer-motion';
 import { useNavigate } from 'react-router-dom';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useColonyStore } from '../stores/colonyStore';
-import { useSystemStore } from '../stores/systemStore';
 import { useUIStore } from '../stores/uiStore';
-import { Card, Badge, Button, Skeleton } from '../components/base';
+import { Card, Badge, Button, Input, Modal, Skeleton } from '../components/base';
 import { ColonyScene3D } from '../colony/renderer/ColonyScene3D';
-import { getProviderHealth, getWebSocketClient } from '../api/client';
-import type { StatusResponse, SubagentRecord, SystemEvent } from '../api/types';
+import { assignMainAgentTask, createTask, pauseMainAgent, resumeMainAgent, getProviderHealth, getStatus } from '../api/client';
+import type { SubagentRecord } from '../api/types';
+import { useEventsStore } from '../state/eventsStore';
+import { JsonPanel } from '../components/ops';
 
 // ============================================
 // Provider Health Component
@@ -406,65 +408,6 @@ const ThreatMeter: React.FC<ThreatMeterProps> = ({ errorRate, recentErrors }) =>
 };
 
 // ============================================
-// Quick Actions Component
-// ============================================
-
-const QuickActions: React.FC = () => {
-  const { navigateTo } = useUIStore();
-  const { spawnAnt } = useColonyStore();
-  const { addToast } = useUIStore();
-
-  const handleSpawnWorker = () => {
-    const id = spawnAnt('worker', { x: 400, y: 300 });
-    addToast({
-      type: 'success',
-      title: 'Worker Spawned',
-      message: `Worker ${id} has been created`,
-    });
-  };
-
-  return (
-    <Card>
-      <h3 className="text-lg font-semibold text-white mb-4">Quick Actions</h3>
-      <div className="grid grid-cols-2 gap-3">
-        <Button
-          variant="primary"
-          size="sm"
-          onClick={handleSpawnWorker}
-          icon={<span>🐜</span>}
-        >
-          Spawn Worker
-        </Button>
-        <Button
-          variant="secondary"
-          size="sm"
-          onClick={() => navigateTo('foraging')}
-          icon={<span>📋</span>}
-        >
-          View Tasks
-        </Button>
-        <Button
-          variant="secondary"
-          size="sm"
-          onClick={() => navigateTo('archive')}
-          icon={<span>📚</span>}
-        >
-          Memory
-        </Button>
-        <Button
-          variant="secondary"
-          size="sm"
-          onClick={() => navigateTo('war')}
-          icon={<span>🛡️</span>}
-        >
-          War Room
-        </Button>
-      </div>
-    </Card>
-  );
-};
-
-// ============================================
 // Scene Controls Component
 // ============================================
 
@@ -513,79 +456,71 @@ const SceneControls: React.FC = () => {
 
 export const RoyalChamber: React.FC = () => {
   const navigate = useNavigate();
-  const [status, setStatus] = useState<StatusResponse | null>(null);
-  const [providers, setProviders] = useState<ProviderHealthData[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  const queryClient = useQueryClient();
+  const { addToast } = useUIStore();
+  const { queen } = useColonyStore();
+  const events = useEventsStore((s) => s.events);
 
-  const { queen, isRunning } = useColonyStore();
-  const { queenThinking, totalErrors } = useSystemStore();
+  const [rawOpen, setRawOpen] = React.useState(false);
+  const [dutyText, setDutyText] = React.useState("");
+  const [quickTask, setQuickTask] = React.useState("");
 
-  // Subscribe to WebSocket status updates
-  useEffect(() => {
-    let wsClient = getWebSocketClient({
-      onEvent: (event: SystemEvent) => {
-        if (event.type === 'status_updated' || event.type === 'status_snapshot') {
-          const statusData = (event.data as any)?.data ?? (event.data as any);
-          if (statusData) {
-            setStatus(statusData as StatusResponse);
-            setError(null);
-          }
-        }
+  const statusQuery = useQuery({
+    queryKey: ['status'],
+    queryFn: getStatus,
+  });
 
-        if (event.type === 'status_delta') {
-          const changes = (event.data as any)?.changes as Record<string, unknown> | undefined;
-          if (changes) {
-            setStatus((prev) => (prev ? ({ ...prev, ...changes } as StatusResponse) : prev));
-          }
-        }
-      },
-      onConnect: () => {
-        console.log('RoyalChamber: Connected to status updates');
-        setError(null); // Clear error on successful connection
-      },
-      onDisconnect: () => {
-        console.log('RoyalChamber: Disconnected from status updates');
-      },
-      onError: (error) => {
-        console.error('RoyalChamber: WebSocket error:', error);
-        console.error('RoyalChamber: Error details:', {
-          type: error.type,
-          message: error instanceof Event ? 'WebSocket connection error' : String(error),
-          timestamp: new Date().toISOString(),
-        });
-        setError('WebSocket connection failed');
-      },
-    });
+  const providerHealthQuery = useQuery({
+    queryKey: ['providerHealth'],
+    queryFn: getProviderHealth,
+    refetchInterval: 10_000,
+  });
 
-    wsClient.connect();
-    setLoading(false);
+  const status = statusQuery.data ?? null;
+  const providers = (providerHealthQuery.data as any)?.providers ?? [];
+  const error = (statusQuery.error as Error | undefined)?.message ?? null;
 
-    return () => {
-      wsClient.disconnect();
-    };
-  }, []);
+  const pauseMutation = useMutation({
+    mutationFn: pauseMainAgent,
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ["status"] });
+      addToast({ type: "success", title: "Queen paused" });
+    },
+    onError: (err) => addToast({ type: "error", title: "Pause failed", message: err instanceof Error ? err.message : String(err) }),
+  });
 
-  // Fetch provider health occasionally (can stay as REST since it's less critical)
-  useEffect(() => {
-    const fetchProviders = async () => {
-      try {
-        const providerData = await getProviderHealth().catch(() => ({ ok: true, providers: [] }));
-        setProviders(providerData.providers ?? []);
-      } catch (err) {
-        console.error('Failed to fetch provider health:', err);
-      }
-    };
+  const resumeMutation = useMutation({
+    mutationFn: resumeMainAgent,
+    onSuccess: async () => {
+      await queryClient.invalidateQueries({ queryKey: ["status"] });
+      addToast({ type: "success", title: "Queen resumed" });
+    },
+    onError: (err) => addToast({ type: "error", title: "Resume failed", message: err instanceof Error ? err.message : String(err) }),
+  });
 
-    fetchProviders();
-    const interval = setInterval(fetchProviders, 10000); // Every 10 seconds
-    return () => clearInterval(interval);
-  }, []);
+  const assignDutyMutation = useMutation({
+    mutationFn: (description: string) => assignMainAgentTask(description),
+    onSuccess: async () => {
+      setDutyText("");
+      await queryClient.invalidateQueries({ queryKey: ["status"] });
+      addToast({ type: "success", title: "Duty assigned" });
+    },
+    onError: (err) => addToast({ type: "error", title: "Assign failed", message: err instanceof Error ? err.message : String(err) }),
+  });
+
+  const quickTaskMutation = useMutation({
+    mutationFn: (prompt: string) => createTask(prompt),
+    onSuccess: async () => {
+      setQuickTask("");
+      await queryClient.invalidateQueries({ queryKey: ["tasks"] });
+      addToast({ type: "success", title: "Task queued" });
+    },
+    onError: (err) => addToast({ type: "error", title: "Task failed", message: err instanceof Error ? err.message : String(err) }),
+  });
 
   // Sync Queen to Main Agent status
   useEffect(() => {
     const colonyStore = useColonyStore.getState();
-    const systemStore = useSystemStore.getState();
     
     if (status?.mainAgent) {
       // Activate queen if main agent is enabled
@@ -602,18 +537,22 @@ export const RoyalChamber: React.FC = () => {
         t => t.status === 'running'
       );
       colonyStore.setQueenThinking(hasActiveTask ?? false);
-      systemStore.queenThinking = hasActiveTask ?? false;
     }
   }, [status]);
 
   // Calculate metrics
   const workerCount = status?.subagents?.length ?? 0;
   const queueDepth = status?.queue?.reduce((acc, q) => acc + q.queued, 0) ?? 0;
-  const uptime = status?.time ? Date.now() - status.time : 0;
+  const uptime = (status as any)?.health?.uptime ?? (status?.time ? Date.now() - status.time : 0);
   const runningTasks = status?.running?.length ?? 0;
-  const errorRate = totalErrors > 0 ? Math.min(100, totalErrors * 10) : 0;
+  const healthTotalErrors = (status as any)?.health?.totalErrors;
+  const errorCount = typeof healthTotalErrors === "number" ? healthTotalErrors : 0;
+  const errorRate = Math.min(100, ((status as any)?.health?.errorRate ?? 0) * 10);
+  const feed = events.slice().reverse().slice(0, 20);
+  const queenThinking = Boolean(status?.mainAgent?.tasks?.some((t: any) => t.status === "running" || t.status === "queued" || t.status === "retrying"));
+  const mainAgentRunning = Boolean((status as any)?.mainAgent?.running);
 
-  if (loading) {
+  if (statusQuery.isLoading) {
     return (
       <div className="p-6 space-y-6">
         <Skeleton variant="rectangular" height={150} />
@@ -639,11 +578,11 @@ export const RoyalChamber: React.FC = () => {
         </div>
         <div className="flex items-center gap-3">
           <Badge
-            variant={isRunning ? 'nurse' : 'soldier'}
+            variant={mainAgentRunning ? 'nurse' : 'soldier'}
             dot
-            pulse={isRunning}
+            pulse={mainAgentRunning}
           >
-            {isRunning ? 'Colony Active' : 'Colony Paused'}
+            {mainAgentRunning ? 'Queen Running' : 'Queen Paused'}
           </Badge>
           {error && (
             <Badge variant="soldier" dot>
@@ -674,14 +613,62 @@ export const RoyalChamber: React.FC = () => {
 
         {/* Right sidebar */}
         <aside className="w-80 border-l border-chamber-wall p-4 space-y-4 overflow-y-auto">
+          <Card>
+            <div className="flex items-center justify-between mb-3">
+              <h3 className="text-lg font-semibold text-white">Queen Console</h3>
+              <Badge variant={(status as any)?.mainAgent?.running ? "queen" : "default"} size="sm" dot pulse={(status as any)?.mainAgent?.running}>
+                {(status as any)?.mainAgent?.running ? "running" : "paused"}
+              </Badge>
+            </div>
+            <div className="flex gap-2">
+              <Button
+                variant="secondary"
+                size="sm"
+                onClick={() => pauseMutation.mutate()}
+                loading={pauseMutation.isPending}
+              >
+                Pause
+              </Button>
+              <Button
+                variant="primary"
+                size="sm"
+                onClick={() => resumeMutation.mutate()}
+                loading={resumeMutation.isPending}
+              >
+                Resume
+              </Button>
+            </div>
+            <div className="mt-3">
+              <div className="text-xs text-gray-500 mb-1">Assign duty</div>
+              <div className="flex gap-2">
+                <Input
+                  placeholder="Describe a duty for the queen…"
+                  value={dutyText}
+                  onChange={(e) => setDutyText(e.target.value)}
+                  onKeyDown={(e) => e.key === "Enter" && dutyText.trim() && assignDutyMutation.mutate(dutyText.trim())}
+                  className="flex-1"
+                />
+                <Button
+                  variant="outline"
+                  size="sm"
+                  disabled={!dutyText.trim()}
+                  loading={assignDutyMutation.isPending}
+                  onClick={() => assignDutyMutation.mutate(dutyText.trim())}
+                >
+                  Assign
+                </Button>
+              </div>
+            </div>
+          </Card>
+
           <ColonyVitals
             workerCount={workerCount}
             queueDepth={queueDepth}
             uptime={uptime}
-            errorCount={totalErrors}
+            errorCount={errorCount}
           />
 
-          <ThreatMeter errorRate={errorRate} recentErrors={totalErrors} />
+          <ThreatMeter errorRate={errorRate} recentErrors={errorCount} />
 
           <Card>
             <div className="flex items-center justify-between mb-3">
@@ -718,9 +705,68 @@ export const RoyalChamber: React.FC = () => {
 
           <ProviderHealthPanel providers={providers} />
 
-          <QuickActions />
+          <Card>
+            <h3 className="text-lg font-semibold text-white mb-3">Quick Task</h3>
+            <div className="flex gap-2">
+              <Input
+                placeholder="Ask the colony…"
+                value={quickTask}
+                onChange={(e) => setQuickTask(e.target.value)}
+                onKeyDown={(e) => e.key === "Enter" && quickTask.trim() && quickTaskMutation.mutate(quickTask.trim())}
+                className="flex-1"
+              />
+              <Button
+                variant="primary"
+                size="sm"
+                disabled={!quickTask.trim()}
+                loading={quickTaskMutation.isPending}
+                onClick={() => quickTaskMutation.mutate(quickTask.trim())}
+              >
+                Send
+              </Button>
+            </div>
+            <div className="mt-3 flex items-center justify-between">
+              <Button variant="ghost" size="sm" onClick={() => navigate("/foraging")}>
+                Open Foraging
+              </Button>
+              <Button variant="ghost" size="sm" onClick={() => setRawOpen(true)}>
+                Raw Status
+              </Button>
+            </div>
+          </Card>
+
+          <Card>
+            <div className="flex items-center justify-between mb-3">
+              <h3 className="text-lg font-semibold text-white">Activity Feed</h3>
+              <Badge variant="default" size="sm">{feed.length}</Badge>
+            </div>
+            {feed.length === 0 ? (
+              <div className="text-sm text-gray-500">No recent events.</div>
+            ) : (
+              <div className="space-y-2">
+                {feed.map((evt) => (
+                  <div key={evt.id} className="p-2 bg-chamber-dark rounded border border-chamber-wall">
+                    <div className="flex items-center justify-between gap-2">
+                      <div className="text-xs text-gray-400 truncate">{evt.type}</div>
+                      <Badge variant={evt.severity === "critical" || evt.severity === "error" ? "soldier" : evt.severity === "warn" ? "queen" : "default"} size="sm">
+                        {evt.severity}
+                      </Badge>
+                    </div>
+                    <div className="mt-1 text-xs text-gray-500 truncate">
+                      {new Date(evt.timestamp).toLocaleTimeString()}
+                      {evt.sessionKey ? ` · ${evt.sessionKey}` : ""}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </Card>
         </aside>
       </div>
+
+      <Modal isOpen={rawOpen} onClose={() => setRawOpen(false)} title="Raw Status" size="full">
+        <JsonPanel title="Status JSON" endpoint="/api/status" value={status ?? { loading: true }} />
+      </Modal>
     </div>
   );
 };

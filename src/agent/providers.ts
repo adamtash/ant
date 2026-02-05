@@ -563,10 +563,8 @@ export class ProviderManager {
           this.logger.warn({ id, until: this.cooldownUntil.get(id) }, "Provider in cooldown, skipping");
           continue;
         }
-        this.logger.debug({ id, type: provider.type }, "Checking provider health");
         try {
           const isHealthy = await this.checkProviderHealth(id, provider);
-          this.logger.debug({ id, isHealthy }, "Provider health check result");
           if (isHealthy) {
             return provider;
           }
@@ -642,9 +640,11 @@ export class ProviderManager {
     const timeoutMs = this.config.healthCheck?.timeoutMs ?? 5000;
     const cached = this.healthCache.get(id);
     if (cached && Date.now() - cached.checkedAt < cacheTtlMs) {
+      this.logger.trace({ id, isHealthy: cached.ok }, "Provider health (cached)");
       return cached.ok;
     }
 
+    this.logger.debug({ id, type: provider.type }, "Checking provider health");
     const check = this.withTimeout(provider.health(), timeoutMs, "Provider health check timed out");
     const ok = await check.catch((err) => {
       this.logger.warn(
@@ -654,6 +654,7 @@ export class ProviderManager {
       return false;
     });
 
+    this.logger.debug({ id, isHealthy: ok }, "Provider health check result");
     this.healthCache.set(id, { ok, checkedAt: Date.now() });
     return ok;
   }
@@ -766,6 +767,8 @@ export class OpenAIProvider implements LLMProvider {
     const model = options?.model ?? this.model;
     const url = `${this.baseUrl}/chat/completions`;
     const signal = options?.timeoutMs && options.timeoutMs > 0 ? AbortSignal.timeout(options.timeoutMs) : undefined;
+    const requestId = crypto.randomUUID();
+    const startedAt = Date.now();
 
     const body: Record<string, unknown> = {
       model,
@@ -801,35 +804,69 @@ export class OpenAIProvider implements LLMProvider {
       body.reasoning = { effort: options.thinking.level };
     }
 
-    // Log the OpenAI provider call details
     this.logger.info({
+      event: "provider.request",
+      requestId,
       providerId: this.id,
       providerType: "openai",
       model,
-      baseUrl: this.baseUrl,
-      messageCount: messages.length,
-      hasTools: !!options?.tools && options.tools.length > 0,
-      toolCount: options?.tools?.length || 0,
-      temperature: options?.temperature ?? 0.2,
-      thinkingLevel: options?.thinking?.level,
-    }, "OpenAI provider chat call started");
-
-    const response = await fetch(url, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${this.resolveApiKey()}`,
+      endpoint: url,
+      request: {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: "Bearer [REDACTED]",
+        },
+        body,
       },
-      body: JSON.stringify(body),
-      ...(signal ? { signal } : {}),
-    });
+    }, "Provider request sent");
 
-    if (!response.ok) {
-      const error = await response.text();
-      throw new Error(`OpenAI API error: ${response.status} - ${error}`);
+    let response: Response;
+    try {
+      response = await fetch(url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${this.resolveApiKey()}`,
+        },
+        body: JSON.stringify(body),
+        ...(signal ? { signal } : {}),
+      });
+    } catch (err) {
+      const error = err instanceof Error ? err.message : String(err);
+      this.logger.error({
+        event: "provider.response",
+        requestId,
+        providerId: this.id,
+        providerType: "openai",
+        model,
+        endpoint: url,
+        ok: false,
+        durationMs: Date.now() - startedAt,
+        error,
+      }, "Provider request failed");
+      throw err;
     }
 
-    const data = await response.json() as {
+    const rawBody = await response.text();
+    if (!response.ok) {
+      this.logger.error({
+        event: "provider.response",
+        requestId,
+        providerId: this.id,
+        providerType: "openai",
+        model,
+        endpoint: url,
+        ok: false,
+        status: response.status,
+        statusText: response.statusText,
+        durationMs: Date.now() - startedAt,
+        responseBody: rawBody,
+      }, "Provider response received");
+      throw new Error(`OpenAI API error: ${response.status} - ${rawBody}`);
+    }
+
+    let data: {
       choices: Array<{
         message: {
           content?: string;
@@ -847,6 +884,26 @@ export class OpenAIProvider implements LLMProvider {
       };
     };
 
+    try {
+      data = JSON.parse(rawBody) as typeof data;
+    } catch (err) {
+      const error = err instanceof Error ? err.message : String(err);
+      this.logger.error({
+        event: "provider.response",
+        requestId,
+        providerId: this.id,
+        providerType: "openai",
+        model,
+        endpoint: url,
+        ok: false,
+        status: response.status,
+        durationMs: Date.now() - startedAt,
+        error,
+        responseBody: rawBody,
+      }, "Failed to parse provider response JSON");
+      throw err;
+    }
+
     const choice = data.choices[0];
     const toolCalls: ToolCall[] | undefined = choice.message.tool_calls?.map(tc => ({
       id: tc.id,
@@ -854,18 +911,18 @@ export class OpenAIProvider implements LLMProvider {
       arguments: this.parseArguments(tc.function.arguments),
     }));
 
-    // Log the OpenAI provider call completion
     this.logger.info({
+      event: "provider.response",
+      requestId,
       providerId: this.id,
       providerType: "openai",
       model,
-      success: true,
-      finishReason: choice.finish_reason,
-      hasToolCalls: !!toolCalls && toolCalls.length > 0,
-      toolCallCount: toolCalls?.length || 0,
-      contentPreview: (choice.message.content || "").slice(0, 200) + ((choice.message.content || "").length > 200 ? "..." : ""),
-      usage: data.usage,
-    }, "OpenAI provider chat call completed");
+      endpoint: url,
+      ok: true,
+      status: response.status,
+      durationMs: Date.now() - startedAt,
+      response: data,
+    }, "Provider response received");
 
     return {
       content: choice.message.content || "",
@@ -903,27 +960,109 @@ export class OpenAIProvider implements LLMProvider {
 
   async embeddings(texts: string[]): Promise<number[][]> {
     const url = `${this.baseUrl}/embeddings`;
+    const requestId = crypto.randomUUID();
+    const startedAt = Date.now();
+    const requestBody = {
+      model: this.model,
+      input: texts,
+    };
 
-    const response = await fetch(url, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${this.resolveApiKey()}`,
+    this.logger.info({
+      event: "provider.request",
+      requestId,
+      providerId: this.id,
+      providerType: "openai",
+      model: this.model,
+      endpoint: url,
+      request: {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: "Bearer [REDACTED]",
+        },
+        body: requestBody,
       },
-      body: JSON.stringify({
-        model: this.model,
-        input: texts,
-      }),
-    });
+    }, "Provider embeddings request sent");
 
-    if (!response.ok) {
-      const error = await response.text();
-      throw new Error(`Embeddings API error: ${response.status} - ${error}`);
+    let response: Response;
+    try {
+      response = await fetch(url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${this.resolveApiKey()}`,
+        },
+        body: JSON.stringify(requestBody),
+      });
+    } catch (err) {
+      const error = err instanceof Error ? err.message : String(err);
+      this.logger.error({
+        event: "provider.response",
+        requestId,
+        providerId: this.id,
+        providerType: "openai",
+        model: this.model,
+        endpoint: url,
+        ok: false,
+        durationMs: Date.now() - startedAt,
+        error,
+      }, "Provider embeddings request failed");
+      throw err;
     }
 
-    const data = await response.json() as {
+    const rawBody = await response.text();
+    if (!response.ok) {
+      this.logger.error({
+        event: "provider.response",
+        requestId,
+        providerId: this.id,
+        providerType: "openai",
+        model: this.model,
+        endpoint: url,
+        ok: false,
+        status: response.status,
+        statusText: response.statusText,
+        durationMs: Date.now() - startedAt,
+        responseBody: rawBody,
+      }, "Provider embeddings response received");
+      throw new Error(`Embeddings API error: ${response.status} - ${rawBody}`);
+    }
+
+    let data: {
       data: Array<{ embedding: number[] }>;
     };
+    try {
+      data = JSON.parse(rawBody) as typeof data;
+    } catch (err) {
+      const error = err instanceof Error ? err.message : String(err);
+      this.logger.error({
+        event: "provider.response",
+        requestId,
+        providerId: this.id,
+        providerType: "openai",
+        model: this.model,
+        endpoint: url,
+        ok: false,
+        status: response.status,
+        durationMs: Date.now() - startedAt,
+        error,
+        responseBody: rawBody,
+      }, "Failed to parse provider embeddings response JSON");
+      throw err;
+    }
+
+    this.logger.info({
+      event: "provider.response",
+      requestId,
+      providerId: this.id,
+      providerType: "openai",
+      model: this.model,
+      endpoint: url,
+      ok: true,
+      status: response.status,
+      durationMs: Date.now() - startedAt,
+      response: data,
+    }, "Provider embeddings response received");
 
     return data.data.map(d => d.embedding);
   }
@@ -1047,74 +1186,86 @@ export class CLIProvider implements LLMProvider {
   }
 
   async chat(messages: Message[], options?: ChatOptions): Promise<ChatResponse> {
-    // Build prompt from messages
     const prompt = this.buildPromptFromMessages(messages, options?.thinking?.level);
     const timeoutMs =
       typeof options?.timeoutMs === "number" && options.timeoutMs > 0
         ? options.timeoutMs
         : this.timeoutMs;
+    const requestId = crypto.randomUUID();
+    const startedAt = Date.now();
 
-    // Log the CLI call details
     this.logger.info({
+      event: "provider.request",
+      requestId,
       providerId: this.id,
+      providerType: "cli",
       cliType: this.cliType,
       model: this.model,
-      command: this.command,
-      args: this.args,
-      promptPreview: prompt.slice(0, 200) + (prompt.length > 200 ? "..." : ""),
-      promptLength: prompt.length,
-      timeoutMs,
-    }, "CLI provider chat call started");
+      endpoint: `cli://${this.command}`,
+      request: {
+        command: this.command,
+        baseArgs: this.args,
+        prompt,
+        messages,
+        options,
+        timeoutMs,
+      },
+    }, "Provider request sent");
 
-    // Run CLI command
-    const result = await this.runCLI(prompt, timeoutMs);
+    const result = await this.runCLI(prompt, timeoutMs, requestId);
 
-    // Log detailed result information
-    const logLevel = result.ok ? "info" : "error";
-    const logger = this.logger[logLevel as "info" | "error"].bind(this.logger);
-    
-    logger({
-      providerId: this.id,
-      cliType: this.cliType,
-      success: result.ok,
-      outputLength: result.output?.length || 0,
-      outputPreview: result.output?.slice(0, 200) || "(empty)",
-      error: result.error,
-      ...(result.error && {
-        fullError: result.error.slice(0, 1000),
-      })
-    }, result.ok ? "CLI provider chat call completed" : "CLI provider chat call failed");
+    try {
+      if (!result.ok) {
+        const detail = this.formatCliError(result.error);
+        throw new Error(`CLI ${this.cliType} error: ${detail}`);
+      }
 
-    if (!result.ok) {
-      const detail = this.formatCliError(result.error);
-      this.logger.error({
-        cliType: this.cliType,
-        error: detail,
-        output: result.output?.slice(0, 500) || "(empty)",
-      }, "CLI command failed - will not attempt parsing");
-      throw new Error(`CLI ${this.cliType} error: ${detail}`);
-    }
+      let content: string;
+      if (this.cliType === "kimi") {
+        content = this.parseKimiOutput(result.output);
+      } else {
+        content = this.stripReasoning(result.output);
+      }
 
-    // Parse output based on CLI type
-    let content: string;
-    if (this.cliType === "kimi") {
-      // Kimi outputs ACP protocol format - parse it
-      content = this.parseKimiOutput(result.output);
+      const chatResponse: ChatResponse = {
+        content,
+        finishReason: "stop",
+      };
+
       this.logger.info({
-        rawOutputLength: result.output?.length || 0,
-        rawOutputPreview: result.output?.slice(0, 300) || "(empty)",
-        parsedContentLength: content?.length || 0,
-        parsedContentPreview: content?.slice(0, 200) || "(empty)",
-      }, "Kimi output parsed");
-    } else {
-      // Other CLIs return plain text
-      content = this.stripReasoning(result.output);
-    }
+        event: "provider.response",
+        requestId,
+        providerId: this.id,
+        providerType: "cli",
+        cliType: this.cliType,
+        model: this.model,
+        endpoint: `cli://${this.command}`,
+        ok: true,
+        durationMs: Date.now() - startedAt,
+        response: {
+          run: result,
+          chat: chatResponse,
+        },
+      }, "Provider response received");
 
-    return {
-      content,
-      finishReason: "stop",
-    };
+      return chatResponse;
+    } catch (err) {
+      const error = err instanceof Error ? err.message : String(err);
+      this.logger.error({
+        event: "provider.response",
+        requestId,
+        providerId: this.id,
+        providerType: "cli",
+        cliType: this.cliType,
+        model: this.model,
+        endpoint: `cli://${this.command}`,
+        ok: false,
+        durationMs: Date.now() - startedAt,
+        error,
+        response: result,
+      }, "Provider response processing failed");
+      throw err;
+    }
   }
 
   private buildPromptFromMessages(messages: Message[], thinkingLevel?: string): string {
@@ -1146,8 +1297,21 @@ export class CLIProvider implements LLMProvider {
 
   private async runCLI(
     prompt: string,
-    timeoutMs: number
-  ): Promise<{ ok: boolean; output: string; error?: string }> {
+    timeoutMs: number,
+    requestId: string
+  ): Promise<{
+    ok: boolean;
+    output: string;
+    error?: string;
+    stdout: string;
+    stderr: string;
+    timedOut: boolean;
+    exitCode: number | null;
+    command: string;
+    args: string[];
+    timeoutMs: number;
+    outputFilePath?: string;
+  }> {
     return new Promise((resolve) => {
       const args = [...this.args];
       let stdinPrompt: string | null = null;
@@ -1178,7 +1342,8 @@ export class CLIProvider implements LLMProvider {
             args.push("-p", prompt);
             break;
           case "copilot":
-            args.push("--prompt", prompt);
+            // Copilot CLI uses `-p` for one-shot prompt mode.
+            args.push("-p", prompt);
             break;
           case "codex":
             if (args.includes("-")) {
@@ -1193,18 +1358,32 @@ export class CLIProvider implements LLMProvider {
         }
       }
 
-      this.logger.debug(
+      this.logger.info(
         {
+          event: "provider.cli.spawn",
+          requestId,
+          providerId: this.id,
+          providerType: "cli",
+          cliType: this.cliType,
           command: this.command,
-          args: args.map((a, i) => {
-            // Don't log the full prompt, just indicate it was passed
-            if (a === prompt) return "[PROMPT_CONTENT]";
-            if (i > 0 && args[i - 1] === "-p" || args[i - 1] === "--prompt") return "[PROMPT_CONTENT]";
-            return a;
-          }),
-          promptLength: prompt.length,
+          commandLine: formatCommandLine(this.command, args),
+          args,
+          prompt,
+          timeoutMs,
+          outputFilePath,
         },
-        "runCLI: Spawning command"
+        "CLI process spawn"
+      );
+      this.logger.warn(
+        {
+          event: "provider.cli.command",
+          requestId,
+          providerId: this.id,
+          providerType: "cli",
+          cliType: this.cliType,
+          commandLine: formatCommandLine(this.command, args),
+        },
+        "CLI command"
       );
 
       let stdout = "";
@@ -1236,15 +1415,29 @@ export class CLIProvider implements LLMProvider {
         clearTimeout(timer);
         this.logger.error(
           {
+            event: "provider.cli.spawn_error",
+            requestId,
+            providerId: this.id,
+            providerType: "cli",
+            cliType: this.cliType,
             command: this.command,
+            args,
             error: err.message,
           },
-          "runCLI: Spawn error"
+          "CLI process spawn error"
         );
         resolve({
           ok: false,
           output: "",
           error: err.message,
+          stdout,
+          stderr,
+          timedOut,
+          exitCode: null,
+          command: this.command,
+          args,
+          timeoutMs,
+          ...(outputFilePath ? { outputFilePath } : {}),
         });
       });
 
@@ -1252,7 +1445,15 @@ export class CLIProvider implements LLMProvider {
         void (async () => {
           clearTimeout(timer);
 
-          let finalOutput = stdout;
+          const normalizeStreamOutput = (value: string): string =>
+            value
+              .replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, "")
+              .replace(/\r/g, "\n");
+
+          const normalizedStdout = normalizeStreamOutput(stdout);
+          const normalizedStderr = normalizeStreamOutput(stderr);
+
+          let finalOutput = normalizedStdout;
           if (outputFilePath) {
             try {
               const fileOutput = await fs.readFile(outputFilePath, "utf-8");
@@ -1269,17 +1470,27 @@ export class CLIProvider implements LLMProvider {
             }
           }
 
+          // Some CLIs (notably Copilot) emit the assistant response on stderr.
+          if (!outputFilePath && !finalOutput.trim() && normalizedStderr.trim()) {
+            finalOutput = normalizedStderr;
+          }
+
           this.logger.debug(
             {
+              event: "provider.cli.closed",
+              requestId,
+              providerId: this.id,
+              providerType: "cli",
+              cliType: this.cliType,
+              command: this.command,
+              args,
               exitCode: code,
-              stdoutLength: stdout.length,
-              stderrLength: stderr.length,
-              stdoutPreview: stdout.slice(0, 300),
-              stderrFull: stderr.length > 0 ? stderr : undefined,
+              stdout,
+              stderr,
               timedOut,
               usedOutputFile: Boolean(outputFilePath),
             },
-            "runCLI: Process closed"
+            "CLI process closed"
           );
 
           if (timedOut) {
@@ -1287,6 +1498,14 @@ export class CLIProvider implements LLMProvider {
               ok: false,
               output: finalOutput,
               error: `Command timed out after ${timeoutMs}ms`,
+              stdout,
+              stderr,
+              timedOut,
+              exitCode: code,
+              command: this.command,
+              args,
+              timeoutMs,
+              ...(outputFilePath ? { outputFilePath } : {}),
             });
             return;
           }
@@ -1302,11 +1521,19 @@ export class CLIProvider implements LLMProvider {
             );
           }
 
-          resolve({
-            ok: code === 0,
-            output: finalOutput,
-            error,
-          });
+            resolve({
+              ok: code === 0,
+              output: finalOutput,
+              error,
+              stdout,
+              stderr,
+              timedOut,
+              exitCode: code,
+              command: this.command,
+              args,
+              timeoutMs,
+              ...(outputFilePath ? { outputFilePath } : {}),
+            });
         })();
       });
     });
@@ -1527,6 +1754,14 @@ export class CLIProvider implements LLMProvider {
   }
 }
 
+function formatCommandLine(command: string, args: string[]): string {
+  const quote = (value: string): string => {
+    if (/^[A-Za-z0-9_./:-]+$/.test(value)) return value;
+    return `'${value.replace(/'/g, "'\\''")}'`;
+  };
+  return [command, ...args.map(quote)].join(" ");
+}
+
 // ============================================================================
 // Ollama Provider
 // ============================================================================
@@ -1561,6 +1796,8 @@ export class OllamaProvider implements LLMProvider {
     const model = options?.model ?? this.model;
     const url = `${this.baseUrl}/api/chat`;
     const signal = options?.timeoutMs && options.timeoutMs > 0 ? AbortSignal.timeout(options.timeoutMs) : undefined;
+    const requestId = crypto.randomUUID();
+    const startedAt = Date.now();
 
     const body = {
       model,
@@ -1574,23 +1811,99 @@ export class OllamaProvider implements LLMProvider {
       },
     };
 
-    const response = await fetch(url, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
+    this.logger.info({
+      event: "provider.request",
+      requestId,
+      providerId: this.id,
+      providerType: "ollama",
+      model,
+      endpoint: url,
+      request: {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body,
       },
-      body: JSON.stringify(body),
-      ...(signal ? { signal } : {}),
-    });
+    }, "Provider request sent");
 
-    if (!response.ok) {
-      const error = await response.text();
-      throw new Error(`Ollama API error: ${response.status} - ${error}`);
+    let response: Response;
+    try {
+      response = await fetch(url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(body),
+        ...(signal ? { signal } : {}),
+      });
+    } catch (err) {
+      const error = err instanceof Error ? err.message : String(err);
+      this.logger.error({
+        event: "provider.response",
+        requestId,
+        providerId: this.id,
+        providerType: "ollama",
+        model,
+        endpoint: url,
+        ok: false,
+        durationMs: Date.now() - startedAt,
+        error,
+      }, "Provider request failed");
+      throw err;
     }
 
-    const data = await response.json() as {
+    const rawBody = await response.text();
+    if (!response.ok) {
+      this.logger.error({
+        event: "provider.response",
+        requestId,
+        providerId: this.id,
+        providerType: "ollama",
+        model,
+        endpoint: url,
+        ok: false,
+        status: response.status,
+        statusText: response.statusText,
+        durationMs: Date.now() - startedAt,
+        responseBody: rawBody,
+      }, "Provider response received");
+      throw new Error(`Ollama API error: ${response.status} - ${rawBody}`);
+    }
+
+    let data: {
       message: { content: string };
     };
+    try {
+      data = JSON.parse(rawBody) as typeof data;
+    } catch (err) {
+      const error = err instanceof Error ? err.message : String(err);
+      this.logger.error({
+        event: "provider.response",
+        requestId,
+        providerId: this.id,
+        providerType: "ollama",
+        model,
+        endpoint: url,
+        ok: false,
+        status: response.status,
+        durationMs: Date.now() - startedAt,
+        error,
+        responseBody: rawBody,
+      }, "Failed to parse provider response JSON");
+      throw err;
+    }
+
+    this.logger.info({
+      event: "provider.response",
+      requestId,
+      providerId: this.id,
+      providerType: "ollama",
+      model,
+      endpoint: url,
+      ok: true,
+      status: response.status,
+      durationMs: Date.now() - startedAt,
+      response: data,
+    }, "Provider response received");
 
     return {
       content: data.message.content,
@@ -1603,23 +1916,102 @@ export class OllamaProvider implements LLMProvider {
 
     for (const text of texts) {
       const url = `${this.baseUrl}/api/embeddings`;
+      const requestId = crypto.randomUUID();
+      const startedAt = Date.now();
+      const body = {
+        model: this.model,
+        prompt: text,
+      };
 
-      const response = await fetch(url, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
+      this.logger.info({
+        event: "provider.request",
+        requestId,
+        providerId: this.id,
+        providerType: "ollama",
+        model: this.model,
+        endpoint: url,
+        request: {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body,
         },
-        body: JSON.stringify({
-          model: this.model,
-          prompt: text,
-        }),
-      });
+      }, "Provider embeddings request sent");
 
+      let response: Response;
+      try {
+        response = await fetch(url, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify(body),
+        });
+      } catch (err) {
+        const error = err instanceof Error ? err.message : String(err);
+        this.logger.error({
+          event: "provider.response",
+          requestId,
+          providerId: this.id,
+          providerType: "ollama",
+          model: this.model,
+          endpoint: url,
+          ok: false,
+          durationMs: Date.now() - startedAt,
+          error,
+        }, "Provider embeddings request failed");
+        throw err;
+      }
+
+      const rawBody = await response.text();
       if (!response.ok) {
+        this.logger.error({
+          event: "provider.response",
+          requestId,
+          providerId: this.id,
+          providerType: "ollama",
+          model: this.model,
+          endpoint: url,
+          ok: false,
+          status: response.status,
+          statusText: response.statusText,
+          durationMs: Date.now() - startedAt,
+          responseBody: rawBody,
+        }, "Provider embeddings response received");
         throw new Error(`Ollama embeddings error: ${response.status}`);
       }
 
-      const data = await response.json() as { embedding: number[] };
+      let data: { embedding: number[] };
+      try {
+        data = JSON.parse(rawBody) as typeof data;
+      } catch (err) {
+        const error = err instanceof Error ? err.message : String(err);
+        this.logger.error({
+          event: "provider.response",
+          requestId,
+          providerId: this.id,
+          providerType: "ollama",
+          model: this.model,
+          endpoint: url,
+          ok: false,
+          status: response.status,
+          durationMs: Date.now() - startedAt,
+          error,
+          responseBody: rawBody,
+        }, "Failed to parse provider embeddings response JSON");
+        throw err;
+      }
+      this.logger.info({
+        event: "provider.response",
+        requestId,
+        providerId: this.id,
+        providerType: "ollama",
+        model: this.model,
+        endpoint: url,
+        ok: true,
+        status: response.status,
+        durationMs: Date.now() - startedAt,
+        response: data,
+      }, "Provider embeddings response received");
       results.push(data.embedding);
     }
 

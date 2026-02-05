@@ -10,6 +10,7 @@ import * as THREE from 'three';
 import type { Ant } from '../../../colony/entities';
 import { colors } from '../../../utils/colors';
 import type { AntCaste } from '../../../utils/biology';
+import { useSelectionStore } from '../../../state/selectionStore';
 
 interface Ant3DProps {
   ant: Ant;
@@ -54,6 +55,7 @@ export const Ant3D: React.FC<Ant3DProps> = ({ ant }) => {
   const legsRef = useRef<THREE.Group | null>(null);
   const antennaeRef = useRef<THREE.Group | null>(null);
   const timeRef = useRef<number>(0);
+  const select = useSelectionStore((s) => s.select);
 
   // Global scale for ants to be visible in the chamber view
   const ANT_SCALE = 15.0;
@@ -243,5 +245,28 @@ export const Ant3D: React.FC<Ant3DProps> = ({ ant }) => {
   });
 
   // @ts-ignore r3f JSX elements
-  return <group ref={groupRef} />;
+  return (
+    // @ts-ignore r3f JSX elements
+    <group
+      ref={groupRef}
+      onPointerDown={(e: any) => {
+        e.stopPropagation();
+        if (!ant.entityType || !ant.entityId) return;
+        if (ant.entityType === 'task') select({ type: 'task', id: ant.entityId });
+        else if (ant.entityType === 'subagent') select({ type: 'subagent', id: ant.entityId });
+        else if (ant.entityType === 'error') select({ type: 'error', id: ant.entityId });
+        else if (ant.entityType === 'cron') select({ type: 'job', id: ant.entityId });
+        else if (ant.entityType === 'memory') select({ type: 'memory', id: ant.entityId });
+      }}
+    >
+      {/* Invisible hitbox to make clicking reliable */}
+      {/* @ts-ignore r3f JSX elements */}
+      <mesh>
+        {/* @ts-ignore r3f JSX elements */}
+        <sphereGeometry args={[6, 8, 8]} />
+        {/* @ts-ignore r3f JSX elements */}
+        <meshBasicMaterial transparent opacity={0} />
+      </mesh>
+    </group>
+  );
 };

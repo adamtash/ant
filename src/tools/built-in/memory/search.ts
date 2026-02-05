@@ -29,6 +29,20 @@ export default defineTool({
     const minScore = typeof args.minScore === "number" ? args.minScore : 0.35;
 
     try {
+      if (ctx.memoryManager) {
+        const results = await ctx.memoryManager.search(query, {
+          maxResults,
+          minScore,
+        });
+        return {
+          ok: true,
+          data: {
+            query,
+            results,
+          },
+        };
+      }
+
       const results = await searchWorkspaceAndSessions({
         query,
         maxResults,

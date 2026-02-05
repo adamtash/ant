@@ -42,7 +42,7 @@ npm run ui:build
 
 ### 1. Configuration
 
-Copy and customize `ant.config.json` in the project root:
+Copy `ant.config.example.json` to `~/.ant/ant.config.json` (or run `ant onboard` to generate config + `.env` interactively). ant auto-detects the nearest `ant.config.json` by walking upwards from your current directory; otherwise it falls back to `~/.ant/ant.config.json` (see `docs/config.md`). Put secrets and machine paths in `.env` (notably `ANT_WORKSPACE_DIR` and `ANT_RUNTIME_REPO_ROOT` if your config lives in `~/.ant`).
 
 ```json
 {
@@ -87,10 +87,10 @@ Copy and customize `ant.config.json` in the project root:
 
 ```bash
 # Development mode (with hot reload)
-npm run dev -- run -c ant.config.json
+npm run dev -- run
 
 # With TUI dashboard (real-time monitoring + drone flights)
-npm run dev -- run -c ant.config.json --tui
+npm run dev -- run --tui
 
 # Production mode
 npm start
@@ -113,7 +113,7 @@ Scan the QR code in the terminal to pair with WhatsApp and start chatting!
 
 ## Provider Discovery (Backups)
 
-Enable automatic backup discovery in `ant.config.json`:
+Enable automatic backup discovery in your `ant.config.json`:
 
 ```json
 {
@@ -121,8 +121,8 @@ Enable automatic backup discovery in `ant.config.json`:
     "discovery": {
       "enabled": true,
       "researchIntervalHours": 24,
-      "healthCheckIntervalMinutes": 15,
-      "minBackupProviders": 2
+      "healthCheckIntervalMinutes": 120,
+      "minBackupProviders": 1
     },
     "local": {
       "enabled": true,
@@ -263,10 +263,10 @@ ANT includes a **programmatic harness** for repeatable “polish loops”: injec
 
 ```bash
 # Inject an inbound WhatsApp message (child-process mode; closest to real CLI runtime)
-npm run dev -- diagnostics harness -c ant.config.json --message "Reply with exactly: PONG" --mode child_process --timeout 120000
+npm run dev -- diagnostics harness --message "Reply with exactly: PONG" --mode child_process --timeout 120000
 
 # Faster, in-process mode (best observability)
-npm run dev -- diagnostics harness -c ant.config.json --message "Reply with exactly: PONG" --mode in_process --timeout 120000
+npm run dev -- diagnostics harness --message "Reply with exactly: PONG" --mode in_process --timeout 120000
 ```
 
 The command writes a `harness-report.json` and a full `.ant/` state tree (sessions, logs) into a temp directory printed at the end of the run.
@@ -289,6 +289,8 @@ These endpoints are disabled outside test mode (or can be forced with `ANT_ENABL
 ---
 
 ## Configuration (`ant.config.json`)
+
+ant loads a single config file (selected by `-c`, `ANT_CONFIG_PATH`, nearest `ant.config.json`, or fallback `~/.ant/ant.config.json`). Secrets (API keys, tokens) should live in `.env` (gitignored), not in `ant.config.json`. See `docs/config.md`.
 
 ### Core Settings
 
@@ -529,19 +531,16 @@ Add to `ant.config.json`:
 {
   "mainAgent": {
     "enabled": true,
-    "iterationDelayMinutes": 5,
-    "maxIterationsPerTask": 10,
-    "maxConsecutiveFailures": 3,
     "dutiesFile": "AGENT_DUTIES.md",
-    "logFile": "AGENT_LOG.md",
-    "alertOwnerOnCritical": true
+    "logFile": ".ant/AGENT_LOG.md",
+    "intervalMs": 300000
   }
 }
 ```
 
 ### Define Your Duties
 
-Create `AGENT_DUTIES.md` in your project root:
+Create `AGENT_DUTIES.md` in your `workspaceDir` (often your project root). If your `workspaceDir` is something like `~/.ant`, create it there instead. See `docs/agent-files.md` for how ant resolves these paths.
 
 ```markdown
 # Main Agent Duties
@@ -585,7 +584,7 @@ After checking all duties, output:
 
 ```bash
 # View duty execution log
-tail -f AGENT_LOG.md
+tail -f .ant/AGENT_LOG.md
 
 # Check Main Agent session
 ant sessions view "agent:main:system"
@@ -632,7 +631,7 @@ ant tool <tool-name>
 
 - **[PROJECT.md](PROJECT.md)** - Complete technical documentation
 - **[AGENT_DUTIES.md](AGENT_DUTIES.md)** - Main Agent responsibilities template
-- **[AGENT_LOG.md](AGENT_LOG.md)** - Main Agent activity log
+- **`docs/agent-files.md`** - Where agent docs/logs live (repo vs workspace vs state)
 - **[AGENTS.md](AGENTS.md)** - Quick reference for AI agents
 
 ## License

@@ -34,7 +34,6 @@ import {
 } from "./file-watcher.js";
 import { SqliteStore } from "./sqlite-store.js";
 import type {
-  EmbeddingProvider as IEmbeddingProvider,
   MemorySearchResult,
 } from "./types.js";
 
@@ -56,7 +55,9 @@ export type MemoryProgressCallback = (progress: {
 export class MemoryManager {
   private readonly cfg: AntConfig;
   private readonly store: SqliteStore;
-  private readonly embedder: EmbeddingProvider;
+  private embedder: EmbeddingProvider | null = null;
+  private embedderPromise: Promise<EmbeddingProvider> | null = null;
+  private readonly embeddingConfig: OpenClawEmbeddingConfig;
   private fileWatcher?: FileWatcher;
   private sessionUpdateTimer?: NodeJS.Timeout;
   private progressCallback?: MemoryProgressCallback;
@@ -64,16 +65,15 @@ export class MemoryManager {
   private embeddingsAvailable = true;
   private lastEmbeddingsCheckAt = 0;
   private nextEmbeddingsCheckAt = 0;
+  private syncInFlight = false;
+  private lastSyncAt = 0;
+  private readonly sessionsDir: string;
 
-  // Session delta tracking for incremental indexing
-  private sessionDeltas = new Map<
-    string,
-    {
-      lastSize: number;
-      pendingBytes: number;
-      pendingMessages: number;
-    }
-  >();
+  private static isLikelyLocalBaseUrl(raw?: string): boolean {
+    if (!raw) return false;
+    const value = raw.trim().toLowerCase();
+    return value.includes("localhost") || value.includes("127.0.0.1") || value.includes("0.0.0.0");
+  }
 
   constructor(cfg: AntConfig, progressCallback?: MemoryProgressCallback) {
     this.cfg = cfg;
@@ -82,8 +82,9 @@ export class MemoryManager {
     // Create SQLite store
     this.store = new SqliteStore(
       cfg.resolved.memorySqlitePath,
-      cfg.memory.query.minScore ?? 30
+      cfg.memory.retentionDays ?? 30
     );
+    this.sessionsDir = path.join(cfg.resolved.stateDir, "sessions");
 
     // Initialize embedding provider with multi-provider fallback
     const embeddingConfig: OpenClawEmbeddingConfig = {
@@ -92,7 +93,7 @@ export class MemoryManager {
         | "local"
         | "openai"
         | "gemini",
-      fallback: cfg.memory.provider?.fallback ?? ["openai"],
+      fallback: cfg.memory.provider?.fallback ?? ["local", "openai"],
       local: cfg.memory.provider?.local ?? {
         baseUrl: "http://localhost:1234/v1",
       },
@@ -101,32 +102,61 @@ export class MemoryManager {
       batch: cfg.memory.provider?.batch,
     };
 
-    // Apply legacy config if needed
-    if (!embeddingConfig.openai?.baseUrl) {
-      const defaultProvider =
-        cfg.resolved.providers.items[cfg.resolved.providers.default];
-      embeddingConfig.openai ??= {
-        baseUrl: defaultProvider?.baseUrl,
-        apiKey: defaultProvider?.apiKey,
-      };
+    if (embeddingConfig.local) {
+      embeddingConfig.local.model ??= cfg.memory.embeddingsModel;
     }
 
-    // Initialize embedding provider asynchronously
-    this.embedder = this.initEmbeddingProvider(embeddingConfig);
+    const routingEmbeddings = cfg.resolved.routing.embeddings ?? cfg.resolved.providers.default;
+    const routingProvider = cfg.resolved.providers.items[routingEmbeddings];
+    const routingBaseUrl = routingProvider?.baseUrl?.trim();
+    const routingEmbeddingsModel =
+      routingProvider?.embeddingsModel?.trim() || routingProvider?.model?.trim() || cfg.memory.embeddingsModel;
+
+    const localFromRouting =
+      routingProvider?.type === "openai" &&
+      MemoryManager.isLikelyLocalBaseUrl(routingBaseUrl) &&
+      !routingProvider?.apiKey;
+
+    if (localFromRouting) {
+      embeddingConfig.local = {
+        ...(embeddingConfig.local ?? {}),
+        baseUrl: routingBaseUrl || embeddingConfig.local?.baseUrl || "http://localhost:1234/v1",
+        model: embeddingConfig.local?.model ?? routingEmbeddingsModel,
+      };
+      if (embeddingConfig.provider === "auto" || embeddingConfig.provider === "openai") {
+        embeddingConfig.provider = "local";
+      }
+      if (!embeddingConfig.fallback.includes("local")) {
+        embeddingConfig.fallback = ["local", ...embeddingConfig.fallback];
+      }
+    } else if (!embeddingConfig.openai?.baseUrl) {
+      embeddingConfig.openai ??= {
+        baseUrl: routingBaseUrl,
+        apiKey: routingProvider?.apiKey,
+        model: routingEmbeddingsModel,
+      };
+    } else {
+      embeddingConfig.openai.model ??= cfg.memory.embeddingsModel;
+    }
+
+    this.embeddingConfig = embeddingConfig;
   }
 
-  /**
-   * Initialize embedding provider with fallback chain
-   * Note: This is synchronous initialization for backwards compatibility.
-   * The actual provider creation happens lazily or use start() for async init.
-   */
-  private initEmbeddingProvider(config: OpenClawEmbeddingConfig): EmbeddingProvider {
-    // For now, use SimpleEmbeddingProvider directly as it works with LM Studio
-    // The createEmbeddingProvider function is async and requires different handling
-    return new SimpleEmbeddingProvider(
-      config.local?.baseUrl ?? "http://localhost:1234/v1",
-      config.local?.model ?? this.cfg.memory.embeddingsModel ?? "nomic-embed-text"
-    );
+  private async getEmbedder(): Promise<EmbeddingProvider | null> {
+    if (this.embedder) return this.embedder;
+    if (!this.embedderPromise) {
+      this.embedderPromise = createEmbeddingProvider({ openClawConfig: this.embeddingConfig });
+    }
+    try {
+      this.embedder = await this.embedderPromise;
+      return this.embedder;
+    } catch (err) {
+      this.embedderPromise = null;
+      this.embeddingsAvailable = false;
+      this.nextEmbeddingsCheckAt = Date.now() + 60_000;
+      console.warn("Embedding provider initialization failed:", err);
+      return null;
+    }
   }
 
   /**
@@ -162,6 +192,15 @@ export class MemoryManager {
       // Initial indexing if configured
       if (this.cfg.memory.sync.onSessionStart) {
         await this.indexAll();
+      }
+
+      const intervalMinutes = this.cfg.memory.sync.intervalMinutes ?? 0;
+      if (intervalMinutes > 0) {
+        const intervalMs = intervalMinutes * 60 * 1000;
+        this.sessionUpdateTimer = setInterval(() => {
+          void this.syncIfNeeded("interval");
+        }, intervalMs);
+        this.sessionUpdateTimer.unref();
       }
       this.started = true;
     } catch (err) {
@@ -276,7 +315,9 @@ export class MemoryManager {
   ): Promise<MemorySearchResult[]> {
     // Generate query embedding
     try {
-      const embeddings = await this.embedder.embed([query]);
+      const embedder = await this.getEmbedder();
+      if (!embedder) return [];
+      const embeddings = await embedder.embed([query]);
       const queryEmbedding = embeddings[0];
       if (!queryEmbedding || queryEmbedding.length === 0) return [];
 
@@ -415,8 +456,7 @@ export class MemoryManager {
     progress?: MemoryProgressCallback
   ): Promise<void> {
     try {
-      const sessionDir = this.cfg.resolved.whatsappSessionDir;
-      const files = await fs.readdir(sessionDir);
+      const files = await fs.readdir(this.sessionsDir);
 
       if (progress) {
         progress({
@@ -430,14 +470,15 @@ export class MemoryManager {
         const file = files[i]!;
         if (!file.endsWith(".jsonl")) continue;
 
-        const filePath = path.join(sessionDir, file);
+        const filePath = path.join(this.sessionsDir, file);
 
         // Check delta - only re-index if threshold exceeded
-        const delta = this.sessionDeltas.get(filePath);
-        const shouldIndex = await this.checkSessionDelta(filePath, delta);
-
+        const shouldIndex = await this.checkSessionDelta(filePath);
         if (shouldIndex) {
           await this.indexFile(filePath, "sessions");
+          await this.updateSessionDelta(filePath, { indexed: true });
+        } else {
+          await this.updateSessionDelta(filePath, { indexed: false });
         }
 
         if (progress) {
@@ -456,27 +497,69 @@ export class MemoryManager {
   /**
    * Check if session file should be re-indexed based on delta
    */
-  private async checkSessionDelta(
-    filePath: string,
-    delta?: {
-      lastSize: number;
-      pendingBytes: number;
-      pendingMessages: number;
-    }
-  ): Promise<boolean> {
+  private getSessionDeltaKey(filePath: string): string {
+    return path.resolve(filePath);
+  }
+
+  private async checkSessionDelta(filePath: string): Promise<boolean> {
     try {
       const stat = await fs.stat(filePath);
-      const current = delta ?? { lastSize: 0, pendingBytes: 0, pendingMessages: 0 };
-
-      const newBytes = stat.size - current.lastSize;
-      const newMessages = await this.countNewMessages(filePath, current.lastSize);
+      const key = this.getSessionDeltaKey(filePath);
+      const current = this.store.getSessionDelta(key) ?? {
+        lastSize: 0,
+        pendingBytes: 0,
+        pendingMessages: 0,
+      };
 
       const deltaBytes = this.cfg.memory.sync.sessions?.deltaBytes ?? 100_000;
       const deltaMessages = this.cfg.memory.sync.sessions?.deltaMessages ?? 50;
 
-      return newBytes >= deltaBytes || newMessages >= deltaMessages;
+      const sizeDelta = stat.size - current.lastSize;
+      if (sizeDelta < 0) {
+        return true;
+      }
+
+      const newMessages = await this.countNewMessages(filePath, current.lastSize);
+      const pendingBytes = current.pendingBytes + sizeDelta;
+      const pendingMessages = current.pendingMessages + newMessages;
+
+      return pendingBytes >= deltaBytes || pendingMessages >= deltaMessages || current.lastSize === 0;
     } catch {
       return false;
+    }
+  }
+
+  private async updateSessionDelta(
+    filePath: string,
+    params: { indexed: boolean }
+  ): Promise<void> {
+    try {
+      const stat = await fs.stat(filePath);
+      const key = this.getSessionDeltaKey(filePath);
+      const current = this.store.getSessionDelta(key) ?? {
+        lastSize: 0,
+        pendingBytes: 0,
+        pendingMessages: 0,
+      };
+
+      const sizeDelta = Math.max(0, stat.size - current.lastSize);
+      const newMessages = await this.countNewMessages(filePath, current.lastSize);
+
+      if (params.indexed) {
+        this.store.updateSessionDelta(key, {
+          lastSize: stat.size,
+          pendingBytes: 0,
+          pendingMessages: 0,
+        });
+        return;
+      }
+
+      this.store.updateSessionDelta(key, {
+        pendingBytes: current.pendingBytes + sizeDelta,
+        pendingMessages: current.pendingMessages + newMessages,
+      });
+    } catch {
+      // ignore
     }
   }
 
@@ -493,6 +576,94 @@ export class MemoryManager {
     }
   }
 
+  private async readIndexableContent(
+    filePath: string,
+    source: "memory" | "sessions"
+  ): Promise<{ content: string; fileHash: string; lineCount: number }> {
+    if (source === "sessions") {
+      const sessionContent = await this.readSessionTranscript(filePath);
+      const fileHash = crypto.createHash("sha256").update(sessionContent).digest("hex");
+      const lineCount = sessionContent.split("\n").filter(Boolean).length;
+      return { content: sessionContent, fileHash, lineCount };
+    }
+
+    const content = await fs.readFile(filePath, "utf-8");
+    const fileHash = crypto.createHash("sha256").update(content).digest("hex");
+    const lineCount = content.split("\n").length;
+    return { content, fileHash, lineCount };
+  }
+
+  private async readSessionTranscript(filePath: string): Promise<string> {
+    const raw = await fs.readFile(filePath, "utf-8");
+    const cfg = this.cfg.memory.sessions;
+    let slice = raw;
+
+    if (cfg.maxBytes && slice.length > cfg.maxBytes) {
+      slice = slice.slice(-cfg.maxBytes);
+      const firstNewline = slice.indexOf("\n");
+      if (firstNewline >= 0) {
+        slice = slice.slice(firstNewline + 1);
+      }
+    }
+
+    let lines = slice.split("\n").filter(Boolean);
+    if (cfg.maxMessages && lines.length > cfg.maxMessages) {
+      lines = lines.slice(-cfg.maxMessages);
+    }
+
+    const includeRoles = new Set(
+      (cfg.includeRoles ?? ["user", "assistant"]).map((role) => role.toLowerCase())
+    );
+    const minChars = cfg.minChars ?? 1;
+    const excludePatterns = this.compileExcludePatterns(cfg.excludePatterns ?? []);
+
+    const output: string[] = [];
+    for (const line of lines) {
+      try {
+        const parsed = JSON.parse(line) as { role?: unknown; content?: unknown; name?: unknown } | null;
+        if (!parsed || typeof parsed !== "object") continue;
+        const role = typeof parsed.role === "string" ? parsed.role.toLowerCase() : "message";
+        if (!includeRoles.has(role)) continue;
+        const contentValue = (parsed as any).content;
+        const content = typeof contentValue === "string" ? contentValue : String(contentValue ?? "");
+        const trimmed = content.trim();
+        if (trimmed.length < minChars) continue;
+        const name = typeof (parsed as any).name === "string" ? (parsed as any).name : undefined;
+        const rendered = `${role}${name ? `(${name})` : ""}: ${trimmed}`;
+        if (this.matchesExcludePatterns(rendered, excludePatterns)) continue;
+        output.push(rendered);
+      } catch {
+        // ignore malformed lines
+      }
+    }
+
+    return output.join("\n");
+  }
+
+  private compileExcludePatterns(patterns: string[]): Array<RegExp | string> {
+    return patterns.map((pattern) => {
+      const trimmed = pattern.trim();
+      if (!trimmed) return "";
+      try {
+        return new RegExp(trimmed, "i");
+      } catch {
+        return trimmed;
+      }
+    }).filter((pattern) => pattern !== "");
+  }
+
+  private matchesExcludePatterns(text: string, patterns: Array<RegExp | string>): boolean {
+    for (const pattern of patterns) {
+      if (!pattern) continue;
+      if (typeof pattern === "string") {
+        if (text.toLowerCase().includes(pattern.toLowerCase())) return true;
+        continue;
+      }
+      if (pattern.test(text)) return true;
+    }
+    return false;
+  }
+
   /**
    * Index a single file
    */
@@ -501,8 +672,8 @@ export class MemoryManager {
     source: "memory" | "sessions"
   ): Promise<void> {
     try {
-      const content = await fs.readFile(filePath, "utf-8");
-      const fileHash = crypto.createHash("sha256").update(content).digest("hex");
+      const { content, fileHash, lineCount } = await this.readIndexableContent(filePath, source);
+      if (!content.trim()) return;
       const relPath = path.relative(this.cfg.resolved.workspaceDir, filePath);
 
       // Check if file needs re-indexing
@@ -536,7 +707,7 @@ export class MemoryManager {
         source,
         fileHash,
         content.length,
-        content.split("\n").length
+        lineCount
       );
 
       // Store chunks
@@ -546,18 +717,24 @@ export class MemoryManager {
       try {
         const ok = await this.ensureEmbeddingsAvailable("index");
         if (ok) {
-          const embeddings = await this.embedder.embed(chunks.map((c) => c.text));
-          if (embeddings.length === chunks.length) {
-            const valid = chunks
-              .map((chunk, i) => ({
-                chunkId: chunk.id,
-                embedding: embeddings[i] ?? [],
-                model: this.embedder.getModel(),
-              }))
-              .filter((item) => Array.isArray(item.embedding) && item.embedding.length > 0);
+          const embedder = await this.getEmbedder();
+          if (!embedder) {
+            this.embeddingsAvailable = false;
+            this.nextEmbeddingsCheckAt = Date.now() + 60_000;
+          } else {
+            const embeddings = await embedder.embed(chunks.map((c) => c.text));
+            if (embeddings.length === chunks.length) {
+              const valid = chunks
+                .map((chunk, i) => ({
+                  chunkId: chunk.id,
+                  embedding: embeddings[i] ?? [],
+                  model: embedder.getModel(),
+                }))
+                .filter((item) => Array.isArray(item.embedding) && item.embedding.length > 0);
 
-            if (valid.length > 0) {
-              this.store.storeEmbeddings(valid);
+              if (valid.length > 0) {
+                this.store.storeEmbeddings(valid);
+              }
             }
           }
         }
@@ -588,13 +765,18 @@ export class MemoryManager {
     this.lastEmbeddingsCheckAt = now;
 
     try {
-      const provider = this.embedder as EmbeddingProvider & { health?: () => Promise<boolean> };
-      if (typeof provider.health === "function") {
-        const ok = await provider.health();
-        this.embeddingsAvailable = ok;
+      const embedder = await this.getEmbedder();
+      if (!embedder) {
+        this.embeddingsAvailable = false;
       } else {
-        const test = await this.embedder.embed(["ping"]);
-        this.embeddingsAvailable = Array.isArray(test) && test.length === 1 && test[0]?.length > 0;
+        const provider = embedder as EmbeddingProvider & { health?: () => Promise<boolean> };
+        if (typeof provider.health === "function") {
+          const ok = await provider.health();
+          this.embeddingsAvailable = ok;
+        } else {
+          const test = await embedder.embed(["ping"]);
+          this.embeddingsAvailable = Array.isArray(test) && test.length === 1 && test[0]?.length > 0;
+        }
       }
     } catch {
       this.embeddingsAvailable = false;
@@ -610,9 +792,36 @@ export class MemoryManager {
   /**
    * Sync if needed (check dirty flag)
    */
-  private async syncIfNeeded(reason: string): Promise<void> {
-    // This would check timestamps and sync only if needed
-    // For now, minimal implementation
+  private async syncIfNeeded(reason: "search" | "interval"): Promise<void> {
+    if (!this.cfg.memory.enabled) return;
+    if (this.syncInFlight) return;
+
+    const intervalMinutes = this.cfg.memory.sync.intervalMinutes ?? 0;
+    const intervalMs = intervalMinutes > 0 ? intervalMinutes * 60 * 1000 : 0;
+    const now = Date.now();
+
+    if (reason === "interval" && intervalMs > 0 && now - this.lastSyncAt < intervalMs) {
+      return;
+    }
+
+    this.syncInFlight = true;
+    try {
+      if (reason === "search") {
+        if (this.cfg.memory.sources.includes("sessions") && this.cfg.memory.indexSessions) {
+          await this.indexSessionTranscripts();
+        }
+        if (!this.cfg.memory.sync.watch && this.cfg.memory.sources.includes("memory")) {
+          await this.indexMemoryFiles();
+        }
+      } else {
+        await this.indexAll();
+      }
+      this.lastSyncAt = Date.now();
+    } catch (err) {
+      console.warn("Memory sync failed:", err);
+    } finally {
+      this.syncInFlight = false;
+    }
   }
 
   getMemoryStats(): {
@@ -639,6 +848,11 @@ export class MemoryManager {
     return this.store.listChunks(params);
   }
 
+  countMemoryChunks(params?: { category?: string; source?: "memory" | "sessions" | "short-term" }): number {
+    if (!this.cfg.memory.enabled) return 0;
+    return this.store.countChunks(params);
+  }
+
   /**
    * Add content to memory (recall/remember feature)
    */
@@ -661,75 +875,5 @@ export class MemoryManager {
     } catch (err) {
       console.warn("Failed to update memory:", err);
     }
-  }
-}
-
-/**
- * Simple embedding provider - uses OpenAI-compatible LM Studio
- */
-class SimpleEmbeddingProvider implements IEmbeddingProvider {
-  private baseUrl: string;
-  private model: string;
-
-  constructor(baseUrl: string, model: string) {
-    this.baseUrl = baseUrl.replace(/\/$/, "");
-    this.model = model;
-  }
-
-  async embed(texts: string[]): Promise<number[][]> {
-    if (texts.length === 0) return [];
-
-    try {
-      const response = await fetch(`${this.baseUrl}/embeddings`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          model: this.model,
-          input: texts,
-        }),
-      });
-
-      if (!response.ok) {
-        throw new Error(`Embedding failed: ${response.status}`);
-      }
-
-      const data = (await response.json()) as {
-        data?: Array<{ embedding: number[]; index: number }>;
-      };
-
-      if (!data.data) return texts.map(() => []);
-
-      const sorted = [...data.data].sort((a, b) => a.index - b.index);
-      return sorted.map((item) => this.normalizeEmbedding(item.embedding));
-    } catch (err) {
-      console.warn("Embedding error:", err);
-      return texts.map(() => []);
-    }
-  }
-
-  async health(): Promise<boolean> {
-    try {
-      const response = await fetch(`${this.baseUrl}/models`, {
-        method: "GET",
-        signal: AbortSignal.timeout(3000),
-      });
-      return response.ok;
-    } catch {
-      return false;
-    }
-  }
-
-  private normalizeEmbedding(vec: number[]): number[] {
-    const magnitude = Math.sqrt(vec.reduce((sum, v) => sum + v * v, 0));
-    if (magnitude < 1e-10) return vec;
-    return vec.map((v) => v / magnitude);
-  }
-
-  getModel(): string {
-    return this.model;
-  }
-
-  getDimension(): number | undefined {
-    return undefined;
   }
 }

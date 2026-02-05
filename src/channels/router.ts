@@ -934,6 +934,69 @@ export class MessageRouter extends EventEmitter {
     return stats;
   }
 
+  getSessionOrderingInfo(): { enabled: boolean; maxConcurrentSessions: number } {
+    return { enabled: this.sessionOrderingEnabled, maxConcurrentSessions: this.maxConcurrentSessions };
+  }
+
+  getQueueLaneSnapshots(): Array<{
+    lane: string;
+    queued: number;
+    processing: number;
+    maxConcurrent: number;
+    oldestEnqueuedAt?: number;
+  }> {
+    if (this.sessionOrderingEnabled) {
+      let queued = 0;
+      let processing = 0;
+      let oldestEnqueuedAt: number | undefined;
+
+      for (const queue of this.sessionQueues.values()) {
+        queued += queue.length;
+        if (queue.length > 0) {
+          const candidate = queue[0]?.enqueuedAt;
+          if (typeof candidate === "number") {
+            oldestEnqueuedAt =
+              oldestEnqueuedAt === undefined ? candidate : Math.min(oldestEnqueuedAt, candidate);
+          }
+        }
+      }
+      for (const count of this.sessionProcessing.values()) {
+        processing += count;
+      }
+
+      return [
+        {
+          lane: "sessions",
+          queued,
+          processing,
+          maxConcurrent: this.maxConcurrentSessions,
+          oldestEnqueuedAt,
+        },
+      ];
+    }
+
+    const channels = new Set<Channel>();
+    for (const channel of this.adapters.keys()) channels.add(channel);
+    for (const channel of this.queues.keys()) channels.add(channel);
+    for (const channel of this.processing.keys()) channels.add(channel);
+
+    return Array.from(channels)
+      .sort()
+      .map((channel) => {
+        const queue = this.queues.get(channel) ?? [];
+        const processing = this.processing.get(channel) ?? 0;
+        const oldestEnqueuedAt = queue.length > 0 ? queue[0]?.enqueuedAt : undefined;
+
+        return {
+          lane: channel,
+          queued: queue.length,
+          processing,
+          maxConcurrent: this.concurrency,
+          oldestEnqueuedAt,
+        };
+      });
+  }
+
   getSessionQueueStats(): { queued: number; processing: number } {
     if (!this.sessionOrderingEnabled) {
       return { queued: 0, processing: 0 };

@@ -1,78 +1,126 @@
 /**
  * Archive Chambers Page
- * Memory system visualization and management
+ * Memory explorer + search + stats.
  */
 
-import React, { useEffect, useState, useCallback } from 'react';
-import { motion } from 'framer-motion';
-import { Card, Badge, Button, Input, Skeleton, Tabs, TabPanel } from '../components/base';
+import React, { useMemo, useState } from 'react';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import type { ColumnDef } from '@tanstack/react-table';
+import { Badge, Button, Card, Input, Skeleton, Tabs, TabPanel } from '../components/base';
 import { MemoryTreemap } from '../components/complex';
-import { getMemoryStats, searchMemory, getMemoryIndex } from '../api/client';
-import type { Memory, MemoryStatsResponse } from '../api/types';
+import { addMemory, getMemoryIndexPage, getMemoryStats, searchMemory } from '../api/client';
+import type { Memory } from '../api/types';
+import { DataTable, JsonPanel } from '../components/ops';
+
+const getTypeIcon = (type: string) => {
+  switch (type) {
+    case 'note':
+      return '📝';
+    case 'session':
+      return '💬';
+    case 'indexed':
+      return '📑';
+    case 'learned':
+      return '🧠';
+    case 'system':
+      return '⚙️';
+    default:
+      return '📄';
+  }
+};
 
 export const ArchiveChambers: React.FC = () => {
-  const [stats, setStats] = useState<MemoryStatsResponse['stats'] | null>(null);
-  const [memories, setMemories] = useState<Memory[]>([]);
-  const [searchQuery, setSearchQuery] = useState('');
-  const [searchResults, setSearchResults] = useState<Memory[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [searching, setSearching] = useState(false);
+  const queryClient = useQueryClient();
   const [activeTab, setActiveTab] = useState('browse');
 
-  const fetchData = useCallback(async () => {
-    try {
-      const [statsData, indexData] = await Promise.all([
-        getMemoryStats(),
-        getMemoryIndex(),
-      ]);
-      setStats(statsData.stats);
-      setMemories(indexData.memories ?? []);
-    } catch (err) {
-      console.error('Failed to fetch memory data:', err);
-    } finally {
-      setLoading(false);
-    }
-  }, []);
+  const [indexCategory, setIndexCategory] = useState('');
+  const [indexSource, setIndexSource] = useState('');
+  const [limit, setLimit] = useState(50);
+  const [offset, setOffset] = useState(0);
 
-  useEffect(() => {
-    fetchData();
-  }, [fetchData]);
+  const [newCategory, setNewCategory] = useState('');
+  const [newContent, setNewContent] = useState('');
+
+  const [searchQuery, setSearchQuery] = useState('');
+  const [searching, setSearching] = useState(false);
+  const [searchResults, setSearchResults] = useState<Memory[]>([]);
+
+  const statsQuery = useQuery({
+    queryKey: ['memoryStats'],
+    queryFn: getMemoryStats,
+    refetchInterval: 10_000,
+  });
+
+  const indexQuery = useQuery({
+    queryKey: ['memoryIndex', { limit, offset, category: indexCategory, source: indexSource }],
+    queryFn: () =>
+      getMemoryIndexPage({
+        limit,
+        offset,
+        category: indexCategory.trim() ? indexCategory.trim() : undefined,
+        source: indexSource.trim() ? indexSource.trim() : undefined,
+      }),
+  });
+
+  const addMutation = useMutation({
+    mutationFn: async () => addMemory(newContent, newCategory.trim() ? newCategory.trim() : undefined),
+    onSuccess: async () => {
+      setNewContent('');
+      await queryClient.invalidateQueries({ queryKey: ['memoryStats'] });
+      await queryClient.invalidateQueries({ queryKey: ['memoryIndex'] });
+    },
+  });
 
   const handleSearch = async () => {
     if (!searchQuery.trim()) return;
     setSearching(true);
     try {
-      const data = await searchMemory(searchQuery);
+      const data = await searchMemory(searchQuery.trim());
       setSearchResults(data.results ?? []);
       setActiveTab('search');
-    } catch (err) {
-      console.error('Search failed:', err);
     } finally {
       setSearching(false);
     }
   };
 
-  const getTypeIcon = (type: string) => {
-    switch (type) {
-      case 'note': return '📝';
-      case 'session': return '💬';
-      case 'indexed': return '📑';
-      case 'learned': return '🧠';
-      case 'system': return '⚙️';
-      default: return '📄';
-    }
-  };
+  const stats = statsQuery.data?.stats as any;
+  const memories = (indexQuery.data?.memories ?? []) as Memory[];
+  const total = (indexQuery.data as any)?.total ?? memories.length;
 
-  const formatDate = (timestamp: number) => {
-    return new Date(timestamp).toLocaleDateString('en-US', {
-      month: 'short',
-      day: 'numeric',
-      hour: '2-digit',
-      minute: '2-digit',
-    });
-  };
+  const columns = useMemo<Array<ColumnDef<Memory>>>(
+    () => [
+      {
+        header: 'Type',
+        accessorKey: 'type',
+        cell: (ctx) => <span className="text-lg">{getTypeIcon(String(ctx.row.original.type))}</span>,
+      },
+      {
+        header: 'Category',
+        accessorKey: 'category',
+        cell: (ctx) => <Badge variant="default" size="sm">{ctx.row.original.category}</Badge>,
+      },
+      {
+        header: 'Content',
+        accessorKey: 'content',
+        cell: (ctx) => (
+          <div className="min-w-0">
+            <div className="text-white line-clamp-2">{ctx.row.original.content}</div>
+            <div className="mt-1 text-[11px] text-gray-500 font-mono truncate">
+              {ctx.row.original.references?.[0] ?? ctx.row.original.id}
+            </div>
+          </div>
+        ),
+      },
+      {
+        header: 'Hits',
+        accessorKey: 'accessCount',
+        cell: (ctx) => <span className="text-xs text-gray-400">{ctx.row.original.accessCount ?? 0}</span>,
+      },
+    ],
+    []
+  );
 
-  if (loading) {
+  if (statsQuery.isLoading || indexQuery.isLoading) {
     return (
       <div className="p-6 space-y-4">
         <Skeleton variant="rectangular" height={100} />
@@ -83,47 +131,42 @@ export const ArchiveChambers: React.FC = () => {
 
   return (
     <div className="h-full flex flex-col">
-      {/* Header */}
       <header className="flex items-center justify-between p-4 border-b border-chamber-wall">
         <div>
           <h1 className="text-2xl font-bold text-white flex items-center gap-3">
             <span className="text-3xl">🍄</span>
             Archive Chambers
           </h1>
-          <p className="text-sm text-gray-400">Colony Knowledge Base (Fungus Garden)</p>
+          <p className="text-sm text-gray-400">Memory Explorer (backend-truthful)</p>
         </div>
         <div className="flex items-center gap-2">
-          <Badge variant="nurse">
-            {stats?.fileCount ?? 0} memories
-          </Badge>
-          <Badge variant={stats?.enabled ? 'nurse' : 'default'}>
-            {stats?.enabled ? 'Active' : 'Disabled'}
-          </Badge>
+          <Badge variant="nurse">{stats?.fileCount ?? 0} files</Badge>
+          <Badge variant="architect">{stats?.chunkCount ?? 0} chunks</Badge>
+          <Badge variant={stats?.enabled ? 'nurse' : 'default'}>{stats?.enabled ? 'Enabled' : 'Disabled'}</Badge>
         </div>
       </header>
 
-      {/* Search bar */}
       <div className="p-4 border-b border-chamber-wall">
-        <div className="flex gap-3">
+        <div className="grid grid-cols-6 gap-2">
           <Input
-            placeholder="Search colony memories..."
+            placeholder="Search memories…"
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
             onKeyDown={(e) => e.key === 'Enter' && handleSearch()}
-            icon={<span>🔍</span>}
-            className="flex-1"
+            className="col-span-3"
           />
-          <Button
-            variant="primary"
-            onClick={handleSearch}
-            loading={searching}
-          >
+          <Button variant="primary" onClick={handleSearch} loading={searching}>
             Search
+          </Button>
+          <Button variant="secondary" onClick={() => setActiveTab('browse')}>
+            Browse
+          </Button>
+          <Button variant="outline" onClick={() => setActiveTab('stats')}>
+            Stats
           </Button>
         </div>
       </div>
 
-      {/* Tabs */}
       <div className="px-4 pt-4">
         <Tabs
           tabs={[
@@ -137,179 +180,145 @@ export const ArchiveChambers: React.FC = () => {
         />
       </div>
 
-      {/* Content */}
-      <div className="flex-1 overflow-y-auto p-4">
+      <div className="flex-1 overflow-y-auto p-4 space-y-4">
         <TabPanel tabId="browse" activeTab={activeTab}>
-          {memories.length === 0 ? (
-            <div className="text-center py-16">
-              <span className="text-6xl">🌱</span>
-              <h3 className="text-xl font-semibold text-white mt-4">
-                Fungus Garden is Empty
-              </h3>
-              <p className="text-gray-400 mt-2">
-                Memories will grow here as the colony learns
-              </p>
+          <Card>
+            <div className="flex items-center justify-between mb-3">
+              <h3 className="text-lg font-semibold text-white">Add Memory</h3>
+              <Badge variant="default" size="sm">POST /api/memory</Badge>
             </div>
-          ) : (
-            <div className="space-y-3">
-              {memories.map((memory, i) => (
-                <motion.div
-                  key={memory.id}
-                  initial={{ opacity: 0, y: 10 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  transition={{ delay: i * 0.02 }}
+            <div className="grid grid-cols-6 gap-2">
+              <Input
+                placeholder="Category (optional)"
+                value={newCategory}
+                onChange={(e) => setNewCategory(e.target.value)}
+                className="col-span-2"
+              />
+              <Input
+                placeholder="Memory content…"
+                value={newContent}
+                onChange={(e) => setNewContent(e.target.value)}
+                className="col-span-4"
+              />
+              <div className="col-span-6 flex justify-end">
+                <Button
+                  variant="primary"
+                  onClick={() => addMutation.mutate()}
+                  disabled={!newContent.trim()}
+                  loading={addMutation.isPending}
                 >
-                  <Card hoverable>
-                    <div className="flex items-start gap-3">
-                      <span className="text-2xl">{getTypeIcon(memory.type)}</span>
-                      <div className="flex-1 min-w-0">
-                        <div className="flex items-center gap-2 mb-1">
-                          <Badge variant="default" size="sm">
-                            {memory.category}
-                          </Badge>
-                          <span className="text-xs text-gray-500">
-                            {formatDate(memory.createdAt)}
-                          </span>
-                        </div>
-                        <p className="text-white line-clamp-3">
-                          {memory.content}
-                        </p>
-                        {memory.tags.length > 0 && (
-                          <div className="flex flex-wrap gap-1 mt-2">
-                            {memory.tags.map((tag) => (
-                              <span
-                                key={tag}
-                                className="px-2 py-0.5 text-xs bg-chamber-wall rounded text-gray-400"
-                              >
-                                #{tag}
-                              </span>
-                            ))}
-                          </div>
-                        )}
-                      </div>
-                      <div className="text-sm text-gray-500">
-                        {memory.accessCount}x
-                      </div>
-                    </div>
-                  </Card>
-                </motion.div>
-              ))}
+                  Add
+                </Button>
+              </div>
             </div>
-          )}
+          </Card>
+
+          <Card>
+            <div className="flex items-center justify-between mb-3">
+              <h3 className="text-lg font-semibold text-white">Memory Index</h3>
+              <div className="flex items-center gap-2">
+                <Badge variant="default" size="sm">
+                  total {total}
+                </Badge>
+                <Badge variant="default" size="sm">
+                  GET /api/memory/index
+                </Badge>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-6 gap-2 mb-3">
+              <Input
+                placeholder="category filter"
+                value={indexCategory}
+                onChange={(e) => {
+                  setIndexCategory(e.target.value);
+                  setOffset(0);
+                }}
+                className="col-span-2"
+              />
+              <Input
+                placeholder="source filter"
+                value={indexSource}
+                onChange={(e) => {
+                  setIndexSource(e.target.value);
+                  setOffset(0);
+                }}
+                className="col-span-2"
+              />
+              <select
+                value={limit}
+                onChange={(e) => {
+                  setLimit(parseInt(e.target.value, 10));
+                  setOffset(0);
+                }}
+                className="col-span-1 bg-chamber-dark border border-chamber-wall rounded-lg px-3 py-2 text-sm text-white"
+              >
+                <option value={25}>25</option>
+                <option value={50}>50</option>
+                <option value={100}>100</option>
+              </select>
+              <div className="col-span-1 flex justify-end gap-2">
+                <Button variant="secondary" size="sm" onClick={() => setOffset(Math.max(0, offset - limit))} disabled={offset === 0}>
+                  Prev
+                </Button>
+                <Button variant="secondary" size="sm" onClick={() => setOffset(offset + limit)} disabled={offset + limit >= total}>
+                  Next
+                </Button>
+              </div>
+            </div>
+
+            <DataTable data={memories} columns={columns} dense empty="No memory chunks found." />
+          </Card>
         </TabPanel>
 
         <TabPanel tabId="search" activeTab={activeTab}>
           {searchResults.length === 0 ? (
-            <div className="text-center py-16">
-              <span className="text-6xl">🔎</span>
-              <h3 className="text-xl font-semibold text-white mt-4">
-                No Results
-              </h3>
-              <p className="text-gray-400 mt-2">
-                Try a different search query
-              </p>
-            </div>
+            <Card>
+              <div className="text-sm text-gray-500">No results.</div>
+            </Card>
           ) : (
-            <div className="space-y-3">
-              {searchResults.map((memory, i) => (
-                <motion.div
-                  key={memory.id}
-                  initial={{ opacity: 0, y: 10 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  transition={{ delay: i * 0.02 }}
-                >
-                  <Card hoverable className="border-l-4 border-l-fungus-cyan">
-                    <div className="flex items-start gap-3">
-                      <span className="text-2xl">{getTypeIcon(memory.type)}</span>
-                      <div className="flex-1 min-w-0">
-                        <div className="flex items-center gap-2 mb-1">
-                          <Badge variant="nurse" size="sm">
-                            Score: {((memory.searchScore ?? 0) * 100).toFixed(0)}%
-                          </Badge>
-                          <Badge variant="default" size="sm">
-                            {memory.category}
-                          </Badge>
-                        </div>
-                        <p className="text-white line-clamp-3">
-                          {memory.content}
-                        </p>
-                      </div>
-                    </div>
-                  </Card>
-                </motion.div>
-              ))}
-            </div>
+            <DataTable
+              data={searchResults}
+              columns={columns}
+              dense
+            />
           )}
         </TabPanel>
 
         <TabPanel tabId="stats" activeTab={activeTab}>
           <div className="grid grid-cols-2 gap-4">
-            {/* Memory Treemap */}
             <Card className="col-span-2">
-              <h3 className="text-lg font-semibold text-white mb-4">Memory Map</h3>
+              <h3 className="text-lg font-semibold text-white mb-4">Category Map</h3>
               <div className="flex justify-center">
                 <MemoryTreemap
                   data={stats?.categories ?? {}}
-                  width={600}
-                  height={250}
+                  width={700}
+                  height={280}
                   onCategoryClick={(category) => {
-                    setSearchQuery(category);
-                    handleSearch();
+                    setIndexCategory(category);
+                    setOffset(0);
+                    setActiveTab('browse');
                   }}
                 />
               </div>
             </Card>
 
             <Card>
-              <h3 className="text-lg font-semibold text-white mb-4">Storage Stats</h3>
-              <div className="space-y-3">
-                <div className="flex justify-between">
-                  <span className="text-gray-400">Total Memories</span>
-                  <span className="font-bold text-nurse-green">{stats?.fileCount ?? 0}</span>
-                </div>
-                <div className="flex justify-between">
-                  <span className="text-gray-400">Last Indexed</span>
-                  <span className="text-white">
-                    {stats?.lastRunAt ? formatDate(stats.lastRunAt) : 'Never'}
-                  </span>
-                </div>
-                <div className="flex justify-between">
-                  <span className="text-gray-400">Status</span>
-                  <Badge variant={stats?.enabled ? 'nurse' : 'default'}>
-                    {stats?.enabled ? 'Enabled' : 'Disabled'}
-                  </Badge>
-                </div>
+              <h3 className="text-lg font-semibold text-white mb-4">Stats</h3>
+              <div className="space-y-2 text-sm text-gray-300">
+                <div className="flex justify-between"><span className="text-gray-500">Enabled</span><span>{String(stats?.enabled ?? false)}</span></div>
+                <div className="flex justify-between"><span className="text-gray-500">Files</span><span>{stats?.fileCount ?? 0}</span></div>
+                <div className="flex justify-between"><span className="text-gray-500">Chunks</span><span>{stats?.chunkCount ?? 0}</span></div>
+                <div className="flex justify-between"><span className="text-gray-500">Last Run</span><span>{stats?.lastRunAt ? new Date(stats.lastRunAt).toLocaleString() : 'never'}</span></div>
+                <div className="flex justify-between"><span className="text-gray-500">Total Size</span><span>{typeof stats?.totalSize === 'number' ? `${Math.round(stats.totalSize / 1024)} KB` : '-'}</span></div>
               </div>
             </Card>
 
-            <Card>
-              <h3 className="text-lg font-semibold text-white mb-4">Categories</h3>
-              {stats?.categories ? (
-                <div className="space-y-2">
-                  {Object.entries(stats.categories).map(([category, count]) => (
-                    <div key={category} className="flex items-center gap-2">
-                      <div className="flex-1 h-2 bg-chamber-dark rounded-full overflow-hidden">
-                        <div
-                          className="h-full bg-fungus-cyan"
-                          style={{ width: `${(count / (stats?.fileCount ?? 1)) * 100}%` }}
-                        />
-                      </div>
-                      <span className="text-sm text-gray-400 w-20 text-right">
-                        {category}
-                      </span>
-                      <span className="text-sm font-medium text-white w-8">
-                        {count}
-                      </span>
-                    </div>
-                  ))}
-                </div>
-              ) : (
-                <p className="text-gray-500">No category data available</p>
-              )}
-            </Card>
+            <JsonPanel title="Raw Stats JSON" endpoint="/api/memory/stats" value={statsQuery.data ?? { loading: true }} />
           </div>
         </TabPanel>
       </div>
     </div>
   );
 };
+

@@ -145,7 +145,14 @@ export class ProviderHealthTracker {
    * Register a provider for tracking
    */
   registerProvider(id: string, name: string, type: ProviderHealth["type"], model: string): void {
-    if (this.providers.has(id)) return;
+    const existing = this.providers.get(id);
+    if (existing) {
+      existing.name = name;
+      existing.type = type;
+      existing.model = model;
+      existing.lastSeen = Date.now();
+      return;
+    }
 
     const now = Date.now();
     this.providers.set(id, {

@@ -26,8 +26,11 @@ import type {
   CronContext,
   ToolPolicy,
   LLMProvider,
+  PromptMode,
 } from "./types.js";
 import type { Logger } from "../log.js";
+import type { AntConfig } from "../config.js";
+import type { MemoryManager } from "../memory/manager.js";
 import { ToolRegistry } from "./tool-registry.js";
 import type { SessionManager } from "../gateway/session-manager.js";
 import {
@@ -61,12 +64,14 @@ import { parseToolCallsFromText } from "./tool-call-parser.js";
  */
 export interface AgentEngineConfig {
   config: AgentConfig;
+  antConfig?: AntConfig;
   logger: Logger;
   providerManager: ProviderManager;
   toolRegistry: ToolRegistry;
   workspaceDir: string;
   stateDir: string;
   memorySearch?: (query: string, maxResults?: number) => Promise<string[]>;
+  memoryManager?: MemoryManager;
   toolPolicies?: Record<string, ToolPolicy>;
   sessionManager?: SessionManager;
   onProviderError?: (params: {
@@ -75,6 +80,7 @@ export interface AgentEngineConfig {
     error: string;
     retryingProvider?: string;
   }) => Promise<void>;
+  notifyOwners?: (message: string) => Promise<void>;
 }
 
 /**
@@ -87,7 +93,9 @@ export class AgentEngine {
   private readonly tools: ToolRegistry;
   private readonly workspaceDir: string;
   private readonly stateDir: string;
+  private readonly repoRoot: string;
   private readonly memorySearch?: (query: string, maxResults?: number) => Promise<string[]>;
+  private readonly memoryManager?: MemoryManager;
   private toolPolicies?: Record<string, ToolPolicy>;
   private readonly sessionManager?: SessionManager;
   private readonly onProviderError?: (params: {
@@ -96,18 +104,24 @@ export class AgentEngine {
     error: string;
     retryingProvider?: string;
   }) => Promise<void>;
+  private readonly antConfig?: AntConfig;
+  private readonly notifyOwners?: (message: string) => Promise<void>;
 
   constructor(params: AgentEngineConfig) {
     this.config = params.config;
+    this.antConfig = params.antConfig;
     this.logger = params.logger;
     this.providers = params.providerManager;
     this.tools = params.toolRegistry;
     this.workspaceDir = params.workspaceDir;
     this.stateDir = params.stateDir;
+    this.repoRoot = params.antConfig?.resolved.repoRoot ?? params.workspaceDir;
     this.memorySearch = params.memorySearch;
+    this.memoryManager = params.memoryManager;
     this.toolPolicies = params.toolPolicies;
     this.sessionManager = params.sessionManager;
     this.onProviderError = params.onProviderError;
+    this.notifyOwners = params.notifyOwners;
   }
 
   /**
@@ -118,6 +132,7 @@ export class AgentEngine {
     const toolsUsed: string[] = [];
     let iterations = 0;
     const cfg = this.config;
+    const promptMode = this.resolvePromptMode(input);
     const events = createEventPublishers(getEventStream());
     const toolParts = new Map<string, ToolPart>();
     const blockedTools = new Map<string, number>();
@@ -214,14 +229,17 @@ export class AgentEngine {
       );
 
       // 2. Prepare prompt context (bootstrap + memory)
-      const bootstrapFiles = await loadBootstrapFiles({
-        workspaceDir: this.workspaceDir,
-        stateDir: this.stateDir,
-        isSubagent: input.isSubagent,
-      });
+      const bootstrapFiles =
+        promptMode === "minimal" || promptMode === "none"
+          ? []
+          : await loadBootstrapFiles({
+              workspaceDir: this.workspaceDir,
+              stateDir: this.stateDir,
+              isSubagent: input.isSubagent,
+            });
 
       let memoryContext: MemoryContext | undefined;
-      if (this.memorySearch) {
+      if (this.memorySearch && promptMode === "full") {
         try {
           const results = await this.memorySearch(input.query, 5);
           if (results.length > 0) {
@@ -240,6 +258,7 @@ export class AgentEngine {
 
       const baseRuntimeInfo = {
         workspaceDir: this.workspaceDir,
+        repoRoot: this.repoRoot,
         currentTime: new Date(),
         cronContext: input.cronContext,
       };
@@ -255,6 +274,7 @@ export class AgentEngine {
         },
         memoryContext,
         isSubagent: input.isSubagent,
+        promptMode,
       });
 
       const chatSystemPrompt =
@@ -271,12 +291,14 @@ export class AgentEngine {
               },
               memoryContext,
               isSubagent: input.isSubagent,
+              promptMode,
             });
 
       // 3. Build initial messages (tool-runner loop)
+      const history = promptMode === "full" ? (input.history || []) : (input.history || []).slice(-6);
       const messages: Message[] = [
         { role: "system", content: toolSystemPrompt },
-        ...(input.history || []),
+        ...history,
         { role: "user", content: input.query },
       ];
 
@@ -590,6 +612,18 @@ export class AgentEngine {
         // Execute tools
         for (const toolCall of response.toolCalls) {
           toolsUsed.push(toolCall.name);
+          this.logger.info(
+            {
+              event: "agent.tool_call.request",
+              runId,
+              sessionKey: input.sessionKey,
+              iteration: iterations,
+              toolCallId: toolCall.id,
+              toolName: toolCall.name,
+              arguments: toolCall.arguments,
+            },
+            "Agent tool call requested"
+          );
 
           if (!allowedToolNames.has(toolCall.name)) {
             const attempts = (blockedTools.get(toolCall.name) ?? 0) + 1;
@@ -621,6 +655,21 @@ export class AgentEngine {
               duration: 0,
               error: errorMessage,
             }, { sessionKey: input.sessionKey, channel: input.channel });
+
+            this.logger.warn(
+              {
+                event: "agent.tool_call.response",
+                runId,
+                sessionKey: input.sessionKey,
+                iteration: iterations,
+                toolCallId: toolCall.id,
+                toolName: toolCall.name,
+                blocked: true,
+                attempts,
+                result: blockedResult,
+              },
+              "Agent tool call blocked by policy"
+            );
 
             currentMessages.push({
               role: "tool",
@@ -694,10 +743,11 @@ export class AgentEngine {
 
           const toolContext = this.createToolContext(input, cfg);
           const result = await this.executeToolWithRecovery(toolCall, toolContext, toolTimeoutMs);
+          const formattedResult = this.formatToolResult(result);
 
           const completedPart = result.ok
             ? this.createToolPart(toolCall, "completed", {
-                output: this.formatToolResult(result),
+                output: formattedResult,
                 timeStart: (runningPart.state.status === "running" ? runningPart.state.time.start : Date.now()),
                 metadata: result.metadata as Record<string, unknown> | undefined,
               })
@@ -751,10 +801,25 @@ export class AgentEngine {
             );
           }
 
+          this.logger.info(
+            {
+              event: "agent.tool_call.response",
+              runId,
+              sessionKey: input.sessionKey,
+              iteration: iterations,
+              toolCallId: toolCall.id,
+              toolName: toolCall.name,
+              success: result.ok,
+              result,
+              formattedResult,
+            },
+            "Agent tool call completed"
+          );
+
           // Add tool result to messages
           currentMessages.push({
             role: "tool",
-            content: this.formatToolResult(result),
+            content: formattedResult,
             toolCallId: toolCall.id,
             name: toolCall.name,
           });
@@ -877,16 +942,20 @@ export class AgentEngine {
    * Build the system prompt with all context
    */
   private async buildPrompt(input: AgentInput): Promise<string> {
+    const promptMode = this.resolvePromptMode(input);
     // Load bootstrap files
-    const bootstrapFiles = await loadBootstrapFiles({
-      workspaceDir: this.workspaceDir,
-      stateDir: this.stateDir,
-      isSubagent: input.isSubagent,
-    });
+    const bootstrapFiles =
+      promptMode === "minimal" || promptMode === "none"
+        ? []
+        : await loadBootstrapFiles({
+            workspaceDir: this.workspaceDir,
+            stateDir: this.stateDir,
+            isSubagent: input.isSubagent,
+          });
 
     // Get memory context if available
     let memoryContext: MemoryContext | undefined;
-    if (this.memorySearch) {
+    if (this.memorySearch && promptMode === "full") {
       try {
         const results = await this.memorySearch(input.query, 5);
         if (results.length > 0) {
@@ -905,6 +974,7 @@ export class AgentEngine {
       model: "unknown", // Will be filled by provider
       providerType: "openai",
       workspaceDir: this.workspaceDir,
+      repoRoot: this.repoRoot,
       currentTime: new Date(),
       cronContext: input.cronContext,
     };
@@ -916,6 +986,7 @@ export class AgentEngine {
       runtimeInfo,
       memoryContext,
       isSubagent: input.isSubagent,
+      promptMode,
     });
   }
 
@@ -930,7 +1001,17 @@ export class AgentEngine {
       chatId: input.chatId,
       logger: this.logger.child({ component: "tool" }),
       config,
+      antConfig: this.antConfig,
+      memoryManager: this.memoryManager,
+      notifyOwners: this.notifyOwners,
     };
+  }
+
+  private resolvePromptMode(input: AgentInput): PromptMode {
+    if (input.promptMode) return input.promptMode;
+    if (input.isSubagent || input.cronContext) return "minimal";
+    if (/health\s*check/i.test(input.query)) return "minimal";
+    return "full";
   }
 
   /**
@@ -1490,6 +1571,26 @@ export class AgentEngine {
         "Attempting provider"
       );
 
+      const providerRequestId = crypto.randomUUID();
+      const providerRequestStartedAt = Date.now();
+      this.logger.info(
+        {
+          event: "agent.provider.request",
+          requestId: providerRequestId,
+          sessionKey,
+          providerId: attemptedProvider.id,
+          providerType: attemptedProvider.type,
+          model: options.model ?? attemptedProvider.model,
+          request: {
+            messages,
+            options,
+            requireTools,
+            isPrimary,
+          },
+        },
+        "Agent provider request dispatched"
+      );
+
       try {
         let response = await withRetry(
           () =>
@@ -1572,17 +1673,15 @@ export class AgentEngine {
 
         this.logger.info(
           {
+            event: "agent.provider.response",
+            requestId: providerRequestId,
             sessionKey,
             providerId: attemptedProvider.id,
             succeeded: true,
-            contentLength: response.content?.length || 0,
-            contentPreview: response.content?.slice(0, 100) || "(no content)",
-            finishReason: response.finishReason,
-            hasToolCalls: (response.toolCalls?.length || 0) > 0,
-            toolCallCount: response.toolCalls?.length || 0,
-            usage: response.usage,
+            durationMs: Date.now() - providerRequestStartedAt,
+            response,
           },
-          "Provider call succeeded"
+          "Agent provider response received"
         );
 
         const recovery = this.providers.recordProviderSuccess(attemptedProvider.id);
@@ -1597,6 +1696,21 @@ export class AgentEngine {
         return { response, provider: attemptedProvider };
       } catch (err) {
         lastError = err instanceof Error ? err : new Error(String(err));
+        this.logger.error(
+          {
+            event: "agent.provider.response",
+            requestId: providerRequestId,
+            sessionKey,
+            providerId: attemptedProvider.id,
+            providerType: attemptedProvider.type,
+            model: options.model ?? attemptedProvider.model,
+            succeeded: false,
+            durationMs: Date.now() - providerRequestStartedAt,
+            error: lastError.message,
+            stack: lastError.stack,
+          },
+          "Agent provider response failed"
+        );
         await events.errorOccurred(
           createClassifiedErrorData(lastError, "medium", {
             providerId: attemptedProvider.id,
@@ -1719,6 +1833,7 @@ export class AgentEngine {
  */
 export async function createAgentEngine(params: {
   config: AgentConfig;
+  antConfig?: AntConfig;
   providerConfig: {
     providers: Record<string, {
       type: "openai" | "cli" | "ollama";
@@ -1758,6 +1873,7 @@ export async function createAgentEngine(params: {
   workspaceDir: string;
   stateDir: string;
   memorySearch?: (query: string, maxResults?: number) => Promise<string[]>;
+  memoryManager?: MemoryManager;
   toolPolicies?: Record<string, ToolPolicy>;
   sessionManager?: SessionManager;
   onProviderError?: (params: {
@@ -1766,6 +1882,7 @@ export async function createAgentEngine(params: {
     error: string;
     retryingProvider?: string;
   }) => Promise<void>;
+  notifyOwners?: (message: string) => Promise<void>;
 }): Promise<AgentEngine> {
   // Initialize provider manager
   const defaultHealthTimeout = Math.min(params.config.toolLoop?.timeoutPerIterationMs ?? 5000, 10_000);
@@ -1835,14 +1952,17 @@ export async function createAgentEngine(params: {
   // Create and return engine
   return new AgentEngine({
     config: effectiveConfig,
+    antConfig: params.antConfig,
     logger: params.logger,
     providerManager,
     toolRegistry,
     workspaceDir: params.workspaceDir,
     stateDir: params.stateDir,
     memorySearch: params.memorySearch,
+    memoryManager: params.memoryManager,
     toolPolicies: params.toolPolicies,
     sessionManager: params.sessionManager,
     onProviderError: params.onProviderError,
+    notifyOwners: params.notifyOwners,
   });
 }

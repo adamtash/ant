@@ -180,6 +180,7 @@ async function startInProcessHarness(
       toolPolicy: cfg.agent.toolPolicy,
       toolResultGuard: cfg.agent.toolResultGuard,
     },
+    antConfig: cfg,
     providerConfig: {
       providers: cfg.resolved.providers.items as any,
       defaultProvider: cfg.resolved.providers.default,

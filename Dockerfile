@@ -73,7 +73,7 @@ COPY --from=builder /app/dist ./dist
 COPY --from=builder /app/ui/dist ./ui/dist
 
 # Copy configuration files (if they exist in the build context)
-COPY ant.config.json* ./
+COPY ant.config*.json ./
 COPY .env.example ./.env.example
 
 # Create non-root user for security

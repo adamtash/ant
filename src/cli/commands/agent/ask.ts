@@ -140,6 +140,13 @@ async function askDirect(cfg: AntConfig, prompt: string, options: AskOptions): P
       logger,
     });
 
+    const memoryManager = cfg.memory.enabled
+      ? new (await import("../../../memory/manager.js")).MemoryManager(cfg)
+      : undefined;
+    if (memoryManager) {
+      await memoryManager.start();
+    }
+
     const engine = await createAgentEngine({
       config: {
         temperature: 0.7,
@@ -151,10 +158,18 @@ async function askDirect(cfg: AntConfig, prompt: string, options: AskOptions): P
         toolPolicy: cfg.agent.toolPolicy,
         toolResultGuard: cfg.agent.toolResultGuard,
       },
+      antConfig: cfg,
       providerConfig,
       logger,
       workspaceDir: cfg.resolved.workspaceDir,
       stateDir: cfg.resolved.stateDir,
+      memorySearch: memoryManager
+        ? async (query, max) => {
+            const results = await memoryManager.search(query, { maxResults: max });
+            return results.map((r) => r.snippet);
+          }
+        : undefined,
+      memoryManager,
       toolPolicies: cfg.toolPolicies,
       sessionManager,
       onProviderError: async (params) => {
@@ -170,6 +185,8 @@ async function askDirect(cfg: AntConfig, prompt: string, options: AskOptions): P
       sessionKey: "cli-direct",
       channel: "cli",
     });
+
+    memoryManager?.stop();
 
     stopProgress();
 

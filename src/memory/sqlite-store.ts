@@ -605,6 +605,27 @@ export class SqliteStore {
     }));
   }
 
+  countChunks(params?: { category?: string; source?: MemorySource; includePruned?: boolean }): number {
+    const where: string[] = [];
+    const values: Array<string | number> = [];
+
+    if (!params?.includePruned) {
+      where.push("pruned_at IS NULL");
+    }
+    if (params?.category) {
+      where.push("category = ?");
+      values.push(params.category);
+    }
+    if (params?.source) {
+      where.push("source = ?");
+      values.push(params.source);
+    }
+
+    const sql = `SELECT COUNT(*) as count FROM chunks${where.length > 0 ? ` WHERE ${where.join(" AND ")}` : ""}`;
+    const row = this.db.prepare(sql).get(...values) as { count: number } | undefined;
+    return row?.count ?? 0;
+  }
+
   getMemoryStats(): {
     fileCount: number;
     chunkCount: number;

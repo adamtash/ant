@@ -11,6 +11,7 @@ import {
   cleanupTest,
   httpGet,
   httpPost,
+  httpDelete,
   type TestInstance,
 } from "./setup.js";
 
@@ -50,6 +51,17 @@ describe("Gateway HTTP Endpoints", () => {
         uptime: expect.any(Number),
         activeConnections: expect.any(Number),
       });
+    });
+
+    it("should include provider info", async () => {
+      const response = await httpGet(instance, "/api/status");
+      const data = await response.json();
+
+      expect(data.runtime).toBeTypeOf("object");
+      expect(Array.isArray(data.runtime.providers)).toBe(true);
+      expect(data.runtime.providers.length).toBeGreaterThan(0);
+      expect(data.runtime.providers[0]).toHaveProperty("id");
+      expect(data.runtime.providers[0]).toHaveProperty("model");
     });
 
     it("should include main agent status", async () => {
@@ -100,6 +112,33 @@ describe("Gateway HTTP Endpoints", () => {
     });
   });
 
+  describe("DELETE /api/sessions/:key", () => {
+    it("should delete an existing session", async () => {
+      const inbound = await httpPost(instance, "/api/test/whatsapp/inbound", {
+        chatId: "test-self@s.whatsapp.net",
+        text: "hello from integration test",
+        senderId: "test-self@s.whatsapp.net",
+        pushName: "Tester",
+        fromMe: true,
+      });
+      expect(inbound.status).toBe(200);
+      const inboundData = await inbound.json();
+      expect(inboundData.ok).toBe(true);
+      expect(inboundData.accepted).toBe(true);
+      expect(inboundData.sessionKey).toBeTypeOf("string");
+
+      const sessionKey = inboundData.sessionKey as string;
+
+      const del = await httpDelete(instance, `/api/sessions/${encodeURIComponent(sessionKey)}`);
+      expect(del.status).toBe(200);
+      const delData = await del.json();
+      expect(delData.ok).toBe(true);
+
+      const after = await httpGet(instance, `/api/sessions/${encodeURIComponent(sessionKey)}`);
+      expect(after.status).toBe(404);
+    });
+  });
+
   describe("GET /api/config", () => {
     it("should return 200 with configuration", async () => {
       const response = await httpGet(instance, "/api/config");
@@ -129,6 +168,28 @@ describe("Gateway HTTP Endpoints", () => {
 
       const data = await response.json();
       expect(data.ok).toBe(true);
+    });
+  });
+
+  describe("POST /api/config/validate", () => {
+    it("should validate a correct config", async () => {
+      const configRes = await httpGet(instance, "/api/config");
+      expect(configRes.status).toBe(200);
+      const configData = await configRes.json();
+
+      const response = await httpPost(instance, "/api/config/validate", configData.config);
+      expect(response.status).toBe(200);
+      const data = await response.json();
+      expect(data.ok).toBe(true);
+    });
+
+    it("should reject an invalid config", async () => {
+      const response = await httpPost(instance, "/api/config/validate", {});
+      expect(response.status).toBe(200);
+      const data = await response.json();
+      expect(data.ok).toBe(false);
+      expect(Array.isArray(data.errors)).toBe(true);
+      expect(data.errors.length).toBeGreaterThan(0);
     });
   });
 

@@ -27,6 +27,19 @@ export default defineTool({
     const category = typeof args.category === "string" ? args.category.trim() : undefined;
 
     try {
+      if (ctx.memoryManager) {
+        const formatted = category ? `[${category}]\n${note}` : note;
+        await ctx.memoryManager.update(formatted);
+        return {
+          ok: true,
+          data: {
+            saved: true,
+            path: "memory/dynamic.md",
+            note: formatted,
+          },
+        };
+      }
+
       const filePath = path.join(ctx.workspaceDir, "MEMORY.md");
       const date = new Date().toISOString().slice(0, 10);
 
